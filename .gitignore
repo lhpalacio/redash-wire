@@ -1,0 +1,12 @@
+bin/
+config.yaml
+config.yaml.bak
+.idea/
+.vscode/
+.claude/
+coverage.out
+coverage.html
+dist/
+.DS_Store
+# Generated at release time by scripts/gen-third-party-licenses.sh.
+THIRD_PARTY_LICENSES.md

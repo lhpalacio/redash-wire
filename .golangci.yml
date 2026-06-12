@@ -1,0 +1,54 @@
+version: "2"
+
+linters:
+  # errcheck, govet, ineffassign, staticcheck, and unused are enabled by default.
+  enable:
+    - bodyclose # response bodies are closed
+    - gosec     # security-focused checks
+    - noctx     # require context on outbound HTTP/DB calls
+    - revive
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # Test code legitimately ignores errors and uses the simple net/db helpers.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - noctx
+          - gosec
+      # os.Getpid() is always a small positive int; no real overflow.
+      - path: internal/pgwire/startup\.go
+        text: "G115"
+      # WriteConfig intentionally serializes the proxy password to the config file.
+      - path: internal/config/write\.go
+        text: "G117"
+      # Wizard validation strings are user-facing form messages, not wrapped errors.
+      - path: internal/setup/
+        text: "ST1005"
+      # Shutdown goroutines intentionally use a fresh background context.
+      - text: "G118"
+        linters:
+          - gosec
+    paths:
+      - bin
+      - third_party$
+      - builtin$
+      - examples$
+
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

@@ -1,0 +1,12 @@
+bin/
+.git/
+.github/
+.idea/
+.vscode/
+.claude/
+config.yaml
+config.yaml.bak
+coverage.out
+coverage.html
+*.md
+dev/

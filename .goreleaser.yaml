@@ -1,0 +1,42 @@
+version: 2
+
+project_name: redash-wire
+
+before:
+  hooks:
+    # Bundles every linked dependency's license into THIRD_PARTY_LICENSES.md.
+    - sh scripts/gen-third-party-licenses.sh
+
+builds:
+  - main: ./cmd/redash-wire
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+# install.sh relies on this exact naming; update both together.
+archives:
+  - name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    # Explicit list overrides goreleaser's defaults, so re-add LICENSE/README.
+    files:
+      - LICENSE
+      - README.md
+      - THIRD_PARTY_LICENSES.md
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"

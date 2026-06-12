@@ -1,0 +1,24 @@
+# Top-level keys are defaults for every profile; a profile can override them.
+# At least one listener must be configured.
+postgres_listen_addr: "127.0.0.1:15432"  # omit to disable; keep on loopback unless you mean to expose it
+mysql_listen_addr: "127.0.0.1:13306"     # omit to disable
+
+# Proxy login. Defaults to redash-wire / supersecret; change them for anything
+# beyond loopback.
+username: "redash-wire"
+password: "supersecret"
+
+poll_interval: "500ms"  # how often to poll Redash for query completion
+poll_timeout: "120s"    # give up on a query after this long
+
+# Profile used when the -profile flag is omitted.
+default_profile: integration
+
+profiles:
+  integration:
+    redash_url: "https://redash.integration.example.com"
+    api_key: "${REDASH_INTEGRATION_API_KEY}"  # ${ENV_VAR} expansion works for redash_url and api_key
+  prod:
+    redash_url: "https://redash.prod.example.com"
+    api_key: "${REDASH_PROD_API_KEY}"
+    postgres_listen_addr: "127.0.0.1:25432"  # per-profile override

@@ -1,0 +1,471 @@
+package integration_test
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/lhpalacio/redash-wire/internal/redash"
+)
+
+func TestMySQL_ConnectionAndAuth(t *testing.T) {
+	mock, registry := defaultMockAndRegistry()
+	addr := startMySQLServer(t, mock, registry)
+
+	t.Run("valid credentials", func(t *testing.T) {
+		db := connectMySQL(t, addr, "")
+		if err := db.Ping(); err != nil {
+			t.Fatalf("ping failed: %v", err)
+		}
+	})
+
+	t.Run("wrong username", func(t *testing.T) {
+		dsn := fmt.Sprintf("wronguser:%s@tcp(%s)/?allowNativePasswords=true", testPass, addr)
+		db, err := sql.Open("mysql", dsn)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer db.Close()
+		if err := db.Ping(); err == nil {
+			t.Fatal("expected auth error, got nil")
+		}
+	})
+}
+
+func TestMySQL_UseDatabase(t *testing.T) {
+	mock, registry := defaultMockAndRegistry()
+	addr := startMySQLServer(t, mock, registry)
+	db := connectMySQL(t, addr, "")
+
+	t.Run("valid MySQL source", func(t *testing.T) {
+		_, err := db.Exec("USE `Analytics MySQL`")
+		if err != nil {
+			t.Fatalf("USE failed: %v", err)
+		}
+	})
+
+	t.Run("unknown database", func(t *testing.T) {
+		_, err := db.Exec("USE nonexistent")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "Unknown database") {
+			t.Fatalf("expected 'Unknown database' error, got: %v", err)
+		}
+	})
+
+	t.Run("non-MySQL source", func(t *testing.T) {
+		_, err := db.Exec("USE `Production PG`")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "not a MySQL-compatible") {
+			t.Fatalf("expected non-MySQL-compatible error, got: %v", err)
+		}
+	})
+}
+
+func TestMySQL_ShowDatabases(t *testing.T) {
+	mock, registry := defaultMockAndRegistry()
+	addr := startMySQLServer(t, mock, registry)
+	db := connectMySQL(t, addr, "")
+
+	rows, err := db.Query("SHOW DATABASES")
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	defer rows.Close()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		names = append(names, name)
+	}
+
+	found := map[string]bool{}
+	for _, n := range names {
+		found[n] = true
+	}
+	if !found["Analytics MySQL"] {
+		t.Error("expected 'Analytics MySQL' in SHOW DATABASES")
+	}
+	if found["Production PG"] {
+		t.Error("did not expect 'Production PG' in SHOW DATABASES")
+	}
+}
+
+func TestMySQL_ShowTables(t *testing.T) {
+	mock, registry := defaultMockAndRegistry()
+	addr := startMySQLServer(t, mock, registry)
+	db := connectMySQL(t, addr, "")
+
+	_, err := db.Exec("USE `Analytics MySQL`")
+	if err != nil {
+		t.Fatalf("USE failed: %v", err)
+	}
+
+	t.Run("SHOW TABLES", func(t *testing.T) {
+		rows, err := db.Query("SHOW TABLES")
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		defer rows.Close()
+
+		var tables []string
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			tables = append(tables, name)
+		}
+
+		found := map[string]bool{}
+		for _, n := range tables {
+			found[n] = true
+		}
+		if !found["users"] || !found["orders"] {
+			t.Fatalf("expected 'users' and 'orders', got %v", tables)
+		}
+	})
+
+	t.Run("SHOW FULL TABLES", func(t *testing.T) {
+		rows, err := db.Query("SHOW FULL TABLES")
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var name, tableType string
+			if err := rows.Scan(&name, &tableType); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			if tableType != "BASE TABLE" {
+				t.Errorf("expected table type 'BASE TABLE', got %q for %q", tableType, name)
+			}
+		}
+	})
+}
+
+func TestMySQL_ShowVariables(t *testing.T) {
+	mock, registry := defaultMockAndRegistry()
+	addr := startMySQLServer(t, mock, registry)
+	db := connectMySQL(t, addr, "")
+
+	rows, err := db.Query("SHOW VARIABLES")
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	defer rows.Close()
+
+	vars := map[string]string{}
+	for rows.Next() {
+		var name string
+		var value sql.NullString
+		if err := rows.Scan(&name, &value); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		vars[name] = value.String
+	}
+
+	if v, ok := vars["version"]; !ok || v != "8.0.0-redash-wire" {
+		t.Errorf("expected version '8.0.0-redash-wire', got %q", v)
+	}
+	if v, ok := vars["character_set_client"]; !ok || v != "utf8mb4" {
+		t.Errorf("expected character_set_client 'utf8mb4', got %q", v)
+	}
+}
+
+func TestMySQL_LocalSelects(t *testing.T) {
+	mock, registry := defaultMockAndRegistry()
+	addr := startMySQLServer(t, mock, registry)
+	db := connectMySQL(t, addr, "")
+
+	tests := []struct {
+		name     string
+		sql      string
+		expected string
+	}{
+		{"@@version", "SELECT @@version", "8.0.0-redash-wire"},
+		{"@@version_comment", "SELECT @@version_comment", "redash-wire MySQL proxy"},
+		{"version()", "SELECT version()", "8.0.0-redash-wire"},
+		{"user()", "SELECT user()", "redash@localhost"},
+		{"connection_id()", "SELECT connection_id()", "1"},
+		{"@@sql_mode", "SELECT @@sql_mode", "ONLY_FULL_GROUP_BY"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var val string
+			err := db.QueryRow(tt.sql).Scan(&val)
+			if err != nil {
+				t.Fatalf("query %q failed: %v", tt.sql, err)
+			}
+			if !strings.Contains(val, tt.expected) {
+				t.Fatalf("expected %q to contain %q, got %q", tt.sql, tt.expected, val)
+			}
+		})
+	}
+
+	t.Run("database() without USE", func(t *testing.T) {
+		var val sql.NullString
+		err := db.QueryRow("SELECT database()").Scan(&val)
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		// Should be NULL or empty when no database selected
+	})
+
+	t.Run("database() after USE", func(t *testing.T) {
+		_, err := db.Exec("USE `Analytics MySQL`")
+		if err != nil {
+			t.Fatalf("USE failed: %v", err)
+		}
+		var val string
+		err = db.QueryRow("SELECT database()").Scan(&val)
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		if val != "Analytics MySQL" {
+			t.Fatalf("expected 'Analytics MySQL', got %q", val)
+		}
+	})
+}
+
+func TestMySQL_RemoteQueryExecution(t *testing.T) {
+	mock, registry := defaultMockAndRegistry()
+
+	var capturedSQL string
+	var capturedDSID int
+	mock.ExecuteQueryFunc = func(ctx context.Context, sql string, dataSourceID int) (*redash.QueryResult, error) {
+		capturedSQL = sql
+		capturedDSID = dataSourceID
+		return &redash.QueryResult{
+			Columns: []redash.Column{
+				{Name: "id", Type: "integer"},
+				{Name: "name", Type: "string"},
+				{Name: "score", Type: "float"},
+				{Name: "active", Type: "boolean"},
+				{Name: "created_at", Type: "datetime"},
+				{Name: "metadata", Type: "string"},
+			},
+			Rows: []map[string]any{
+				{
+					"id":         json.Number("42"),
+					"name":       "Alice",
+					"score":      json.Number("95.5"),
+					"active":     true,
+					"created_at": "2024-01-15T10:30:00Z",
+					"metadata":   map[string]any{"role": "admin"},
+				},
+			},
+		}, nil
+	}
+
+	addr := startMySQLServer(t, mock, registry)
+	db := connectMySQL(t, addr, "")
+
+	_, err := db.Exec("USE `Analytics MySQL`")
+	if err != nil {
+		t.Fatalf("USE failed: %v", err)
+	}
+
+	rows, err := db.Query("SELECT * FROM some_table")
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	defer rows.Close()
+
+	if capturedSQL != "SELECT * FROM some_table" {
+		t.Fatalf("expected SQL 'SELECT * FROM some_table', got %q", capturedSQL)
+	}
+	if capturedDSID != 2 {
+		t.Fatalf("expected data source ID 2, got %d", capturedDSID)
+	}
+
+	if !rows.Next() {
+		t.Fatal("expected 1 row")
+	}
+
+	var id int64
+	var name, score, active, createdAt, metadata string
+	if err := rows.Scan(&id, &name, &score, &active, &createdAt, &metadata); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	if id != 42 {
+		t.Errorf("id: expected 42, got %d", id)
+	}
+	if name != "Alice" {
+		t.Errorf("name: expected 'Alice', got %q", name)
+	}
+	if active != "1" {
+		t.Errorf("active: expected '1', got %q", active)
+	}
+	if !strings.Contains(createdAt, "2024-01-15") {
+		t.Errorf("created_at: expected to contain '2024-01-15', got %q", createdAt)
+	}
+	if !strings.Contains(metadata, "admin") {
+		t.Errorf("metadata: expected to contain 'admin', got %q", metadata)
+	}
+}
+
+func TestMySQL_DML(t *testing.T) {
+	mock, registry := defaultMockAndRegistry()
+	mock.ExecuteQueryFunc = func(ctx context.Context, sql string, dataSourceID int) (*redash.QueryResult, error) {
+		return &redash.QueryResult{
+			Columns: []redash.Column{{Name: "id", Type: "integer"}},
+			Rows: []map[string]any{
+				{"id": json.Number("1")},
+				{"id": json.Number("2")},
+				{"id": json.Number("3")},
+			},
+		}, nil
+	}
+
+	addr := startMySQLServer(t, mock, registry)
+	db := connectMySQL(t, addr, "")
+
+	_, err := db.Exec("USE `Analytics MySQL`")
+	if err != nil {
+		t.Fatalf("USE failed: %v", err)
+	}
+
+	tests := []struct {
+		name         string
+		sql          string
+		expectedRows int64
+	}{
+		{"INSERT", "INSERT INTO t (id) VALUES (1)", 3},
+		{"UPDATE", "UPDATE t SET x = 1", 3},
+		{"DELETE", "DELETE FROM t WHERE x = 1", 3},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := db.Exec(tt.sql)
+			if err != nil {
+				t.Fatalf("exec %q failed: %v", tt.sql, err)
+			}
+			affected, err := result.RowsAffected()
+			if err != nil {
+				t.Fatalf("rows affected: %v", err)
+			}
+			if affected != tt.expectedRows {
+				t.Fatalf("expected %d affected rows, got %d", tt.expectedRows, affected)
+			}
+		})
+	}
+}
+
+func TestMySQL_DMLNoData(t *testing.T) {
+	mock, registry := defaultMockAndRegistry()
+	// Simulate Redash's "query completed but returned no data": the query
+	// executed successfully but Redash does not return affected row counts.
+	mock.ExecuteQueryFunc = func(ctx context.Context, sql string, dataSourceID int) (*redash.QueryResult, error) {
+		return &redash.QueryResult{}, nil
+	}
+
+	addr := startMySQLServer(t, mock, registry)
+	db := connectMySQL(t, addr, "")
+
+	_, err := db.Exec("USE `Analytics MySQL`")
+	if err != nil {
+		t.Fatalf("USE failed: %v", err)
+	}
+
+	_, err = db.Exec("UPDATE customers SET name = 'test' WHERE id = 1")
+	if err != nil {
+		t.Fatalf("exec failed: %v", err)
+	}
+}
+
+func TestMySQL_NoDatabaseSelected(t *testing.T) {
+	mock, registry := defaultMockAndRegistry()
+	addr := startMySQLServer(t, mock, registry)
+	db := connectMySQL(t, addr, "")
+
+	_, err := db.Exec("SELECT * FROM users")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "No database selected") {
+		t.Fatalf("expected 'No database selected' error, got: %v", err)
+	}
+}
+
+func TestMySQL_InformationSchema(t *testing.T) {
+	mock, registry := defaultMockAndRegistry()
+	addr := startMySQLServer(t, mock, registry)
+	db := connectMySQL(t, addr, "")
+
+	_, err := db.Exec("USE `Analytics MySQL`")
+	if err != nil {
+		t.Fatalf("USE failed: %v", err)
+	}
+
+	t.Run("information_schema.routines", func(t *testing.T) {
+		rows, err := db.Query("SELECT * FROM information_schema.routines")
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		defer rows.Close()
+
+		count := 0
+		for rows.Next() {
+			count++
+		}
+		if count != 0 {
+			t.Fatalf("expected 0 rows for routines, got %d", count)
+		}
+	})
+
+	t.Run("information_schema.tables", func(t *testing.T) {
+		rows, err := db.Query("SELECT table_name, table_type FROM information_schema.tables")
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		defer rows.Close()
+
+		var tables []string
+		for rows.Next() {
+			var name, ttype string
+			if err := rows.Scan(&name, &ttype); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			tables = append(tables, name)
+			if ttype != "BASE TABLE" {
+				t.Errorf("expected table type 'BASE TABLE', got %q", ttype)
+			}
+		}
+		if len(tables) == 0 {
+			t.Error("expected at least one table in information_schema.tables")
+		}
+	})
+
+	t.Run("information_schema.collation_character_set_applicability", func(t *testing.T) {
+		rows, err := db.Query("SELECT * FROM information_schema.collation_character_set_applicability")
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var charset, collation, engine, name string
+			var estimatedRow int64
+			if err := rows.Scan(&charset, &collation, &engine, &name, &estimatedRow); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			if charset != "utf8mb4" {
+				t.Errorf("expected charset 'utf8mb4', got %q", charset)
+			}
+		}
+	})
+}
