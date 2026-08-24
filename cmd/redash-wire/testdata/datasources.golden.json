@@ -1,0 +1,32 @@
+[
+  {
+    "id": 2,
+    "name": "Analytics MySQL",
+    "type": "mysql",
+    "wire": "mysql"
+  },
+  {
+    "id": 5,
+    "name": "aurora reporting",
+    "type": "aurora_mysql",
+    "wire": "mysql"
+  },
+  {
+    "id": 4,
+    "name": "BigQuery Warehouse",
+    "type": "bigquery",
+    "wire": ""
+  },
+  {
+    "id": 1,
+    "name": "Production PG",
+    "type": "pg",
+    "wire": "postgres"
+  },
+  {
+    "id": 3,
+    "name": "Redshift DW",
+    "type": "redshift",
+    "wire": "postgres"
+  }
+]

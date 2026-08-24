@@ -10,3 +10,7 @@ dist/
 .DS_Store
 # Generated at release time by scripts/gen-third-party-licenses.sh.
 THIRD_PARTY_LICENSES.md
+build/
+# Xcode per-user state, created the first time the project is opened.
+xcuserdata/
+*.xcuserstate

@@ -1,0 +1,7 @@
+{
+  "config_path": "/testdata/config.yaml",
+  "exists": false,
+  "source": "home",
+  "default_profile": "",
+  "profiles": []
+}

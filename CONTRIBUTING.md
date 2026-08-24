@@ -35,9 +35,55 @@ The integration tests in `internal/integration` drive real `pgx` and
 `go-sql-driver/mysql` clients against in-process servers, so the whole suite runs
 in CI without external services.
 
+## macOS app
+
+The menu bar app is a SwiftUI target; its sources live in `macos/RedashWire/`
+and the Xcode project next to them in `macos/RedashWire.xcodeproj`:
+
+```bash
+make macos       # builds build/RedashWire.app
+make macos-run   # builds it and opens it
+```
+
+Both run `scripts/build-app.sh`, which builds a universal `redash-wire`, calls
+`xcodebuild`, embeds the binary in the bundle, and signs the nested binary and
+then the bundle. It needs full Xcode: `xcodebuild` doesn't ship with the Command
+Line Tools.
+
+The target uses a file system synchronized group, so it compiles whatever Swift
+files are in `macos/RedashWire/`. Adding a file needs no project edit, which
+also keeps `project.pbxproj` out of most diffs. Opening the project needs
+Xcode 16 or newer; older versions can't read a synchronized group.
+
+The app runs the copy of `redash-wire` inside its bundle. To point it at a
+local build instead, set `REDASH_WIRE_BINARY` and launch the executable directly
+so it inherits the variable:
+
+```bash
+make build
+REDASH_WIRE_BINARY=$PWD/bin/redash-wire build/RedashWire.app/Contents/MacOS/RedashWire
+```
+
+## JSON output and golden files
+
+The macOS menu bar app decodes the `-json` payloads of `config`, `datasources`,
+and `init`, along with the error envelope they share, so their shape is a
+contract. `cmd/redash-wire/json_test.go` pins each one against a golden file in
+`cmd/redash-wire/testdata/`:
+
+```bash
+go test ./cmd/redash-wire            # compare the payloads against the goldens
+go test ./cmd/redash-wire -update    # rewrite the goldens from the current code
+```
+
+A golden diff means a consumer breaks, so update the files only as part of a
+change you meant to make, and read the diff before you commit it. The error
+codes in `cmd/redash-wire/cli.go` are part of the same contract: adding a code
+is safe, renaming or repurposing one is not.
+
 ## README demo GIFs
 
-`dev/demo.gif` and `dev/wizard.gif` are recorded with
+We record `dev/demo.gif` and `dev/wizard.gif` with
 [VHS](https://github.com/charmbracelet/vhs). With the dev stack running and a
 fresh binary built:
 

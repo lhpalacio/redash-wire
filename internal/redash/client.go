@@ -55,6 +55,16 @@ func isFatalStatus(code int) bool {
 	return code == http.StatusUnauthorized || code == http.StatusForbidden || code == http.StatusNotFound
 }
 
+// HTTPStatus reports the status of a failed API call, and false when the error
+// came from the transport instead of a response.
+func HTTPStatus(err error) (int, bool) {
+	var he *httpError
+	if errors.As(err, &he) {
+		return he.statusCode, true
+	}
+	return 0, false
+}
+
 // QueryError represents a failure of the SQL query itself (as reported by the
 // data source via Redash), as opposed to an infrastructure failure talking to
 // Redash. Its message is safe to surface to the SQL client; infrastructure errors
@@ -176,7 +186,7 @@ func (c *Client) GetSession(ctx context.Context) (*SessionInfo, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("session request failed (status %d)", resp.StatusCode)
+		return nil, &httpError{statusCode: resp.StatusCode, message: fmt.Sprintf("session request failed (status %d)", resp.StatusCode)}
 	}
 
 	var info SessionInfo
@@ -201,7 +211,7 @@ func (c *Client) ListDataSources(ctx context.Context) ([]DataSource, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("data sources request failed (status %d)", resp.StatusCode)
+		return nil, &httpError{statusCode: resp.StatusCode, message: fmt.Sprintf("data sources request failed (status %d)", resp.StatusCode)}
 	}
 
 	var sources []DataSource

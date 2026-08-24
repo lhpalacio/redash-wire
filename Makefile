@@ -1,4 +1,4 @@
-.PHONY: build run clean test test-race cover lint vet licenses docker dev-up dev-setup dev-down dev-logs
+.PHONY: build run clean test test-race cover lint vet licenses docker dev-up dev-setup dev-down dev-logs macos macos-run
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -ldflags "-X main.version=$(VERSION)"
@@ -34,8 +34,16 @@ licenses:
 docker:
 	docker build -t redash-wire:$(VERSION) --build-arg VERSION=$(VERSION) .
 
+# Builds RedashWire.app with a universal redash-wire embedded in it. Needs Xcode,
+# not just the Command Line Tools.
+macos:
+	./scripts/build-app.sh
+
+macos-run: macos
+	open build/RedashWire.app
+
 clean:
-	rm -rf bin/ coverage.out coverage.html
+	rm -rf bin/ build/ coverage.out coverage.html
 
 dev-up:
 	docker compose up -d
