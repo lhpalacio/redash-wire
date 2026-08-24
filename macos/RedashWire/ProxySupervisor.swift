@@ -80,16 +80,18 @@ final class ProxySupervisor: ObservableObject {
         }
     }
 
-    func restart() async {
-        guard let profile = activeProfile else { return }
+    /// Pass `profile` to come back up on an edited copy. Restarting on the stale
+    /// `activeProfile` keeps the old `enabledListenerCount`, so enabling a second
+    /// listener would mark the proxy ready as soon as the first one binds.
+    func restart(profile: Profile? = nil) async {
+        guard let target = profile ?? activeProfile else { return }
         await stop()
-        start(profile: profile)
+        start(profile: target)
     }
 
     /// One profile at a time. Two would usually collide on the same ports.
     func switchTo(profile: Profile) async {
-        await stop()
-        start(profile: profile)
+        await restart(profile: profile)
     }
 
     func clearLog() {

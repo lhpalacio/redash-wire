@@ -204,6 +204,10 @@ From the menu you can:
   command, the username, the password.
 - Follow the proxy's log stream in a window you can filter by level and by text.
 - Turn on launch at login.
+- Open `config.yaml` in a text editor with Settings…, and apply your edits with
+  Reload Configuration.
+- Read the proxy's state off the dot beside the status line: grey stopped,
+  yellow starting, green running, red failed.
 
 The first run opens a setup sheet that asks for your Redash URL and API key and
 hands them to `redash-wire init`. Only the binary ever writes `config.yaml`, so
@@ -227,6 +231,14 @@ A few decisions behind it that aren't obvious from the outside:
   backoff, three times at most.
 - Copying a password clears it from the clipboard 60 seconds later, unless you
   copied something else in the meantime.
+- Settings… opens the config with whatever app claims `.yaml`, or TextEdit if
+  nothing does.
+- Reload Configuration restarts a running proxy only when the profile it serves
+  changed. The file watcher never restarts it: one save fires the watcher
+  several times, because the config is written with a temp file and a rename and
+  editors leave swap files in the same directory.
+- The ⌘, and ⇧⌘, shortcuts work only while the menu is open. Without a Dock
+  icon the app has no app menu to register them with.
 
 Build and run the app from the repo root:
 
@@ -235,8 +247,12 @@ make macos       # builds build/RedashWire.app
 make macos-run   # builds it and opens it
 ```
 
-That needs full Xcode, not just the Command Line Tools, because it drives
-`xcodebuild`. The build compiles `redash-wire` for arm64 and amd64, merges them
+That needs full Xcode 26 or newer, not just the Command Line Tools, because it
+drives `xcodebuild`. The app picks up Liquid Glass from the macOS 26 SDK, so an
+older toolchain builds a working app without it. It still runs on macOS 13,
+where the two windows skip the glass.
+
+The build compiles `redash-wire` for arm64 and amd64, merges them
 into one universal binary, and embeds it in the bundle. It signs the nested
 binary and then the bundle around it, and fails if either one didn't come out
 universal.
