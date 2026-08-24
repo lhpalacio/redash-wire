@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -26,11 +27,52 @@ import (
 // version is overridden at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
+const (
+	formatText = "text"
+	formatJSON = "json"
+)
+
+// JSON adds an RFC3339 timestamp to every event, which the human format omits.
+func newLogger(w io.Writer, format string, debug bool) (*slog.Logger, error) {
+	level := slog.LevelInfo
+	if debug {
+		level = slog.LevelDebug
+	}
+
+	opts := log.Options{
+		Level:      log.Level(level),
+		TimeFormat: time.Kitchen,
+	}
+
+	switch format {
+	case formatText:
+	case formatJSON:
+		opts.Formatter = log.JSONFormatter
+		opts.ReportTimestamp = true
+		opts.TimeFormat = time.RFC3339
+	default:
+		return nil, fmt.Errorf("invalid -log-format %q: want %q or %q", format, formatText, formatJSON)
+	}
+
+	return slog.New(log.NewWithOptions(w, opts)), nil
+}
+
 func main() {
+	// A leading non-flag argument selects a subcommand; anything else still serves.
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		os.Exit(dispatch(os.Args[1], os.Args[2:]))
+	}
+
+	serve()
+}
+
+func serve() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
 	profile := flag.String("profile", "", "config profile to use (overrides default_profile in config)")
 	debug := flag.Bool("debug", false, "enable debug logging")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	logFormat := flag.String("log-format", formatText, "log output format: text or json")
+	exitOnStdinEOF := flag.Bool("exit-on-stdin-eof", false, "shut down when stdin reaches EOF, for use under a supervising parent process")
 	flag.Parse()
 
 	if *showVersion {
@@ -38,14 +80,13 @@ func main() {
 		return
 	}
 
-	level := slog.LevelInfo
-	if *debug {
-		level = slog.LevelDebug
+	logger, err := newLogger(os.Stderr, *logFormat, *debug)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(2)
 	}
-	logger := slog.New(log.NewWithOptions(os.Stderr, log.Options{
-		Level:      log.Level(level),
-		TimeFormat: time.Kitchen,
-	}))
+	// A program is reading, so suppress the banner and the wizard.
+	machineReadable := *logFormat == formatJSON
 
 	configExplicit := false
 	flag.Visit(func(f *flag.Flag) {
@@ -63,6 +104,12 @@ func main() {
 	if !resolved.Found {
 		if configExplicit {
 			logger.Error("config file not found", "path", shortenHome(resolved.Path))
+			os.Exit(1)
+		}
+
+		if machineReadable {
+			logger.Error("no config file found, and the setup wizard cannot run under -log-format=json",
+				"path", shortenHome(resolved.Path))
 			os.Exit(1)
 		}
 
@@ -139,13 +186,28 @@ func main() {
 
 	registry := redash.NewDataSourceRegistry(sources)
 
-	printBanner(cfg, resolved.Path, sources, session)
+	if !machineReadable {
+		printBanner(cfg, resolved.Path, sources, session)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// A nil channel blocks forever, so without the flag this case never fires.
+	var stdinClosed chan struct{}
+	if *exitOnStdinEOF {
+		stdinClosed = make(chan struct{})
+		go func() {
+			// macOS reparents a child instead of killing it, so a force-quit
+			// would otherwise leave an orphan holding the ports. The write end
+			// of this pipe closes however the parent dies.
+			_, _ = io.Copy(io.Discard, os.Stdin)
+			close(stdinClosed)
+		}()
+	}
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
@@ -174,6 +236,8 @@ func main() {
 	select {
 	case s := <-sigCh:
 		logger.Info("shutting down", "signal", s.String())
+	case <-stdinClosed:
+		logger.Info("stdin closed, shutting down")
 	case err := <-errCh:
 		if err != nil {
 			logger.Error("server error", "error", err)

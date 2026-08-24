@@ -89,7 +89,164 @@ Traffic between client and proxy is plaintext (no TLS), and any client that
 authenticates can reach everything the configured API key can. Keep the
 listeners on localhost unless you trust the network.
 
-CLI flags: `-config <path>`, `-profile <name>`, `-debug`, `-version`.
+## CLI
+
+With no arguments, or with only flags, `redash-wire` starts the proxy. The
+serve flags are `-config <path>`, `-profile <name>`, `-debug`, `-version`,
+`-log-format <text|json>`, and `-exit-on-stdin-eof`.
+
+`-log-format json` writes every log event as a JSON object on stderr with an
+RFC3339 timestamp. It also drops the startup banner and the setup wizard, since
+a program is reading the output. `-exit-on-stdin-eof` shuts the proxy down when
+its stdin reaches EOF, which is what happens when the process that spawned it
+goes away. macOS reparents a child process when its parent dies, so without this
+a supervising app that gets force-quit leaves the proxy running and still
+holding its listen ports.
+
+A first argument that isn't a flag is a subcommand. Each one answers a question
+and exits, so a script or a supervising app can ask without starting a server:
+
+```bash
+redash-wire config [-json] [-show-secrets] [-config <path>]
+redash-wire datasources [-json] [-config <path>] [-profile <name>]
+redash-wire init -url <url> [-profile <name>] [-username <u>] [-password <p>] [-config <path>] [-json]
+redash-wire help
+```
+
+Without `-json` each command prints the same information as text.
+
+`config` shows the resolved configuration for every profile: which file it
+read, where that path came from, and what each profile ends up with after
+defaults and `${ENV_VAR}` expansion. It reports a missing config file as
+`"exists": false` and exits 0. You run `config` to find out whether setup is
+needed, and a fresh install has to look different from a broken config. Every
+other command treats a missing config as `not_configured` and exits non-zero.
+`config` omits the API key unless you pass `-show-secrets`, and an `api_key_set`
+boolean says whether one is configured. It always includes the proxy username
+and password, since you need them to build a connection string.
+
+`datasources` lists one profile's Redash data sources with the wire protocol
+each is reachable over. The classification comes from the proxy itself, so an
+empty `wire` means the proxy won't serve that source:
+
+```bash
+$ redash-wire datasources -json
+[
+  {
+    "id": 4,
+    "name": "BigQuery Warehouse",
+    "type": "bigquery",
+    "wire": ""
+  },
+  {
+    "id": 1,
+    "name": "Production PG",
+    "type": "pg",
+    "wire": "postgres"
+  }
+]
+```
+
+`init` is the setup wizard without the terminal: the same checks against Redash,
+the same config file, driven by flags. It reads the API key from stdin. A flag
+would put the key in argv, which any local process can read through `ps`, and in
+your shell history as well:
+
+```bash
+pbpaste | redash-wire init -url https://redash.example.com
+```
+
+It won't overwrite a config that already exists; pass `-config` to write
+somewhere else.
+
+Stdout carries command results and nothing else, and stays empty while the proxy
+is serving. The log stream always goes to stderr, so a caller can capture one
+without the other.
+
+On success a command prints its payload and exits 0. On failure it exits 2 for a
+usage mistake and 1 for everything else; with `-json` it prints
+`{"error":{"code":"...","message":"..."}}` on stdout, and without it prints
+`error: <message>` on stderr. The codes are a stable contract, so branch on the
+code rather than on the message:
+
+- `usage`: a required flag is missing, or the API key wasn't piped in.
+- `not_configured`: no config file exists at any of the lookup paths.
+- `invalid_config`: the file is there but doesn't load, whether from bad YAML, an
+  unknown key, or a profile that fails validation.
+- `profile_not_found`: `-profile` names a profile the config doesn't have.
+- `connection_failed`: Redash didn't answer, or answered with something that
+  isn't about the request itself, such as a 500.
+- `authentication_failed`: Redash rejected the request. It answers a bad API key
+  with a 404 rather than a 401, and a URL pointing at something that isn't Redash
+  looks the same from the outside, so one code covers both cases and the
+  message names them.
+- `config_exists`: `init` found a config already in place and left it alone.
+- `io_error`: `redash-wire` couldn't read or write a file.
+
+An unknown command or an unparseable flag exits 2 with the usage text on stderr
+and no JSON.
+
+## macOS app
+
+There's a menu bar app too, so the proxy doesn't need a terminal window of its
+own. It has no Dock icon, needs macOS 13 or newer, and starts and stops
+`redash-wire` as a child process.
+
+From the menu you can:
+
+- Start and stop the proxy, and choose which profile it serves. One profile runs
+  at a time.
+- Browse that profile's Redash data sources. The menu lists the ones the proxy
+  can't serve in their own section, so you can see why a source is absent. Every
+  servable one copies a `psql` or `mysql` command, or a connection URI, with the
+  data source already filled in as the database name.
+- Copy the profile-level details from the Connect submenu: the psql or mysql
+  command, the username, the password.
+- Follow the proxy's log stream in a window you can filter by level and by text.
+- Turn on launch at login.
+
+The first run opens a setup sheet that asks for your Redash URL and API key and
+hands them to `redash-wire init`. Only the binary ever writes `config.yaml`, so
+there's no second implementation of the format to drift out of step. After setup
+the app only reads that file, and it watches it, so an edit you make by hand
+shows up without a restart.
+
+A few decisions behind it that aren't obvious from the outside:
+
+- The app carries its own copy of `redash-wire` in `Contents/Resources` and runs
+  that one, so the app and the binary can't disagree about the JSON contract
+  between them.
+- It always passes `-config` explicitly. It doesn't control its working
+  directory, and `redash-wire` falls back to `./config.yaml`, so a stray file
+  there could otherwise point the proxy at somebody else's Redash.
+- It spawns the proxy with `-exit-on-stdin-eof`, so force-quitting the app can't
+  leave an orphan behind still holding the listen ports.
+- A proxy that dies before it ever starts listening died of something permanent,
+  like a rejected API key or a port already in use, so the app shows the reason
+  and doesn't retry. It restarts one that dies after it was serving, with
+  backoff, three times at most.
+- Copying a password clears it from the clipboard 60 seconds later, unless you
+  copied something else in the meantime.
+
+Build and run the app from the repo root:
+
+```bash
+make macos       # builds build/RedashWire.app
+make macos-run   # builds it and opens it
+```
+
+That needs full Xcode, not just the Command Line Tools, because it drives
+`xcodebuild`. The build compiles `redash-wire` for arm64 and amd64, merges them
+into one universal binary, and embeds it in the bundle. It signs the nested
+binary and then the bundle around it, and fails if either one didn't come out
+universal.
+
+The signature is ad-hoc and the app isn't notarized, so macOS quarantines a copy
+that arrives over the network and Gatekeeper blocks its first launch. Right-click
+the app and choose Open, or run `xattr -dr com.apple.quarantine
+/path/to/RedashWire.app`. Either one means vouching for a binary Apple hasn't
+checked, which is worth a moment's thought for an app you're about to give a
+Redash API key. Build it from a checkout you trust.
 
 ## Supported SQL & limitations
 

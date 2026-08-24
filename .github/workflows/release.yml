@@ -24,3 +24,35 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  macos-app:
+    # goreleaser creates the release; this attaches the app to it.
+    needs: goreleaser
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # macos/RedashWire.xcodeproj uses a file system synchronized group, which
+      # Xcode 15 cannot read. Fail with a clear message instead of a parse error.
+      - name: Check the Xcode version
+        run: |
+          xcodebuild -version
+          major=$(xcodebuild -version | head -1 | sed -E 's/Xcode ([0-9]+).*/\1/')
+          if [ "$major" -lt 16 ]; then
+            echo "::error::Xcode $major cannot open the project; it needs 16 or newer"
+            exit 1
+          fi
+      # Matching goreleaser, which strips the leading v, so the app and the CLI
+      # report the same version.
+      - name: Build the app
+        run: VERSION="${GITHUB_REF_NAME#v}" ./scripts/build-app.sh
+      - name: Package the app
+        run: ditto -c -k --keepParent build/RedashWire.app "RedashWire_${GITHUB_REF_NAME#v}_macos_universal.zip"
+      - name: Attach the app to the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" "RedashWire_${GITHUB_REF_NAME#v}_macos_universal.zip" --clobber

@@ -66,6 +66,74 @@ func (c *Config) GetPollTimeout() time.Duration {
 }
 
 func Load(path, profile string) (*Config, error) {
+	fc, err := readFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg, err := resolveProfile(fc, profile)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("profile %q: %w", cfg.Profile, err)
+	}
+
+	return cfg, nil
+}
+
+// ProfileNotFoundError reports a profile absent from the config file, so callers
+// can branch on the condition without matching the message.
+type ProfileNotFoundError struct {
+	Name      string
+	Available []string
+}
+
+func (e *ProfileNotFoundError) Error() string {
+	return fmt.Sprintf("profile %q not found (available: %s)", e.Name, strings.Join(e.Available, ", "))
+}
+
+// ProfileSummary pairs a resolved profile with the error that would stop it
+// starting. Config stays populated when Err is set.
+type ProfileSummary struct {
+	Name   string
+	Config *Config
+	Err    error
+}
+
+// Summary describes every profile in a config file.
+type Summary struct {
+	DefaultProfile string
+	Profiles       []ProfileSummary
+}
+
+// LoadAll resolves every profile through the same rules as Load, reporting a
+// validation failure per profile instead of failing outright.
+func LoadAll(path string) (*Summary, error) {
+	fc, err := readFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(fc.Profiles) == 0 {
+		return nil, fmt.Errorf("no profiles defined in config file")
+	}
+
+	sum := &Summary{DefaultProfile: fc.DefaultProfile}
+	for _, name := range profileNames(fc.Profiles) {
+		cfg, err := resolveProfile(fc, name)
+		if err != nil {
+			sum.Profiles = append(sum.Profiles, ProfileSummary{Name: name, Err: err})
+			continue
+		}
+		sum.Profiles = append(sum.Profiles, ProfileSummary{Name: name, Config: cfg, Err: cfg.Validate()})
+	}
+
+	return sum, nil
+}
+
+func readFile(path string) (*FileConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading config file: %w", err)
@@ -78,6 +146,12 @@ func Load(path, profile string) (*Config, error) {
 		return nil, fmt.Errorf("parsing config file: %w", err)
 	}
 
+	return &fc, nil
+}
+
+// Layers defaults, then file-level keys, then the profile's own. Callers that act
+// on the config validate it; callers that only report it do not.
+func resolveProfile(fc *FileConfig, profile string) (*Config, error) {
 	if len(fc.Profiles) == 0 {
 		return nil, fmt.Errorf("no profiles defined in config file")
 	}
@@ -92,8 +166,7 @@ func Load(path, profile string) (*Config, error) {
 
 	p, ok := fc.Profiles[profile]
 	if !ok {
-		names := profileNames(fc.Profiles)
-		return nil, fmt.Errorf("profile %q not found (available: %s)", profile, strings.Join(names, ", "))
+		return nil, &ProfileNotFoundError{Name: profile, Available: profileNames(fc.Profiles)}
 	}
 
 	cfg := &Config{
@@ -126,10 +199,6 @@ func Load(path, profile string) (*Config, error) {
 	cfg.RedashURL = os.ExpandEnv(cfg.RedashURL)
 
 	cfg.Profile = profile
-
-	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("profile %q: %w", profile, err)
-	}
 
 	return cfg, nil
 }

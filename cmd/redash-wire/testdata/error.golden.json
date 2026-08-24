@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "authentication_failed",
+    "message": "session request failed (status 401)"
+  }
+}

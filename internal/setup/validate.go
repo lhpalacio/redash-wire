@@ -15,7 +15,7 @@ func ValidateConnection(redashURL, apiKey string) (*redash.SessionInfo, []redash
 	client := redash.NewClient(redashURL, apiKey)
 	session, err := client.GetSession(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("connection failed: %w", err)
+		return nil, nil, fmt.Errorf("validating connection: %w", err)
 	}
 
 	sources, err := client.ListDataSources(ctx)
