@@ -1,7 +1,11 @@
+import AppKit
 import SwiftUI
 
 /// The `.menu` style renders a real NSMenu, so this is limited to Text, Button,
 /// Toggle, Divider and nested Menu.
+///
+/// Icons stop at the root menu. Profile and Data sources are lists of like things,
+/// where an icon column repeats the same symbol down every row.
 struct MenuBarView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var supervisor: ProxySupervisor
@@ -19,19 +23,33 @@ struct MenuBarView: View {
             Divider()
             utilitySection
             Divider()
-            Button("Quit redash-wire") { NSApplication.shared.terminate(nil) }
-                .keyboardShortcut("q")
+            aboutSection
+            Button {
+                NSApplication.shared.terminate(nil)
+            } label: {
+                Label("Quit redash-wire", systemImage: "xmark.circle")
+            }
+            .keyboardShortcut("q")
         }
     }
 
 
     @ViewBuilder
     private var statusSection: some View {
-        Text(statusLine)
+        Label {
+            Text(statusLine)
+        } icon: {
+            Image(nsImage: Self.dot(Self.statusColor(for: supervisor.state)))
+                .renderingMode(.original)
+        }
 
         if case .failed(let reason) = supervisor.state {
             Text(reason)
-            Button("Show logs") { openWindow("logs") }
+            Button {
+                openWindow("logs")
+            } label: {
+                Label("Show Logs", systemImage: "list.bullet.rectangle")
+            }
         } else if supervisor.state.isRunning, let profile = model.selectedProfile {
             ForEach(listenerLines(for: profile), id: \.self) { line in
                 Text(line)
@@ -60,6 +78,30 @@ struct MenuBarView: View {
         }
     }
 
+    /// Stopped is grey, not red: you stopped it on purpose. Red is left for a crash.
+    private static func statusColor(for state: ProxySupervisor.State) -> NSColor {
+        switch state {
+        case .stopped: return .systemGray
+        case .starting: return .systemYellow
+        case .running: return .systemGreen
+        case .failed: return .systemRed
+        }
+    }
+
+    /// Drawn instead of an SF Symbol: SwiftUI hands symbols to NSMenuItem as template
+    /// images, which AppKit repaints in the system tint. `isTemplate = false` opts out
+    /// on the AppKit side, `.renderingMode(.original)` at the call site opts out on
+    /// the SwiftUI side. Both, because the bridge between them is undocumented.
+    private static func dot(_ color: NSColor) -> NSImage {
+        let image = NSImage(size: NSSize(width: 10, height: 10), flipped: false) { rect in
+            color.setFill()
+            NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1)).fill()
+            return true
+        }
+        image.isTemplate = false
+        return image
+    }
+
     private func listenerLines(for profile: Profile) -> [String] {
         var lines: [String] = []
         if !profile.postgresListenAddr.isEmpty {
@@ -81,18 +123,24 @@ struct MenuBarView: View {
 
     @ViewBuilder
     private var controlSection: some View {
-        Button(supervisor.state.isRunning || supervisor.state.isBusy ? "Stop" : "Start") {
+        let stopping = supervisor.state.isRunning || supervisor.state.isBusy
+
+        Button {
             Task { await model.toggleProxy() }
+        } label: {
+            Label(stopping ? "Stop" : "Start", systemImage: stopping ? "stop.fill" : "play.fill")
         }
         .disabled(model.selectedProfile == nil)
 
         if case .failed = supervisor.state {
-            Button("Retry") {
+            Button {
                 Task {
                     if let profile = model.selectedProfile {
                         supervisor.start(profile: profile)
                     }
                 }
+            } label: {
+                Label("Retry", systemImage: "arrow.clockwise")
             }
         }
     }
@@ -101,7 +149,7 @@ struct MenuBarView: View {
     @ViewBuilder
     private var profileSection: some View {
         if model.profiles.count > 1 || model.isConfigured {
-            Menu("Profile") {
+            Menu {
                 ForEach(model.profiles) { profile in
                     Toggle(profileLabel(profile), isOn: Binding(
                         get: { profile.name == model.selectedProfileName },
@@ -111,6 +159,8 @@ struct MenuBarView: View {
                         }
                     ))
                 }
+            } label: {
+                Label("Profile", systemImage: "rectangle.stack")
             }
         }
     }
@@ -122,7 +172,7 @@ struct MenuBarView: View {
 
     @ViewBuilder
     private var dataSourceSection: some View {
-        Menu(dataSourceMenuTitle) {
+        Menu {
             if let error = model.dataSourcesError {
                 Text(error.message)
                 if let remedy = error.remedy {
@@ -152,6 +202,8 @@ struct MenuBarView: View {
                 Divider()
                 Button("Refresh") { Task { await model.refreshDataSources() } }
             }
+        } label: {
+            Label(dataSourceMenuTitle, systemImage: "cylinder.split.1x2")
         }
     }
 
@@ -185,7 +237,7 @@ struct MenuBarView: View {
     @ViewBuilder
     private var connectSection: some View {
         if let profile = model.selectedProfile {
-            Menu("Connect") {
+            Menu {
                 if let command = ConnectionStrings.psql(profile: profile, database: nil) {
                     Button("Copy psql command") { Clipboard.copySecret(command) }
                 }
@@ -198,6 +250,8 @@ struct MenuBarView: View {
                 if profile.defaultCredentials {
                     Text("Using the built-in default credentials")
                 }
+            } label: {
+                Label("Connect", systemImage: "link")
             }
         }
     }
@@ -205,19 +259,56 @@ struct MenuBarView: View {
 
     @ViewBuilder
     private var utilitySection: some View {
-        Button("Show logs") { openWindow("logs") }
+        Button {
+            openWindow("logs")
+        } label: {
+            Label("Show Logs", systemImage: "list.bullet.rectangle")
+        }
 
-        Toggle("Launch at login", isOn: Binding(
+        Toggle(isOn: Binding(
             get: { model.launchesAtLogin },
             set: { enabled in try? model.setLaunchAtLogin(enabled) }
-        ))
+        )) {
+            Label("Launch at Login", systemImage: "power")
+        }
 
-        Button("Edit config…") { model.openConfigInEditor() }
-        Button("Reveal config in Finder") { model.revealConfigInFinder() }
-        Button("Reload config") { Task { await model.reloadConfig() } }
+        // The shortcuts only fire while the menu is open: LSUIElement leaves no app
+        // menu to register a key equivalent with.
+        Button {
+            // Config deleted out from under us, so there is nothing to edit yet.
+            if !model.openConfigInEditor() {
+                openWindow("onboarding")
+            }
+        } label: {
+            Label("Settings…", systemImage: "gearshape")
+        }
+        .keyboardShortcut(",")
+
+        Button {
+            Task { await model.reloadConfig(applyToRunning: true) }
+        } label: {
+            Label("Reload Configuration", systemImage: "arrow.clockwise")
+        }
+        .keyboardShortcut(",", modifiers: [.command, .shift])
 
         if !model.isConfigured {
-            Button("Set up redash-wire…") { openWindow("onboarding") }
+            Button {
+                openWindow("onboarding")
+            } label: {
+                Label("Set up redash-wire…", systemImage: "wand.and.stars")
+            }
+        }
+    }
+
+
+    /// LSUIElement leaves no app menu, so this is the only place the version shows.
+    @ViewBuilder
+    private var aboutSection: some View {
+        Button {
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            NSApplication.shared.orderFrontStandardAboutPanel(nil)
+        } label: {
+            Label("About redash-wire", systemImage: "info.circle")
         }
     }
 }

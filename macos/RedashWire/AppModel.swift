@@ -44,7 +44,26 @@ final class AppModel: ObservableObject {
         watchConfigFile()
     }
 
-    func reloadConfig() async {
+    /// Only the menu command restarts the proxy. The config is written with a
+    /// temp-file rename and editors leave swap files in the same directory, so the
+    /// watcher fires several times per save; restarting on that would drop live
+    /// connections.
+    func reloadConfig(applyToRunning: Bool = false) async {
+        let running = applyToRunning ? supervisor.activeProfile : nil
+        await readConfig()
+
+        // An edit to some other profile is not a reason to restart this one.
+        guard
+            let running,
+            supervisor.state.isRunning || supervisor.state.isBusy,
+            let edited = profiles.first(where: { $0.name == running.name }),
+            edited != running
+        else { return }
+
+        await supervisor.restart(profile: edited)
+    }
+
+    private func readConfig() async {
         do {
             let payload = try await cli.config()
             config = payload
@@ -132,12 +151,23 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func revealConfigInFinder() {
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: cli.configPath)])
-    }
+    /// Returns false when there is no config yet, so the caller can open onboarding
+    /// instead.
+    ///
+    /// A plain `NSWorkspace.open` hands the file to whatever claims `.yaml`, which on
+    /// a clean install is nothing at all. Resolving the handler first makes the
+    /// TextEdit fallback reachable.
+    func openConfigInEditor() -> Bool {
+        let url = URL(fileURLWithPath: cli.configPath)
+        guard FileManager.default.fileExists(atPath: url.path) else { return false }
 
-    func openConfigInEditor() {
-        NSWorkspace.shared.open(URL(fileURLWithPath: cli.configPath))
+        let workspace = NSWorkspace.shared
+        let editor = workspace.urlForApplication(toOpen: url)
+            ?? workspace.urlForApplication(withBundleIdentifier: "com.apple.TextEdit")
+        guard let editor else { return false }
+
+        workspace.open([url], withApplicationAt: editor, configuration: NSWorkspace.OpenConfiguration())
+        return true
     }
 
 

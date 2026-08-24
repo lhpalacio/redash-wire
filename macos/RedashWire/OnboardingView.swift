@@ -35,7 +35,9 @@ struct OnboardingView: View {
                 footer
             }
         }
-        .padding(20)
+        .padding(16)
+        .glassPanel(cornerRadius: 16)
+        .padding(10)
         .frame(width: 460)
     }
 

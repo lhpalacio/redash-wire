@@ -28,7 +28,7 @@ jobs:
   macos-app:
     # goreleaser creates the release; this attaches the app to it.
     needs: goreleaser
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,14 +36,15 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      # macos/RedashWire.xcodeproj uses a file system synchronized group, which
-      # Xcode 15 cannot read. Fail with a clear message instead of a parse error.
+      # 16 is the floor to read the project's file system synchronized group. 26 is
+      # the floor for Liquid Glass: the app adopts it by linking against the macOS 26
+      # SDK, so an older toolchain silently ships the pre-Tahoe look instead.
       - name: Check the Xcode version
         run: |
           xcodebuild -version
           major=$(xcodebuild -version | head -1 | sed -E 's/Xcode ([0-9]+).*/\1/')
-          if [ "$major" -lt 16 ]; then
-            echo "::error::Xcode $major cannot open the project; it needs 16 or newer"
+          if [ "$major" -lt 26 ]; then
+            echo "::error::Xcode $major cannot build with Liquid Glass; it needs 26 or newer"
             exit 1
           fi
       # Matching goreleaser, which strips the leading v, so the app and the CLI

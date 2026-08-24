@@ -14,13 +14,12 @@ struct LogWindow: View {
         }
     }
 
+    /// `safeAreaInset` rather than a VStack: it reserves the toolbar's height so no
+    /// row starts out hidden, while still letting the list scroll under the glass.
     var body: some View {
-        VStack(spacing: 0) {
-            toolbar
-            Divider()
-            eventList
-        }
-        .frame(minWidth: 620, minHeight: 320)
+        eventList
+            .safeAreaInset(edge: .top, spacing: 0) { toolbar }
+            .frame(minWidth: 620, minHeight: 320)
     }
 
     private var toolbar: some View {
@@ -50,6 +49,7 @@ struct LogWindow: View {
                 .disabled(supervisor.events.isEmpty)
         }
         .padding(10)
+        .glassBar()
     }
 
     @ViewBuilder
