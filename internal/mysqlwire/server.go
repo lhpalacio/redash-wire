@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
+	"github.com/lhpalacio/redash-wire/internal/health"
 	"github.com/lhpalacio/redash-wire/internal/redash"
 )
 
@@ -27,17 +28,28 @@ type Server struct {
 	username     string
 	password     string
 	mysqlServer  *server.Server
+	gate         *health.Gate
 	connSeq      atomic.Int64
 }
 
-func NewServer(listenAddr string, logger *slog.Logger, redashClient redash.RedashAPI, registry redash.SourceRegistry, username, password string) *Server {
-	return &Server{
+type ServerOption func(*Server)
+
+// WithGate makes the server refuse and drop sessions while Redash is unreachable.
+// Without it the server serves unconditionally, which is what the wire-protocol
+// tests want.
+func WithGate(g *health.Gate) ServerOption {
+	return func(s *Server) { s.gate = g }
+}
+
+func NewServer(listenAddr string, logger *slog.Logger, redashClient redash.RedashAPI, registry redash.SourceRegistry, username, password string, opts ...ServerOption) *Server {
+	s := &Server{
 		listenAddr:   listenAddr,
 		redashClient: redashClient,
 		registry:     registry,
 		logger:       logger,
 		username:     username,
 		password:     password,
+		gate:         health.NewGate(),
 		// NewServer wires go-mysql's DefaultAuthenticationProvider, which performs
 		// real mysql_native_password verification against the credential returned
 		// by credentialAuthHandler.GetCredential (see auth.go).
@@ -48,6 +60,10 @@ func NewServer(listenAddr string, logger *slog.Logger, redashClient redash.Redas
 			nil, nil,
 		),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
@@ -57,7 +73,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		return fmt.Errorf("listening on %s: %w", s.listenAddr, err)
 	}
 
-	s.logger.Info("listening (mysql)", "addr", ln.Addr().String())
+	s.logger.Info("listening (mysql)", "event", health.EventListenerReady, "wire", "mysql", "addr", ln.Addr().String())
 
 	return s.Serve(ctx, ln)
 }
@@ -112,7 +128,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	logger := s.logger.With("remote_addr", conn.RemoteAddr().String(), "session_id", s.connSeq.Add(1))
 
 	// Use the per-connection context so server shutdown cancels in-flight Redash polling.
-	h := newHandler(connCtx, logger, s.redashClient, s.registry)
+	h := newHandler(connCtx, logger, s.redashClient, s.registry, s.gate)
 
 	// Bound the handshake/auth phase, then clear the deadline so an established but
 	// idle connection is not torn down between queries.
@@ -126,9 +142,21 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 
 	logger.Info("mysql client connected", "user", mysqlConn.GetUser())
 
+	// go-mysql owns the write side of this connection, so a drop cannot announce
+	// itself with an error packet the way the Postgres side does: an unsolicited
+	// packet the client never asked for is not valid on the wire. Interrupting the
+	// blocked read closes the session instead, and the handler is what gives a
+	// still-connected client the reason, on its next command.
+	stopWatching := health.InterruptOnDown(connCtx, conn, s.gate)
+	defer stopWatching()
+
 	for !mysqlConn.Closed() {
 		if err := mysqlConn.HandleCommand(); err != nil {
-			logger.Info("mysql client disconnected")
+			if !s.gate.Up() {
+				logger.Info("dropping session", "reason", "redash unavailable", "kind", s.gate.Status().Kind)
+			} else {
+				logger.Info("mysql client disconnected")
+			}
 			return
 		}
 	}

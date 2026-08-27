@@ -114,6 +114,7 @@ Serve flags:
   -config <path>    config file to use
   -profile <name>   profile to load
   -debug            enable debug logging
+  -wait-for-redash  bind and wait when Redash is unreachable, instead of exiting
   -version          print version and exit
 
 Run "redash-wire <command> -h" for a command's flags.

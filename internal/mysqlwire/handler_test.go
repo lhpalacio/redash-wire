@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/lhpalacio/redash-wire/internal/health"
 	"github.com/lhpalacio/redash-wire/internal/redash"
 	"github.com/lhpalacio/redash-wire/internal/testutil"
 )
@@ -14,7 +15,7 @@ func newTestHandler(t *testing.T, sources []redash.DataSource, mock *testutil.Mo
 	t.Helper()
 	registry := testutil.NewMockSourceRegistry(sources)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return newHandler(context.Background(), logger, mock, registry)
+	return newHandler(context.Background(), logger, mock, registry, health.NewGate())
 }
 
 func TestUseDB(t *testing.T) {

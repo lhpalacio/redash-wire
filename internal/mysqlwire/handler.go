@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
+	"github.com/lhpalacio/redash-wire/internal/health"
 	"github.com/lhpalacio/redash-wire/internal/redash"
 	"github.com/lhpalacio/redash-wire/internal/sqltext"
 )
@@ -18,6 +19,7 @@ type handler struct {
 	ctx          context.Context
 	redashClient redash.RedashAPI
 	registry     redash.SourceRegistry
+	gate         *health.Gate
 	dataSourceID int
 	dbName       string
 	logger       *slog.Logger
@@ -27,17 +29,26 @@ type handler struct {
 
 var _ server.Handler = (*handler)(nil)
 
-func newHandler(ctx context.Context, logger *slog.Logger, redashClient redash.RedashAPI, registry redash.SourceRegistry) *handler {
+func newHandler(ctx context.Context, logger *slog.Logger, redashClient redash.RedashAPI, registry redash.SourceRegistry, gate *health.Gate) *handler {
 	return &handler{
 		ctx:          ctx,
 		redashClient: redashClient,
 		registry:     registry,
+		gate:         gate,
 		logger:       logger,
 		schemaCache:  redash.NewSchemaCache(),
 	}
 }
 
 func (h *handler) UseDB(dbName string) error {
+	// This is also the connect-time refusal for `mysql -D <db>`: go-mysql calls
+	// UseDB during the handshake when the client names a database, so the error
+	// reaches the client before it ever gets a prompt.
+	if !h.gate.Up() {
+		h.logger.Info("refusing database selection", "reason", "redash unavailable", "kind", h.gate.Status().Kind)
+		return mysql.NewError(mysql.ER_UNKNOWN_ERROR, h.gate.ClientMessage())
+	}
+
 	ds, ok := h.registry.Lookup(dbName)
 	if !ok {
 		return mysql.NewError(mysql.ER_BAD_DB_ERROR, fmt.Sprintf("Unknown database '%s'", dbName))
@@ -87,6 +98,12 @@ func (h *handler) HandleQuery(query string) (*mysql.Result, error) {
 		)
 	}
 
+	// Narrow window: the gate can drop between the read being interrupted and this
+	// query reaching Redash. Answer from what we know instead of a timeout.
+	if !h.gate.Up() {
+		return nil, mysql.NewError(mysql.ER_UNKNOWN_ERROR, h.gate.ClientMessage())
+	}
+
 	query = h.stripDBQualifier(query)
 
 	start := time.Now()
@@ -94,6 +111,11 @@ func (h *handler) HandleQuery(query string) (*mysql.Result, error) {
 	if err != nil {
 		// SQL text is Debug-only (logged above); keep it out of the Error line.
 		h.logger.Error("query execution failed", "error", err, "data_source_id", h.dataSourceID, "duration_ms", time.Since(start).Milliseconds())
+		// A query that died on infrastructure is better evidence than the health
+		// timer has. Ask for a probe now; the probe, not this query, decides.
+		if health.Suspicious(err) {
+			h.gate.Suspect()
+		}
 		// Only surface genuine query errors; infrastructure errors may leak internal
 		// hostnames/credentials, so replace them with a generic message.
 		msg := "query execution failed (see proxy logs for details)"

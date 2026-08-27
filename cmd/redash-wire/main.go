@@ -17,6 +17,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/log"
 	"github.com/lhpalacio/redash-wire/internal/config"
+	"github.com/lhpalacio/redash-wire/internal/health"
 	"github.com/lhpalacio/redash-wire/internal/mysqlwire"
 	"github.com/lhpalacio/redash-wire/internal/proxy"
 	"github.com/lhpalacio/redash-wire/internal/redash"
@@ -73,6 +74,7 @@ func serve() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	logFormat := flag.String("log-format", formatText, "log output format: text or json")
 	exitOnStdinEOF := flag.Bool("exit-on-stdin-eof", false, "shut down when stdin reaches EOF, for use under a supervising parent process")
+	waitForRedash := flag.Bool("wait-for-redash", false, "bind and wait instead of exiting when Redash is unreachable, refusing connections until it recovers")
 	flag.Parse()
 
 	if *showVersion {
@@ -168,30 +170,43 @@ func serve() {
 		redash.WithPollTimeout(cfg.GetPollTimeout()),
 	)
 
-	session, err := redashClient.GetSession(context.Background())
+	// The context is created before the first Redash call so a Ctrl-C during a
+	// slow cold start is not swallowed by a 10-second probe.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	session, err := redashClient.GetSession(ctx)
 	if err != nil {
 		logger.Warn("fetching session info", "error", err)
 	}
 
-	sources, err := redashClient.ListDataSources(context.Background())
-	if err != nil {
-		logger.Error("fetching data sources", "error", err)
+	// One health checker owns both "is Redash reachable" and "what data sources
+	// exist": proving the first and answering the second are the same request.
+	gate := health.NewGate()
+	registry := redash.NewSwappableRegistry(nil)
+	checker := health.NewChecker(redashClient, registry, gate, logger)
+
+	// The first probe is also the startup check. Without -wait-for-redash a
+	// failure is still fatal, so the CLI and the Docker image behave exactly as
+	// they always have; under a supervisor it closes the gate instead and the
+	// proxy comes up ready to recover on its own.
+	if err := checker.Probe(ctx); err != nil && !*waitForRedash {
 		os.Exit(1)
 	}
 
-	if len(sources) == 0 {
+	sources := registry.All()
+	// An empty list means the key authenticated but sees nothing, which is a
+	// Redash permissions problem rather than a connectivity one. Under a
+	// supervisor that is a state worth showing; on the command line it is still
+	// what it always was, nothing to serve.
+	if len(sources) == 0 && !*waitForRedash {
 		logger.Error("no data sources found")
 		os.Exit(1)
 	}
 
-	registry := redash.NewDataSourceRegistry(sources)
-
 	if !machineReadable {
 		printBanner(cfg, resolved.Path, sources, session)
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -221,16 +236,20 @@ func serve() {
 	}
 
 	if cfg.PostgresListenAddr != "" {
-		pgSrv := proxy.NewServer(cfg.PostgresListenAddr, logger, redashClient, registry, cfg.Username, cfg.Password)
+		pgSrv := proxy.NewServer(cfg.PostgresListenAddr, logger, redashClient, registry, cfg.Username, cfg.Password, proxy.WithGate(gate))
 		startServer(pgSrv.ListenAndServe)
 	} else {
 		logger.Info("PostgreSQL listener disabled (no postgres_listen_addr configured)")
 	}
 
 	if cfg.MySQLListenAddr != "" {
-		mysqlSrv := mysqlwire.NewServer(cfg.MySQLListenAddr, logger, redashClient, registry, cfg.Username, cfg.Password)
+		mysqlSrv := mysqlwire.NewServer(cfg.MySQLListenAddr, logger, redashClient, registry, cfg.Username, cfg.Password, mysqlwire.WithGate(gate))
 		startServer(mysqlSrv.ListenAndServe)
 	}
+
+	// Started after the listeners so the event stream reads in the order things
+	// actually happened: listeners ready, then health.
+	go checker.Run(ctx)
 
 	var exitCode int
 	select {
