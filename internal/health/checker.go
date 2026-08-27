@@ -51,6 +51,7 @@ type Checker struct {
 	threshold        int
 
 	failures    int
+	everUp      bool
 	lastKind    Kind
 	fingerprint string
 }
@@ -126,6 +127,7 @@ func (c *Checker) Probe(ctx context.Context) error {
 
 func (c *Checker) recordSuccess(sources []redash.DataSource) {
 	c.failures = 0
+	c.everUp = true
 	c.lastKind = KindOK
 
 	// Swap before recovering, never after: for the instant in between, the gate
@@ -144,7 +146,13 @@ func (c *Checker) recordFailure(err error) {
 
 	// Below the threshold and still serving: record the blip where someone can
 	// find it, but do not move the menu bar over a single dropped packet.
-	if c.failures < c.threshold && c.gate.Up() {
+	//
+	// The threshold defends a state that was working. Before the first success
+	// there is no such state — no session to tear down, and no evidence Redash
+	// was ever reachable — so the startup probe is authoritative. Absorbing it
+	// would leave a cold start that cannot reach Redash looking healthy, which is
+	// the exact failure this checker exists to make visible.
+	if c.everUp && c.failures < c.threshold && c.gate.Up() {
 		c.logger.Debug("redash health probe failed", "kind", kind, "attempt", c.failures, "error", err)
 		return
 	}

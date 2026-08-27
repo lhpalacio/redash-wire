@@ -17,12 +17,22 @@ final class AppModel: ObservableObject {
 
     let cli: WireCLI
     let supervisor: ProxySupervisor
+    let updates = UpdateChecker()
 
     private var watcher: ConfigWatcher?
+    private var updateTask: Task<Void, Never>?
 
     init(cli: WireCLI = .standard()) {
         self.cli = cli
         self.supervisor = ProxySupervisor(cli: cli)
+
+        // While the proxy runs, its own health poll is the source of the list. It
+        // reads the registry that actually resolves a database name, so the menu
+        // can no longer offer a source the proxy would fail to find.
+        supervisor.onDataSources = { [weak self] sources in
+            self?.dataSources = sources
+            self?.dataSourcesError = nil
+        }
     }
 
 
@@ -42,6 +52,22 @@ final class AppModel: ObservableObject {
     func start() async {
         await reloadConfig()
         watchConfigFile()
+
+        // Nothing has published a list yet with the proxy stopped, and a menu whose
+        // data sources appear only after you start something is a menu you have to
+        // learn. This also surfaces an unreachable Redash before you press Start.
+        if !supervisor.state.isRunning {
+            await refreshDataSources()
+        }
+
+        // Checks at launch and, for a menu bar app left running for weeks, once a
+        // day after that. UpdateChecker decides whether enough time has passed.
+        updateTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.updates.checkInBackground()
+                try? await Task.sleep(for: .seconds(6 * 60 * 60))
+            }
+        }
     }
 
     /// Only the menu command restarts the proxy. The config is written with a
@@ -99,6 +125,10 @@ final class AppModel: ObservableObject {
         if supervisor.state.isRunning || supervisor.state.isBusy {
             await supervisor.stop()
         } else if let profile = selectedProfile {
+            // A failed CLI fetch from while the proxy was stopped would otherwise
+            // sit in the menu contradicting the health line the daemon is about to
+            // publish. The running proxy is the better witness; let it answer.
+            dataSourcesError = nil
             supervisor.start(profile: profile)
         }
     }
@@ -111,11 +141,15 @@ final class AppModel: ObservableObject {
 
         // Picking a profile while stopped should not start anything.
         if supervisor.state.isRunning || supervisor.state.isBusy {
+            // The restarted daemon publishes the new profile's sources itself.
             await supervisor.switchTo(profile: profile)
+            return
         }
         await refreshDataSources()
     }
 
+    /// The stopped-proxy path: with nothing running to publish a list, the CLI is
+    /// asked directly. While the proxy runs, the health events do this instead.
     func refreshDataSources() async {
         guard let profile = selectedProfile else { return }
         isLoadingDataSources = true

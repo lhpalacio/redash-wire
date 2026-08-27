@@ -47,10 +47,12 @@ xcodebuild_args=(
   -destination 'generic/platform=macOS'
   -derivedDataPath "$DERIVED"
 )
-# MARKETING_VERSION has to look like a version; an untagged checkout describes
-# as a bare commit sha, so leave the project default alone in that case.
+# MARKETING_VERSION has to look like a version, because the app compares it
+# against the latest GitHub tag to decide whether an update exists. An untagged
+# checkout describes as a bare commit sha; requiring a dot keeps a sha that
+# happens to start with a digit from being stamped in as a version number.
 case "$VERSION" in
-  [0-9]*|v[0-9]*) xcodebuild_args+=("MARKETING_VERSION=${VERSION#v}") ;;
+  [0-9]*.[0-9]*|v[0-9]*.[0-9]*) xcodebuild_args+=("MARKETING_VERSION=${VERSION#v}") ;;
 esac
 xcodebuild "${xcodebuild_args[@]}" build
 

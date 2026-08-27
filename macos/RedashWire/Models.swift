@@ -145,6 +145,54 @@ struct WireError: LocalizedError {
     }
 }
 
+/// The stable machine names the daemon puts in each JSON log line's `event`
+/// field. The app switches on these instead of on the message text, which used
+/// to mean a reworded log sentence could silently break the menu.
+enum WireEvent {
+    static let listenerReady = "listener_ready"
+    static let redashUp = "redash_up"
+    static let redashDown = "redash_down"
+    static let dataSources = "datasources_refreshed"
+}
+
+/// How Redash is answering, as reported by the daemon's health events. It hangs
+/// off the running state rather than standing alone, because a stopped proxy has
+/// no opinion about Redash: nothing is asking it.
+enum RedashHealth: Equatable {
+    case ok
+    /// A network problem, a timeout, or a 5xx. Expected to clear on its own.
+    case unreachable(String)
+    /// A 401, 403 or 404. It will not clear until the config changes.
+    case rejected(String)
+
+    init(kind: String?, reason: String) {
+        self = kind == "rejected" ? .rejected(reason) : .unreachable(reason)
+    }
+
+    var isOK: Bool { self == .ok }
+
+    /// The daemon's own error text.
+    var detail: String? {
+        switch self {
+        case .ok:
+            return nil
+        case .unreachable(let reason), .rejected(let reason):
+            return reason
+        }
+    }
+
+    var remedy: String? {
+        switch self {
+        case .ok:
+            return nil
+        case .unreachable:
+            return "Check your VPN and your connection to Redash. Retrying automatically."
+        case .rejected:
+            return "Check the profile's API key, and that the URL points at your Redash."
+        }
+    }
+}
+
 struct LogEvent: Identifiable, Equatable {
     enum Level: String, Comparable {
         case debug, info, warn, error, fatal
@@ -165,11 +213,18 @@ struct LogEvent: Identifiable, Equatable {
     let id = UUID()
     let time: Date
     let level: Level
+    /// The daemon's machine-readable event name, when the line has one.
+    let event: String?
     let message: String
     let fields: [String: String]
 
+    /// `sources` carries the entire data source list, which the menu renders and
+    /// a one-line log column has no room for.
+    private static let bulkFields: Set<String> = ["sources"]
+
     var fieldSummary: String {
-        fields.sorted { $0.key < $1.key }
+        fields.filter { !Self.bulkFields.contains($0.key) }
+            .sorted { $0.key < $1.key }
             .map { "\($0.key)=\($0.value)" }
             .joined(separator: " ")
     }

@@ -26,8 +26,18 @@ struct WireCLI {
 
     /// `-exit-on-stdin-eof` stops a force-quit from leaving an orphan on the ports.
     /// It only works while the supervisor holds the child's stdin pipe open.
+    ///
+    /// `-wait-for-redash` makes an unreachable Redash a state to show rather than
+    /// a reason to exit, so launching at login before the VPN is up leaves a proxy
+    /// that recovers by itself. The bare CLI still fails fast without it.
     func serveArguments(profile: String) -> [String] {
-        ["-config", configPath, "-profile", profile, "-log-format=json", "-exit-on-stdin-eof"]
+        [
+            "-config", configPath,
+            "-profile", profile,
+            "-log-format=json",
+            "-exit-on-stdin-eof",
+            "-wait-for-redash",
+        ]
     }
 
 

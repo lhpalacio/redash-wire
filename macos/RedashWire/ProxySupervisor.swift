@@ -8,7 +8,10 @@ final class ProxySupervisor: ObservableObject {
     enum State: Equatable {
         case stopped
         case starting
-        case running(since: Date)
+        /// Running says the listeners are bound; `redash` says whether anything
+        /// behind them can be served. The two are separate facts, and conflating
+        /// them is what let the menu show green while every query failed.
+        case running(since: Date, redash: RedashHealth)
         case failed(String)
 
         var isRunning: Bool {
@@ -17,6 +20,12 @@ final class ProxySupervisor: ObservableObject {
         }
 
         var isBusy: Bool { self == .starting }
+
+        /// Nil unless running: a stopped proxy is not asking Redash anything.
+        var health: RedashHealth? {
+            if case .running(_, let redash) = self { return redash }
+            return nil
+        }
     }
 
     /// Its length is also the attempt limit.
@@ -37,6 +46,16 @@ final class ProxySupervisor: ObservableObject {
     /// Held open deliberately: closing it triggers the child's -exit-on-stdin-eof.
     private var stdinPipe: Pipe?
     private var lineBuffer = Data()
+
+    /// The daemon can report Redash down before the listeners finish binding — a
+    /// cold start under -wait-for-redash does exactly that — so the latest health
+    /// is held here and applied when the state reaches running.
+    private var reportedHealth: RedashHealth = .ok
+
+    /// Called with the daemon's own data source list. While the proxy runs this is
+    /// authoritative: it comes from the same registry that resolves a database
+    /// name, so the menu cannot offer a source the proxy would then fail to find.
+    var onDataSources: (([DataSource]) -> Void)?
 
     private var expectedListeners = 0
     private var seenListeners = 0
@@ -105,6 +124,7 @@ final class ProxySupervisor: ObservableObject {
         seenListeners = 0
         reachedReady = false
         stopRequested = false
+        reportedHealth = .ok
         lastErrorMessage = nil
         lineBuffer.removeAll()
         state = .starting
@@ -167,19 +187,54 @@ final class ProxySupervisor: ObservableObject {
         }
 
         if event.level >= .error {
-            lastErrorMessage = event.message
+            lastErrorMessage = Self.reason(for: event)
         }
 
-        // Every configured listener must report in. With both enabled, one bound
-        // port does not make the proxy usable.
-        if event.message.hasPrefix("listening (") {
+        switch event.event {
+        case WireEvent.listenerReady:
+            // Every configured listener must report in. With both enabled, one
+            // bound port does not make the proxy usable.
             seenListeners += 1
             if !reachedReady && seenListeners >= max(expectedListeners, 1) {
                 reachedReady = true
                 restartAttempts = 0
-                state = .running(since: Date())
+                state = .running(since: Date(), redash: reportedHealth)
             }
+
+        case WireEvent.redashDown:
+            reportedHealth = RedashHealth(
+                kind: event.fields["kind"],
+                reason: event.fields["error"] ?? event.message
+            )
+            applyHealth()
+
+        case WireEvent.redashUp:
+            reportedHealth = .ok
+            applyHealth()
+
+        case WireEvent.dataSources:
+            guard
+                let payload = event.fields["sources"],
+                let sources = try? JSONDecoder().decode([DataSource].self, from: Data(payload.utf8))
+            else { return }
+            onDataSources?(sources)
+
+        default:
+            break
         }
+    }
+
+    private func applyHealth() {
+        guard case .running(let since, let current) = state, current != reportedHealth else { return }
+        state = .running(since: since, redash: reportedHealth)
+    }
+
+    /// slog puts the headline in `msg` and the diagnosis in `error`. Keeping only
+    /// the message is what turned "cannot reach Redash: dial tcp ... i/o timeout"
+    /// into a bare "fetching data sources" in the menu.
+    private static func reason(for event: LogEvent) -> String {
+        guard let detail = event.fields["error"], !detail.isEmpty else { return event.message }
+        return "\(event.message): \(detail)"
     }
 
     private static func parse(line: Data) -> LogEvent? {
@@ -191,13 +246,14 @@ final class ProxySupervisor: ObservableObject {
         let message = record["msg"] as? String ?? ""
         let level = (record["level"] as? String).flatMap(LogEvent.Level.init(rawValue:)) ?? .info
         let time = (record["time"] as? String).flatMap(Self.timestampParser.date(from:)) ?? Date()
+        let event = record["event"] as? String
 
         var fields: [String: String] = [:]
-        for (key, value) in record where !["msg", "level", "time"].contains(key) {
+        for (key, value) in record where !["msg", "level", "time", "event"].contains(key) {
             fields[key] = String(describing: value)
         }
 
-        return LogEvent(time: time, level: level, message: message, fields: fields)
+        return LogEvent(time: time, level: level, event: event, message: message, fields: fields)
     }
 
     private static let timestampParser: ISO8601DateFormatter = {

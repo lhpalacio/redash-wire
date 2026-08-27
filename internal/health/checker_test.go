@@ -74,32 +74,28 @@ func sources() []redash.DataSource {
 	return []redash.DataSource{{ID: 1, Name: "Warehouse", Type: "pg"}}
 }
 
-func TestProbeBelowThresholdKeepsServing(t *testing.T) {
-	lister := &stubLister{results: []listResult{{err: errors.New("dial tcp: i/o timeout")}}}
+func TestSecondFailureTripsTheGate(t *testing.T) {
+	// A proxy that has been working: the first failure is absorbed, the second is
+	// believed. Tearing down every live session over one dropped packet is the
+	// failure mode the threshold exists to prevent.
+	lister := &stubLister{results: []listResult{
+		{sources: sources()},
+		{err: errors.New("dial tcp: i/o timeout")},
+	}}
 	gate := health.NewGate()
 	logger, log := newCapture()
 	checker := health.NewChecker(lister, redash.NewSwappableRegistry(sources()), gate, logger)
 
-	// One failure is a blip. Tearing down every live session over a single dropped
-	// packet is the failure mode the threshold exists to prevent.
-	if err := checker.Probe(context.Background()); err == nil {
-		t.Fatal("Probe returned nil for a failing lister")
-	}
+	checker.Probe(context.Background()) // succeeds, so there is now a state to defend
+	checker.Probe(context.Background())
+
 	if !gate.Up() {
-		t.Error("the gate dropped on the first failure, want it to survive one blip")
+		t.Fatal("the gate dropped on the first failure after a success, want it to survive one blip")
 	}
 	if got := log.events(health.EventRedashDown); len(got) != 0 {
 		t.Errorf("emitted %d redash_down events below the threshold, want 0", len(got))
 	}
-}
 
-func TestSecondFailureTripsTheGate(t *testing.T) {
-	lister := &stubLister{results: []listResult{{err: errors.New("dial tcp: i/o timeout")}}}
-	gate := health.NewGate()
-	logger, log := newCapture()
-	checker := health.NewChecker(lister, redash.NewSwappableRegistry(sources()), gate, logger)
-
-	checker.Probe(context.Background())
 	checker.Probe(context.Background())
 
 	if gate.Up() {
@@ -277,5 +273,25 @@ func TestShutdownIsNotAHealthSignal(t *testing.T) {
 	}
 	if len(log.events(health.EventRedashDown)) != 0 {
 		t.Error("shutdown emitted a redash_down event")
+	}
+}
+
+func TestTheStartupProbeIsAuthoritative(t *testing.T) {
+	// Launch-at-login before the VPN is up: the very first probe fails. There is
+	// no session to protect and nothing has ever proved Redash was reachable, so
+	// absorbing this as a blip would leave the menu bar green over a proxy that
+	// cannot serve a single query.
+	lister := &stubLister{results: []listResult{{err: errors.New("dial tcp: connection refused")}}}
+	gate := health.NewGate()
+	logger, log := newCapture()
+	checker := health.NewChecker(lister, redash.NewSwappableRegistry(nil), gate, logger)
+
+	checker.Probe(context.Background())
+
+	if gate.Up() {
+		t.Fatal("the gate is up after a failed startup probe, so the proxy would accept connections it cannot serve")
+	}
+	if len(log.events(health.EventRedashDown)) != 1 {
+		t.Error("a failed startup probe emitted no redash_down event, so the app would show green")
 	}
 }

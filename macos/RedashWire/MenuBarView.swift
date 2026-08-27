@@ -9,6 +9,7 @@ import SwiftUI
 struct MenuBarView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var supervisor: ProxySupervisor
+    @ObservedObject var updates: UpdateChecker
     let openWindow: (String) -> Void
 
     var body: some View {
@@ -45,11 +46,17 @@ struct MenuBarView: View {
 
         if case .failed(let reason) = supervisor.state {
             Text(reason)
-            Button {
-                openWindow("logs")
-            } label: {
-                Label("Show Logs", systemImage: "list.bullet.rectangle")
+            showLogsButton
+        } else if let health = supervisor.state.health, !health.isOK {
+            // The listeners are bound but nothing behind them can be served, so
+            // the addresses would be a lie. Show the cause and the fix instead.
+            if let detail = health.detail {
+                Text(detail)
             }
+            if let remedy = health.remedy {
+                Text(remedy)
+            }
+            showLogsButton
         } else if supervisor.state.isRunning, let profile = model.selectedProfile {
             ForEach(listenerLines(for: profile), id: \.self) { line in
                 Text(line)
@@ -64,6 +71,15 @@ struct MenuBarView: View {
         }
     }
 
+    @ViewBuilder
+    private var showLogsButton: some View {
+        Button {
+            openWindow("logs")
+        } label: {
+            Label("Show Logs", systemImage: "list.bullet.rectangle")
+        }
+    }
+
     private var statusLine: String {
         let name = model.selectedProfileName ?? "no profile"
         switch supervisor.state {
@@ -71,19 +87,27 @@ struct MenuBarView: View {
             return "Stopped — \(name)"
         case .starting:
             return "Starting — \(name)"
-        case .running(let since):
+        case .running(let since, .ok):
             return "Running — \(name) (\(Self.uptime(since: since)))"
+        case .running(_, .unreachable):
+            return "Redash unreachable — \(name)"
+        case .running(_, .rejected):
+            return "Redash rejected the API key — \(name)"
         case .failed:
             return "Failed — \(name)"
         }
     }
 
-    /// Stopped is grey, not red: you stopped it on purpose. Red is left for a crash.
+    /// Stopped is grey, not red: you stopped it on purpose. Amber separates a
+    /// Redash that should come back on its own from a red one that needs you to
+    /// go and change something.
     private static func statusColor(for state: ProxySupervisor.State) -> NSColor {
         switch state {
         case .stopped: return .systemGray
         case .starting: return .systemYellow
-        case .running: return .systemGreen
+        case .running(_, .ok): return .systemGreen
+        case .running(_, .unreachable): return .systemOrange
+        case .running(_, .rejected): return .systemRed
         case .failed: return .systemRed
         }
     }
@@ -178,12 +202,12 @@ struct MenuBarView: View {
                 if let remedy = error.remedy {
                     Text(remedy)
                 }
-                Button("Retry") { Task { await model.refreshDataSources() } }
+                refreshButton
             } else if model.isLoadingDataSources {
                 Text("Loading…")
             } else if model.dataSources.isEmpty {
                 Text("No data sources")
-                Button("Refresh") { Task { await model.refreshDataSources() } }
+                refreshButton
             } else {
                 ForEach(model.servableDataSources) { source in
                     Menu(source.name) {
@@ -199,11 +223,23 @@ struct MenuBarView: View {
                     }
                 }
 
-                Divider()
-                Button("Refresh") { Task { await model.refreshDataSources() } }
+                if !supervisor.state.isRunning {
+                    Divider()
+                    refreshButton
+                }
             }
         } label: {
             Label(dataSourceMenuTitle, systemImage: "cylinder.split.1x2")
+        }
+    }
+
+    /// Only offered while the proxy is stopped. A running proxy refreshes the list
+    /// itself on every health probe, and re-fetching it separately is how the menu
+    /// and the registry that resolves these names drifted apart in the first place.
+    @ViewBuilder
+    private var refreshButton: some View {
+        if !supervisor.state.isRunning {
+            Button("Refresh") { Task { await model.refreshDataSources() } }
         }
     }
 
@@ -304,6 +340,23 @@ struct MenuBarView: View {
     /// LSUIElement leaves no app menu, so this is the only place the version shows.
     @ViewBuilder
     private var aboutSection: some View {
+        // Added by the daily background check. Nothing is downloaded and nothing
+        // interrupts you: the row is the whole notification.
+        if let release = updates.available {
+            Button {
+                updates.openReleasePage()
+            } label: {
+                Label("Update available — \(release.version)", systemImage: "arrow.down.circle")
+            }
+        }
+
+        Button {
+            Task { await updates.checkNow() }
+        } label: {
+            Label("Check for Updates…", systemImage: "arrow.triangle.2.circlepath")
+        }
+        .disabled(updates.isChecking)
+
         Button {
             NSApplication.shared.activate(ignoringOtherApps: true)
             NSApplication.shared.orderFrontStandardAboutPanel(nil)
