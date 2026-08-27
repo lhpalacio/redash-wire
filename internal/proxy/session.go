@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/lhpalacio/redash-wire/internal/health"
 	"github.com/lhpalacio/redash-wire/internal/pgwire"
 	"github.com/lhpalacio/redash-wire/internal/redash"
 	"github.com/lhpalacio/redash-wire/internal/sqltext"
@@ -20,6 +21,7 @@ type Session struct {
 	backend      *pgproto3.Backend
 	redashClient redash.RedashAPI
 	registry     redash.SourceRegistry
+	gate         *health.Gate
 	listenAddr   string
 	username     string
 	password     string
@@ -31,7 +33,7 @@ type Session struct {
 	schemaCache *redash.SchemaCache
 }
 
-func newSession(conn net.Conn, logger *slog.Logger, redashClient redash.RedashAPI, registry redash.SourceRegistry, listenAddr, username, password string) *Session {
+func newSession(conn net.Conn, logger *slog.Logger, redashClient redash.RedashAPI, registry redash.SourceRegistry, gate *health.Gate, listenAddr, username, password string) *Session {
 	backend := pgproto3.NewBackend(conn, conn)
 	backend.SetMaxBodyLen(pgwire.MaxClientMessageBytes)
 	return &Session{
@@ -39,6 +41,7 @@ func newSession(conn net.Conn, logger *slog.Logger, redashClient redash.RedashAP
 		backend:      backend,
 		redashClient: redashClient,
 		registry:     registry,
+		gate:         gate,
 		listenAddr:   listenAddr,
 		username:     username,
 		password:     password,
@@ -48,7 +51,7 @@ func newSession(conn net.Conn, logger *slog.Logger, redashClient redash.RedashAP
 }
 
 func (s *Session) serve(ctx context.Context) {
-	params, err := pgwire.HandleStartup(s.backend, s.conn, s.username, s.password)
+	params, err := pgwire.HandleStartup(s.backend, s.conn, s.username, s.password, s.admit)
 	if err != nil {
 		switch {
 		case errors.Is(err, pgwire.ErrAuthFailed):
@@ -65,6 +68,11 @@ func (s *Session) serve(ctx context.Context) {
 	// connection is not torn down between queries.
 	_ = s.conn.SetReadDeadline(time.Time{})
 	s.params = params
+
+	// Interrupts the blocked Receive below when Redash goes away, so this
+	// goroutine regains control and sends the FATAL itself.
+	watch := health.InterruptOnDown(ctx, s.conn, s.gate)
+	defer watch.Stop()
 
 	dbName := params["database"]
 	if dbName == "" {
@@ -88,6 +96,16 @@ func (s *Session) serve(ctx context.Context) {
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || isConnClosed(err) {
 				s.logger.Info("client disconnected")
+				return
+			}
+			// Checked after the disconnect cases so a client that left on its own
+			// is not reported as a drop. What lands here after the gate closed is
+			// the read deadline the watch armed to interrupt this very call.
+			if watch.Dropped() {
+				s.logger.Info("dropping session", "reason", "redash unavailable", "kind", s.gate.Status().Kind)
+				if err := pgwire.SendFatal(s.conn, pgwire.SQLStateConnectionFailure, s.gate.ClientMessage()); err != nil {
+					s.logger.Debug("sending drop notice to client", "error", err)
+				}
 				return
 			}
 			s.logger.Error("receiving message", "error", err)
@@ -146,6 +164,17 @@ func (s *Session) handleQuery(ctx context.Context, sql string) {
 
 	s.logger.Debug("query received", "sql", sql)
 
+	// Ahead of the catalog answers served from the cached registry and the
+	// no-data-source reply. All of those are true and none of them is the reason
+	// the query cannot run. Only reachable in the window between the gate closing
+	// and the read being interrupted, since a gated proxy refuses at login.
+	if !s.gate.Up() {
+		if err := pgwire.SendError(s.conn, s.gate.ClientMessage()); err != nil {
+			s.logger.Error("sending error to client", "error", err)
+		}
+		return
+	}
+
 	if pgwire.IsLocalQuery(sql) {
 		sources := redash.FilterByType(s.registry.All(), redash.IsPostgresCompatible)
 		if err := pgwire.HandleLocalQuery(s.conn, sql, s.params, sources, s.listenAddr); err != nil {
@@ -180,6 +209,11 @@ func (s *Session) handleQuery(ctx context.Context, sql string) {
 		// SQL text is intentionally Debug-only (logged above); the Error line carries
 		// no query text, only what operators need to triage.
 		s.logger.Error("query execution failed", "error", err, "data_source_id", s.dataSourceID, "duration_ms", time.Since(start).Milliseconds())
+		// A query that died on infrastructure is better evidence than the health
+		// timer has. Ask for a probe now; the probe, not this query, decides.
+		if health.Suspicious(err) {
+			s.gate.Suspect()
+		}
 		// Only surface genuine query errors to the client; infrastructure errors may
 		// contain internal hostnames/credentials, so replace them with a generic message.
 		msg := "query execution failed (see proxy logs for details)"
@@ -200,12 +234,27 @@ func (s *Session) handleQuery(ctx context.Context, sql string) {
 	}
 }
 
+// admit turns away a valid login while Redash is unreachable. It runs inside the
+// startup exchange rather than after it, because a connection the client already
+// believes is open cannot be refused any more, only broken.
+func (s *Session) admit() error {
+	if s.gate.Up() {
+		return nil
+	}
+	return errors.New(s.gate.ClientMessage())
+}
+
 func (s *Session) isPostgresBackend() bool {
 	return redash.IsPostgresCompatible(s.dsType)
 }
 
 func (s *Session) getSchema(ctx context.Context) []redash.SchemaTable {
 	if s.dataSourceID == 0 {
+		return nil
+	}
+	// Redash is known to be unreachable, so a fetch would sit on the HTTP client's
+	// timeout before returning the empty schema we can hand back right now.
+	if !s.gate.Up() {
 		return nil
 	}
 

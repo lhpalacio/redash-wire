@@ -251,6 +251,24 @@ func SendError(conn io.Writer, msg string) error {
 	return err
 }
 
+// SendFatal writes a FATAL ErrorResponse and deliberately no ReadyForQuery: the
+// connection is about to close, and telling the client it may send another query
+// would be a lie. This is what a real Postgres server does when it shuts down
+// under an established session.
+func SendFatal(conn io.Writer, code, msg string) error {
+	buf, err := encode((&pgproto3.ErrorResponse{
+		Severity: "FATAL",
+		Code:     code,
+		Message:  msg,
+	}).Encode(nil))
+	if err != nil {
+		return err
+	}
+
+	_, err = conn.Write(buf)
+	return err
+}
+
 func SendEmptyQuery(conn io.Writer) error {
 	buf, err := encode((&pgproto3.EmptyQueryResponse{}).Encode(nil))
 	if err != nil {

@@ -145,6 +145,100 @@ struct WireError: LocalizedError {
     }
 }
 
+/// The stable machine names the daemon puts in each JSON log line's `event`
+/// field. The app switches on these instead of on the message text, which used
+/// to mean a reworded log sentence could silently break the menu.
+enum WireEvent {
+    static let listenerReady = "listener_ready"
+    static let redashUp = "redash_up"
+    static let redashDown = "redash_down"
+    static let dataSources = "datasources_refreshed"
+}
+
+/// How Redash is answering, as reported by the daemon's health events. It hangs
+/// off the running state rather than standing alone, because a stopped proxy has
+/// no opinion about Redash: nothing is asking it.
+enum RedashHealth: Equatable {
+    case ok
+    /// A network problem, a timeout, or a 5xx. Expected to clear on its own.
+    case unreachable(String)
+    /// A 401, 403 or 404. It will not clear until the config changes.
+    case rejected(String)
+
+    init(kind: String?, reason: String) {
+        self = kind == "rejected" ? .rejected(reason) : .unreachable(reason)
+    }
+
+    var isOK: Bool { self == .ok }
+
+    /// A few words for the menu, never the daemon's own error text.
+    ///
+    /// That text is a Go error carrying a full URL — `Get "https://redash…/api/
+    /// data_sources": context deadline exceeded` — and an NSMenu item is one line
+    /// that never wraps, so the menu widens to fit the longest thing in it. One
+    /// error string is enough to stretch the whole menu across the screen. The
+    /// original is in the log window, which is where a URL and a stack of wrapped
+    /// causes are worth reading.
+    var summary: String? {
+        switch self {
+        case .ok:
+            return nil
+        case .unreachable(let reason):
+            return Self.reachabilityPhrase(for: reason)
+        case .rejected(let reason):
+            guard let status = Self.httpStatus(in: reason) else {
+                return "Redash refused the request."
+            }
+            return "Redash answered with status \(status)."
+        }
+    }
+
+    /// Matched on the text because Go's net and http errors arrive as prose. A
+    /// phrase we do not recognise falls back to saying only what we know for
+    /// certain, rather than pasting the error in and hoping it is short.
+    private static func reachabilityPhrase(for reason: String) -> String {
+        let text = reason.lowercased()
+
+        if text.contains("context deadline exceeded") || text.contains("timeout") || text.contains("timed out") {
+            return "The request timed out."
+        }
+        if text.contains("connection refused") {
+            return "The connection was refused."
+        }
+        if text.contains("no such host") || text.contains("server misbehaving") {
+            return "That host could not be found."
+        }
+        if text.contains("network is unreachable") || text.contains("no route to host") {
+            return "The network is unreachable."
+        }
+        if text.contains("certificate") || text.contains("x509") || text.contains("tls") {
+            return "The TLS certificate was rejected."
+        }
+        if let status = httpStatus(in: reason) {
+            return "Redash answered with status \(status)."
+        }
+        return "Redash did not answer."
+    }
+
+    /// The daemon writes these as "… request failed (status 401)".
+    private static func httpStatus(in reason: String) -> Int? {
+        guard let marker = reason.range(of: "status ") else { return nil }
+        let digits = reason[marker.upperBound...].prefix(while: \.isNumber)
+        return digits.isEmpty ? nil : Int(digits)
+    }
+
+    var remedy: String? {
+        switch self {
+        case .ok:
+            return nil
+        case .unreachable:
+            return "Check your VPN or network. Retrying automatically."
+        case .rejected:
+            return "Check the profile's API key and URL."
+        }
+    }
+}
+
 struct LogEvent: Identifiable, Equatable {
     enum Level: String, Comparable {
         case debug, info, warn, error, fatal
@@ -165,11 +259,18 @@ struct LogEvent: Identifiable, Equatable {
     let id = UUID()
     let time: Date
     let level: Level
+    /// The daemon's machine-readable event name, when the line has one.
+    let event: String?
     let message: String
     let fields: [String: String]
 
+    /// `sources` carries the entire data source list, which the menu renders and
+    /// a one-line log column has no room for.
+    private static let bulkFields: Set<String> = ["sources"]
+
     var fieldSummary: String {
-        fields.sorted { $0.key < $1.key }
+        fields.filter { !Self.bulkFields.contains($0.key) }
+            .sorted { $0.key < $1.key }
             .map { "\($0.key)=\($0.value)" }
             .joined(separator: " ")
     }

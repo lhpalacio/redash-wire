@@ -9,16 +9,15 @@ final class AppModel: ObservableObject {
     @Published private(set) var configError: WireError?
     @Published private(set) var selectedProfileName: String?
 
-    @Published private(set) var dataSources: [DataSource] = []
-    @Published private(set) var dataSourcesError: WireError?
-    @Published private(set) var isLoadingDataSources = false
-
     @Published var isShowingOnboarding = false
 
     let cli: WireCLI
     let supervisor: ProxySupervisor
+    let updates = UpdateChecker()
 
     private var watcher: ConfigWatcher?
+    private var updateTask: Task<Void, Never>?
+    private var didStart = false
 
     init(cli: WireCLI = .standard()) {
         self.cli = cli
@@ -35,13 +34,34 @@ final class AppModel: ObservableObject {
         return profiles.first { $0.name == name }
     }
 
+    /// Only a running proxy has data sources. Asking Redash for them while the
+    /// proxy is stopped means an API call nobody asked for, on a network that may
+    /// not reach Redash at all, to populate a menu whose connection strings point
+    /// at a port that is not listening.
+    var dataSources: [DataSource] { supervisor.dataSources }
+
     var servableDataSources: [DataSource] { dataSources.filter(\.isServable) }
     var unservableDataSources: [DataSource] { dataSources.filter { !$0.isServable } }
 
 
     func start() async {
+        // The menu bar label's .task drives this. It runs once today, but a second
+        // run would leave the first update loop running forever with nothing able
+        // to reach it.
+        guard !didStart else { return }
+        didStart = true
+
         await reloadConfig()
         watchConfigFile()
+
+        // Checks at launch and, for a menu bar app left running for weeks, once a
+        // day after that. UpdateChecker decides whether enough time has passed.
+        updateTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.updates.checkInBackground()
+                try? await Task.sleep(for: .seconds(6 * 60 * 60))
+            }
+        }
     }
 
     /// Only the menu command restarts the proxy. The config is written with a
@@ -106,38 +126,18 @@ final class AppModel: ObservableObject {
     func select(profile: Profile) async {
         guard profile.name != selectedProfileName else { return }
         selectedProfileName = profile.name
-        dataSources = []
-        dataSourcesError = nil
 
-        // Picking a profile while stopped should not start anything.
-        if supervisor.state.isRunning || supervisor.state.isBusy {
-            await supervisor.switchTo(profile: profile)
-        }
-        await refreshDataSources()
-    }
-
-    func refreshDataSources() async {
-        guard let profile = selectedProfile else { return }
-        isLoadingDataSources = true
-        defer { isLoadingDataSources = false }
-
-        do {
-            dataSources = try await cli.dataSources(profile: profile.name)
-            dataSourcesError = nil
-        } catch let error as WireError {
-            dataSources = []
-            dataSourcesError = error
-        } catch {
-            dataSources = []
-            dataSourcesError = WireError(code: .unknown, message: error.localizedDescription)
-        }
+        // Picking a profile while stopped should not start anything, and there is
+        // nothing to list until something is. The restarted proxy publishes the
+        // new profile's sources itself.
+        guard supervisor.state.isRunning || supervisor.state.isBusy else { return }
+        await supervisor.switchTo(profile: profile)
     }
 
     func runOnboarding(redashURL: String, profile: String, apiKey: String) async throws -> InitResult {
         let result = try await cli.initialize(redashURL: redashURL, profile: profile, apiKey: apiKey)
         await reloadConfig()
         selectedProfileName = result.profile
-        await refreshDataSources()
         return result
     }
 

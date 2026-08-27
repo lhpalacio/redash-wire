@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lhpalacio/redash-wire/internal/health"
 	"github.com/lhpalacio/redash-wire/internal/redash"
 )
 
@@ -31,18 +32,33 @@ type Server struct {
 	logger       *slog.Logger
 	username     string
 	password     string
+	gate         *health.Gate
 	connSeq      atomic.Int64
 }
 
-func NewServer(listenAddr string, logger *slog.Logger, redashClient redash.RedashAPI, registry redash.SourceRegistry, username, password string) *Server {
-	return &Server{
+type ServerOption func(*Server)
+
+// WithGate makes the server refuse and drop sessions while Redash is unreachable.
+// Without it the server serves unconditionally, which is what the tests that care
+// about the wire protocol rather than about health want.
+func WithGate(g *health.Gate) ServerOption {
+	return func(s *Server) { s.gate = g }
+}
+
+func NewServer(listenAddr string, logger *slog.Logger, redashClient redash.RedashAPI, registry redash.SourceRegistry, username, password string, opts ...ServerOption) *Server {
+	s := &Server{
 		listenAddr:   listenAddr,
 		redashClient: redashClient,
 		registry:     registry,
 		logger:       logger,
 		username:     username,
 		password:     password,
+		gate:         health.NewGate(),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
@@ -52,7 +68,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		return fmt.Errorf("listening on %s: %w", s.listenAddr, err)
 	}
 
-	s.logger.Info("listening (postgres)", "addr", ln.Addr().String())
+	s.logger.Info("listening (postgres)", "event", health.EventListenerReady, "wire", "postgres", "addr", ln.Addr().String())
 
 	return s.Serve(ctx, ln)
 }
@@ -101,6 +117,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 
 	connCtx, connCancel := context.WithCancel(ctx)
 	defer connCancel()
+
 	go func() {
 		<-connCtx.Done()
 		conn.Close()
@@ -112,7 +129,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	_ = conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 
 	logger := s.logger.With("remote_addr", conn.RemoteAddr().String(), "session_id", s.connSeq.Add(1))
-	session := newSession(conn, logger, s.redashClient, s.registry, s.resolvedAddr, s.username, s.password)
+	session := newSession(conn, logger, s.redashClient, s.registry, s.gate, s.resolvedAddr, s.username, s.password)
 	// Drive the session with the per-connection context so a server shutdown (and,
 	// once the session returns, a client disconnect) cancels in-flight Redash polling.
 	session.serve(connCtx)

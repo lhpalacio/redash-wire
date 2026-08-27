@@ -40,10 +40,18 @@ private struct MenuBarLabel: View {
             }
     }
 
+    /// The menu bar renders these as template images, so colour cannot carry the
+    /// difference — the symbol has to. A proxy that is up but cut off from Redash
+    /// gets its own, because leaving it looking healthy is the thing that made a
+    /// disconnected VPN invisible until a query failed.
     private var symbolName: String {
         switch model.supervisor.state {
-        case .running:
+        case .running(_, .ok):
             return "bolt.horizontal.circle.fill"
+        case .running(_, .unreachable):
+            return "bolt.slash.circle.fill"
+        case .running(_, .rejected):
+            return "exclamationmark.triangle.fill"
         case .starting:
             return "bolt.horizontal.circle"
         case .failed:
@@ -60,7 +68,7 @@ private struct MenuRoot: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        MenuBarView(model: model, supervisor: model.supervisor) { id in
+        MenuBarView(model: model, supervisor: model.supervisor, updates: model.updates) { id in
             // A menu bar app is not active, so the window would open behind others.
             NSApplication.shared.activate(ignoringOtherApps: true)
             openWindow(id: id)

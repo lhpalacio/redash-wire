@@ -1,0 +1,277 @@
+package integration_test
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"net"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/lhpalacio/redash-wire/internal/health"
+	"github.com/lhpalacio/redash-wire/internal/mysqlwire"
+	"github.com/lhpalacio/redash-wire/internal/proxy"
+)
+
+const pgDatabase = "Production PG"
+const mysqlDatabase = "Analytics MySQL"
+
+func startGatedPGServer(t *testing.T, gate *health.Gate) string {
+	t.Helper()
+	mock, registry := defaultMockAndRegistry()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	srv := proxy.NewServer(ln.Addr().String(), discardLogger, mock, registry, testUser, testPass, proxy.WithGate(gate))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.Serve(ctx, ln)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	return ln.Addr().String()
+}
+
+func startGatedMySQLServer(t *testing.T, gate *health.Gate) string {
+	t.Helper()
+	mock, registry := defaultMockAndRegistry()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	srv := mysqlwire.NewServer(ln.Addr().String(), discardLogger, mock, registry, testUser, testPass, mysqlwire.WithGate(gate))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.Serve(ctx, ln)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	return ln.Addr().String()
+}
+
+// dialPG connects without failing the test, so a refusal can be inspected rather
+// than aborting the run.
+func dialPG(addr, dbName string) (*pgx.Conn, error) {
+	host, port, _ := net.SplitHostPort(addr)
+	cfg, err := pgx.ParseConfig(fmt.Sprintf("host=%s port=%s user=%s password=%s sslmode=disable",
+		host, port, testUser, testPass))
+	if err != nil {
+		return nil, err
+	}
+	cfg.Database = dbName
+	cfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return pgx.ConnectConfig(ctx, cfg)
+}
+
+func TestPGRefusesConnectionsWhileRedashIsUnreachable(t *testing.T) {
+	gate := health.NewGate()
+	gate.Fail(health.KindUnreachable, "dial tcp: i/o timeout")
+	addr := startGatedPGServer(t, gate)
+
+	conn, err := dialPG(addr, pgDatabase)
+	if err == nil {
+		conn.Close(context.Background())
+		t.Fatal("connected while Redash was unreachable, want a refusal")
+	}
+	// The whole point of refusing after the handshake rather than at accept: the
+	// person is in a terminal, and this is where they find out it was the VPN.
+	if !strings.Contains(err.Error(), "unreachable") {
+		t.Errorf("connect error = %q, want it to name Redash as the cause", err)
+	}
+}
+
+func TestPGRefusalPointsAtTheKeyWhenRedashRejectedUs(t *testing.T) {
+	gate := health.NewGate()
+	gate.Fail(health.KindRejected, "data sources request failed (status 401)")
+	addr := startGatedPGServer(t, gate)
+
+	conn, err := dialPG(addr, pgDatabase)
+	if err == nil {
+		conn.Close(context.Background())
+		t.Fatal("connected while Redash was rejecting us, want a refusal")
+	}
+	// A dead key and a dead network need different things from the user, so the
+	// two refusals must not read the same.
+	if !strings.Contains(err.Error(), "api_key") {
+		t.Errorf("connect error = %q, want it to point at the API key", err)
+	}
+}
+
+func TestPGDropsALiveSessionWhenRedashGoesAway(t *testing.T) {
+	gate := health.NewGate()
+	addr := startGatedPGServer(t, gate)
+
+	conn, err := dialPG(addr, pgDatabase)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	ctx := context.Background()
+	if _, err := conn.Exec(ctx, "SELECT * FROM users"); err != nil {
+		t.Fatalf("query before the drop: %v", err)
+	}
+
+	gate.Fail(health.KindUnreachable, "the vpn went away")
+
+	// Keep issuing queries until the socket is gone: whichever lands first, the
+	// interrupted read or the query-time gate check, the session must not survive
+	// a proxy that can no longer serve it.
+	var firstErr error
+	deadline := time.Now().Add(5 * time.Second)
+	for !conn.IsClosed() && time.Now().Before(deadline) {
+		_, err := conn.Exec(ctx, "SELECT * FROM users")
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		if err == nil {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	if !conn.IsClosed() {
+		t.Fatal("the live session survived Redash going away")
+	}
+	if firstErr == nil || !strings.Contains(firstErr.Error(), "unreachable") {
+		t.Errorf("first error after the drop = %v, want it to name Redash as the cause", firstErr)
+	}
+}
+
+func TestPGServesAgainAfterRecoveryWithoutARestart(t *testing.T) {
+	gate := health.NewGate()
+	gate.Fail(health.KindUnreachable, "down")
+	addr := startGatedPGServer(t, gate)
+
+	if conn, err := dialPG(addr, pgDatabase); err == nil {
+		conn.Close(context.Background())
+		t.Fatal("connected while the gate was down")
+	}
+
+	// The listener stayed bound throughout, which is the reason recovery needs no
+	// click in the menu bar: the VPN comes back and the next connect just works.
+	gate.Recover()
+
+	conn, err := dialPG(addr, pgDatabase)
+	if err != nil {
+		t.Fatalf("connect after recovery: %v", err)
+	}
+	defer conn.Close(context.Background())
+
+	if _, err := conn.Exec(context.Background(), "SELECT * FROM users"); err != nil {
+		t.Fatalf("query after recovery: %v", err)
+	}
+}
+
+func TestMySQLRefusesWhileRedashIsUnreachable(t *testing.T) {
+	gate := health.NewGate()
+	gate.Fail(health.KindUnreachable, "dial tcp: i/o timeout")
+	addr := startGatedMySQLServer(t, gate)
+
+	// go-mysql calls UseDB during the handshake when the DSN names a database, so
+	// the refusal reaches the client before it ever gets a prompt.
+	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s?allowNativePasswords=true",
+		testUser, testPass, addr, mysqlDatabase))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	err = db.Ping()
+	if err == nil {
+		t.Fatal("connected while Redash was unreachable, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "unreachable") {
+		t.Errorf("ping error = %q, want it to name Redash as the cause", err)
+	}
+}
+
+func TestMySQLDropsALiveSessionWhenRedashGoesAway(t *testing.T) {
+	gate := health.NewGate()
+	addr := startGatedMySQLServer(t, gate)
+
+	db := connectMySQL(t, addr, mysqlDatabase)
+	if _, err := db.Exec("SELECT * FROM users"); err != nil {
+		t.Fatalf("query before the drop: %v", err)
+	}
+
+	gate.Fail(health.KindUnreachable, "the vpn went away")
+
+	// Unlike the Postgres side, this error does not name Redash: go-mysql owns the
+	// write side of an established connection, and an error packet the client
+	// never asked for is not valid on the wire. The session is dropped and the
+	// client sees a broken connection; the reason reaches it on the reconnect,
+	// which TestMySQLRefusesWhileRedashIsUnreachable covers.
+	var err error
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err = db.Exec("SELECT * FROM users"); err != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err == nil {
+		t.Fatal("the live session survived Redash going away")
+	}
+}
+
+func TestMySQLWithNoDatabaseIsToldWhyWhileRedashIsUnreachable(t *testing.T) {
+	// `mysql -u ... -p` with no -D never reaches UseDB during the handshake, so
+	// nothing refuses the connection. It has to learn the reason from its first
+	// command, which means the socket must survive long enough to send one and
+	// the gate has to answer before "No database selected" does.
+	gate := health.NewGate()
+	gate.Fail(health.KindUnreachable, "dial tcp: i/o timeout")
+	addr := startGatedMySQLServer(t, gate)
+
+	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/?allowNativePasswords=true",
+		testUser, testPass, addr))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec("SELECT * FROM users")
+	if err == nil {
+		t.Fatal("a query succeeded while Redash was unreachable")
+	}
+	if !strings.Contains(err.Error(), "unreachable") {
+		t.Errorf("query error = %q, want it to name Redash rather than the missing database", err)
+	}
+}
+
+func TestServersWithoutAGateServeUnconditionally(t *testing.T) {
+	// The wire-protocol tests construct servers with no gate at all; that must
+	// keep meaning "always serve", not "never serve".
+	mock, registry := defaultMockAndRegistry()
+	addr := startPGServer(t, mock, registry)
+
+	conn, err := dialPG(addr, pgDatabase)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(context.Background())
+
+	if _, err := conn.Exec(context.Background(), "SELECT * FROM users"); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+}

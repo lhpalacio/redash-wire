@@ -1,6 +1,16 @@
 import AppKit
 import SwiftUI
 
+extension String {
+    /// An NSMenu item is a single line that never wraps: the menu widens to fit
+    /// the longest one, so anything that came from an error or from the config
+    /// has to be bounded before it gets here.
+    func fittedToMenu(limit: Int = 64) -> String {
+        guard count > limit else { return self }
+        return prefix(limit - 1).trimmingCharacters(in: .whitespaces) + "…"
+    }
+}
+
 /// The `.menu` style renders a real NSMenu, so this is limited to Text, Button,
 /// Toggle, Divider and nested Menu.
 ///
@@ -9,6 +19,7 @@ import SwiftUI
 struct MenuBarView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var supervisor: ProxySupervisor
+    @ObservedObject var updates: UpdateChecker
     let openWindow: (String) -> Void
 
     var body: some View {
@@ -44,12 +55,18 @@ struct MenuBarView: View {
         }
 
         if case .failed(let reason) = supervisor.state {
-            Text(reason)
-            Button {
-                openWindow("logs")
-            } label: {
-                Label("Show Logs", systemImage: "list.bullet.rectangle")
+            Text(reason.fittedToMenu())
+            showLogsButton
+        } else if let health = supervisor.state.health, !health.isOK {
+            // The listeners are bound but nothing behind them can be served, so
+            // the addresses would be a lie. Show the cause and the fix instead.
+            if let summary = health.summary {
+                Text(summary)
             }
+            if let remedy = health.remedy {
+                Text(remedy)
+            }
+            showLogsButton
         } else if supervisor.state.isRunning, let profile = model.selectedProfile {
             ForEach(listenerLines(for: profile), id: \.self) { line in
                 Text(line)
@@ -57,33 +74,50 @@ struct MenuBarView: View {
         }
 
         if let error = model.configError {
-            Text(error.message)
+            Text(error.message.fittedToMenu())
             if let remedy = error.remedy {
                 Text(remedy)
             }
         }
     }
 
+    @ViewBuilder
+    private var showLogsButton: some View {
+        Button {
+            openWindow("logs")
+        } label: {
+            Label("Show Logs", systemImage: "list.bullet.rectangle")
+        }
+    }
+
     private var statusLine: String {
-        let name = model.selectedProfileName ?? "no profile"
+        let name = (model.selectedProfileName ?? "no profile").fittedToMenu(limit: 24)
         switch supervisor.state {
         case .stopped:
             return "Stopped — \(name)"
         case .starting:
             return "Starting — \(name)"
-        case .running(let since):
+        case .running(let since, .ok):
             return "Running — \(name) (\(Self.uptime(since: since)))"
+        case .running(_, .unreachable):
+            return "Redash unreachable — \(name)"
+        case .running(_, .rejected):
+            return "Redash rejected the API key — \(name)"
         case .failed:
             return "Failed — \(name)"
         }
     }
 
-    /// Stopped is grey, not red: you stopped it on purpose. Red is left for a crash.
+    /// Stopped is grey, not red: you stopped it on purpose. Amber separates a
+    /// Redash that should come back on its own from a red one that needs you to
+    /// go and change something.
     private static func statusColor(for state: ProxySupervisor.State) -> NSColor {
         switch state {
         case .stopped: return .systemGray
         case .starting: return .systemYellow
-        case .running: return .systemGreen
+        case .running(_, .ok): return .systemGreen
+        case .running(_, .unreachable): return .systemOrange
+        case .running(_, .rejected): return .systemRed
         case .failed: return .systemRed
         }
     }
@@ -173,17 +207,8 @@ struct MenuBarView: View {
     @ViewBuilder
     private var dataSourceSection: some View {
         Menu {
-            if let error = model.dataSourcesError {
-                Text(error.message)
-                if let remedy = error.remedy {
-                    Text(remedy)
-                }
-                Button("Retry") { Task { await model.refreshDataSources() } }
-            } else if model.isLoadingDataSources {
-                Text("Loading…")
-            } else if model.dataSources.isEmpty {
-                Text("No data sources")
-                Button("Refresh") { Task { await model.refreshDataSources() } }
+            if model.dataSources.isEmpty {
+                Text(emptyDataSourceMessage)
             } else {
                 ForEach(model.servableDataSources) { source in
                     Menu(source.name) {
@@ -198,13 +223,25 @@ struct MenuBarView: View {
                         Text("\(source.name) (\(source.type))")
                     }
                 }
-
-                Divider()
-                Button("Refresh") { Task { await model.refreshDataSources() } }
             }
         } label: {
             Label(dataSourceMenuTitle, systemImage: "cylinder.split.1x2")
         }
+    }
+
+    /// The list is empty for four different reasons and they are worth telling
+    /// apart, since only the last one is about Redash having nothing to serve.
+    private var emptyDataSourceMessage: String {
+        if supervisor.state.isBusy {
+            return "Loading…"
+        }
+        if !supervisor.state.isRunning {
+            return "Start the proxy to list data sources"
+        }
+        if let health = supervisor.state.health, !health.isOK {
+            return "Waiting for Redash"
+        }
+        return "No data sources"
     }
 
     private var dataSourceMenuTitle: String {
@@ -304,6 +341,23 @@ struct MenuBarView: View {
     /// LSUIElement leaves no app menu, so this is the only place the version shows.
     @ViewBuilder
     private var aboutSection: some View {
+        // Added by the daily background check. Nothing is downloaded and nothing
+        // interrupts you: the row is the whole notification.
+        if let release = updates.available {
+            Button {
+                updates.openReleasePage()
+            } label: {
+                Label("Update available — \(release.version)", systemImage: "arrow.down.circle")
+            }
+        }
+
+        Button {
+            Task { await updates.checkNow() }
+        } label: {
+            Label("Check for Updates…", systemImage: "arrow.triangle.2.circlepath")
+        }
+        .disabled(updates.isChecking)
+
         Button {
             NSApplication.shared.activate(ignoringOtherApps: true)
             NSApplication.shared.orderFrontStandardAboutPanel(nil)

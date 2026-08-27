@@ -3,6 +3,7 @@ package pgwire
 import (
 	"crypto/rand"
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -11,6 +12,24 @@ import (
 )
 
 var ErrAuthFailed = fmt.Errorf("authentication failed")
+
+// ErrRefused reports that a valid login was turned away by the admission check.
+// The client has already been told why, over the wire.
+var ErrRefused = errors.New("connection refused")
+
+// SQLStateConnectionFailure (08006) says the fault is upstream of the proxy,
+// rather than in the client's credentials or its SQL.
+const SQLStateConnectionFailure = "08006"
+
+// Admit runs after the client authenticates and before the server declares itself
+// ready. Returning an error refuses the connection, and that error's message is
+// what the client is shown.
+//
+// It has to happen inside the startup exchange. Once ReadyForQuery reaches the
+// wire, pgx and libpq both consider the connection established: a FATAL sent
+// after that point surfaces as a failed *query* on a connection the client
+// believes it opened successfully, which is not a refusal at all.
+type Admit func() error
 
 // MaxClientMessageBytes caps the declared body length of a single client protocol
 // message. pgproto3 checks this before allocating, so a hostile client cannot make
@@ -22,7 +41,7 @@ const MaxClientMessageBytes = 64 << 20
 // upgrades, authenticates the client against the configured credentials, and sends
 // the post-auth parameter bundle through ReadyForQuery. It returns the client's
 // startup parameters (user, database, application_name, ...) for the session to use.
-func HandleStartup(backend *pgproto3.Backend, conn net.Conn, username, password string) (map[string]string, error) {
+func HandleStartup(backend *pgproto3.Backend, conn net.Conn, username, password string, admit Admit) (map[string]string, error) {
 	for {
 		startupMsg, err := backend.ReceiveStartupMessage()
 		if err != nil {
@@ -47,6 +66,15 @@ func HandleStartup(backend *pgproto3.Backend, conn net.Conn, username, password 
 
 			if err := authenticate(backend, conn, params["user"], username, password); err != nil {
 				return nil, err
+			}
+
+			// After authentication, so a port scanner cannot read the proxy's
+			// health off an unauthenticated connection.
+			if admit != nil {
+				if err := admit(); err != nil {
+					_ = SendFatal(conn, SQLStateConnectionFailure, err.Error())
+					return nil, fmt.Errorf("%w: %w", ErrRefused, err)
+				}
 			}
 
 			buf, err := encode((&pgproto3.AuthenticationOk{}).Encode(nil))

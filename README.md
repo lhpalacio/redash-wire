@@ -93,7 +93,7 @@ listeners on localhost unless you trust the network.
 
 With no arguments, or with only flags, `redash-wire` starts the proxy. The
 serve flags are `-config <path>`, `-profile <name>`, `-debug`, `-version`,
-`-log-format <text|json>`, and `-exit-on-stdin-eof`.
+`-log-format <text|json>`, `-exit-on-stdin-eof`, and `-wait-for-redash`.
 
 `-log-format json` writes every log event as a JSON object on stderr with an
 RFC3339 timestamp. It also drops the startup banner and the setup wizard, since
@@ -102,6 +102,27 @@ its stdin reaches EOF, which is what happens when the process that spawned it
 goes away. macOS reparents a child process when its parent dies, so without this
 a supervising app that gets force-quit leaves the proxy running and still
 holding its listen ports.
+
+`-wait-for-redash` changes what an unreachable Redash means at startup. Without
+it the proxy exits 1, which is what a script or a container wants. With it the
+proxy binds its listeners anyway and refuses connections until Redash answers,
+so a supervising app that launches before the VPN is up gets a proxy that
+recovers on its own.
+
+While serving, the proxy asks Redash for its data sources every 30 seconds. One
+call answers two questions: whether Redash is reachable, and what it holds now,
+so a data source added while the proxy runs shows up without a restart. Two
+failures in a row close the gate. The startup probe is the exception: nothing has
+proved Redash reachable yet and there is no session to protect, so one failure is
+enough. While the gate is closed the proxy drops open SQL sessions and refuses
+new ones, with the ports still bound so recovery needs nothing from you.
+Postgres clients are told the reason at login and when they are dropped. A MySQL
+client is told on its next connection or query, because go-mysql owns the write
+side of a session already under way. A query that dies on an
+infrastructure error triggers a probe immediately instead of waiting out the
+interval. A 401, 403 or 404 reads differently from a timeout, and backs off to
+five minutes: a rejected key needs you to edit the config, a dropped VPN does
+not.
 
 A first argument that isn't a flag is a subcommand. Each one answers a question
 and exits, so a script or a supervising app can ask without starting a server:
@@ -196,18 +217,28 @@ From the menu you can:
 
 - Start and stop the proxy, and choose which profile it serves. One profile runs
   at a time.
-- Browse that profile's Redash data sources. The menu lists the ones the proxy
-  can't serve in their own section, so you can see why a source is absent. Every
-  servable one copies a `psql` or `mysql` command, or a connection URI, with the
-  data source already filled in as the database name.
+- Browse the running proxy's Redash data sources. The list appears when you
+  start it and empties when you stop, because the proxy is what reports it. The
+  menu keeps the ones it can't serve in their own section, so you can see why a
+  source is absent. Every servable one copies a `psql` or `mysql` command, or a
+  connection URI, with the data source already filled in as the database name.
 - Copy the profile-level details from the Connect submenu: the psql or mysql
   command, the username, the password.
+- See whether Redash itself is answering. The proxy polls it while running, so
+  the menu says so within a minute of the VPN dropping, rather than the next
+  time a query fails.
 - Follow the proxy's log stream in a window you can filter by level and by text.
 - Turn on launch at login.
+- Check for a new release. It compares the app's version against the latest tag
+  on GitHub and opens the release page. Nothing downloads or installs itself. A
+  background check runs once a day and adds a menu row when there's something
+  new.
 - Open `config.yaml` in a text editor with Settings…, and apply your edits with
   Reload Configuration.
 - Read the proxy's state off the dot beside the status line: grey stopped,
-  yellow starting, green running, red failed.
+  yellow starting, green running, amber running but cut off from Redash, red
+  failed or a rejected API key. The menu bar icon carries the same distinction,
+  since that's the part you can see without opening anything.
 
 The first run opens a setup sheet that asks for your Redash URL and API key and
 hands them to `redash-wire init`. Only the binary ever writes `config.yaml`, so
@@ -225,10 +256,20 @@ A few decisions behind it that aren't obvious from the outside:
   there could otherwise point the proxy at somebody else's Redash.
 - It spawns the proxy with `-exit-on-stdin-eof`, so force-quitting the app can't
   leave an orphan behind still holding the listen ports.
+- It also passes `-wait-for-redash`. An unreachable Redash is then a state the
+  menu shows rather than a reason to exit, and the proxy recovers by itself when
+  the VPN comes back.
 - A proxy that dies before it ever starts listening died of something permanent,
-  like a rejected API key or a port already in use, so the app shows the reason
-  and doesn't retry. It restarts one that dies after it was serving, with
-  backoff, three times at most.
+  like a port already in use or a profile that doesn't parse, so the app shows
+  the reason and doesn't retry. It restarts one that dies after it was serving,
+  with backoff, three times at most.
+- The data source list comes from the running proxy's health events. The app
+  never asks Redash for it directly: two callers asking the same question can
+  get different answers, and the proxy's copy is the one that resolves the
+  database name you connect with. With the proxy stopped there is nothing to
+  list, and the app makes no request.
+- The app switches on the `event` field of each JSON log line, never on the
+  message text. A reworded log message used to be enough to break the menu.
 - Copying a password clears it from the clipboard 60 seconds later, unless you
   copied something else in the meantime.
 - Settings… opens the config with whatever app claims `.yaml`, or TextEdit if

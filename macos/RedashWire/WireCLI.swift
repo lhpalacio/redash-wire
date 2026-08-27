@@ -12,10 +12,6 @@ struct WireCLI {
         try await runJSON(["config", "-json", "-config", configPath])
     }
 
-    func dataSources(profile: String) async throws -> [DataSource] {
-        try await runJSON(["datasources", "-json", "-config", configPath, "-profile", profile])
-    }
-
     /// The key goes over stdin, never argv, which `ps` exposes.
     func initialize(redashURL: String, profile: String, apiKey: String) async throws -> InitResult {
         try await runJSON(
@@ -26,8 +22,18 @@ struct WireCLI {
 
     /// `-exit-on-stdin-eof` stops a force-quit from leaving an orphan on the ports.
     /// It only works while the supervisor holds the child's stdin pipe open.
+    ///
+    /// `-wait-for-redash` makes an unreachable Redash a state to show rather than
+    /// a reason to exit, so launching at login before the VPN is up leaves a proxy
+    /// that recovers by itself. The bare CLI still fails fast without it.
     func serveArguments(profile: String) -> [String] {
-        ["-config", configPath, "-profile", profile, "-log-format=json", "-exit-on-stdin-eof"]
+        [
+            "-config", configPath,
+            "-profile", profile,
+            "-log-format=json",
+            "-exit-on-stdin-eof",
+            "-wait-for-redash",
+        ]
     }
 
 
