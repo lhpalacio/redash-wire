@@ -1,6 +1,16 @@
 import AppKit
 import SwiftUI
 
+extension String {
+    /// An NSMenu item is a single line that never wraps: the menu widens to fit
+    /// the longest one, so anything that came from an error or from the config
+    /// has to be bounded before it gets here.
+    func fittedToMenu(limit: Int = 64) -> String {
+        guard count > limit else { return self }
+        return prefix(limit - 1).trimmingCharacters(in: .whitespaces) + "…"
+    }
+}
+
 /// The `.menu` style renders a real NSMenu, so this is limited to Text, Button,
 /// Toggle, Divider and nested Menu.
 ///
@@ -45,13 +55,13 @@ struct MenuBarView: View {
         }
 
         if case .failed(let reason) = supervisor.state {
-            Text(reason)
+            Text(reason.fittedToMenu())
             showLogsButton
         } else if let health = supervisor.state.health, !health.isOK {
             // The listeners are bound but nothing behind them can be served, so
             // the addresses would be a lie. Show the cause and the fix instead.
-            if let detail = health.detail {
-                Text(detail)
+            if let summary = health.summary {
+                Text(summary)
             }
             if let remedy = health.remedy {
                 Text(remedy)
@@ -64,7 +74,7 @@ struct MenuBarView: View {
         }
 
         if let error = model.configError {
-            Text(error.message)
+            Text(error.message.fittedToMenu())
             if let remedy = error.remedy {
                 Text(remedy)
             }
@@ -81,7 +91,7 @@ struct MenuBarView: View {
     }
 
     private var statusLine: String {
-        let name = model.selectedProfileName ?? "no profile"
+        let name = (model.selectedProfileName ?? "no profile").fittedToMenu(limit: 24)
         switch supervisor.state {
         case .stopped:
             return "Stopped — \(name)"

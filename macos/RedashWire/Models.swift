@@ -171,14 +171,60 @@ enum RedashHealth: Equatable {
 
     var isOK: Bool { self == .ok }
 
-    /// The daemon's own error text.
-    var detail: String? {
+    /// A few words for the menu, never the daemon's own error text.
+    ///
+    /// That text is a Go error carrying a full URL — `Get "https://redash…/api/
+    /// data_sources": context deadline exceeded` — and an NSMenu item is one line
+    /// that never wraps, so the menu widens to fit the longest thing in it. One
+    /// error string is enough to stretch the whole menu across the screen. The
+    /// original is in the log window, which is where a URL and a stack of wrapped
+    /// causes are worth reading.
+    var summary: String? {
         switch self {
         case .ok:
             return nil
-        case .unreachable(let reason), .rejected(let reason):
-            return reason
+        case .unreachable(let reason):
+            return Self.reachabilityPhrase(for: reason)
+        case .rejected(let reason):
+            guard let status = Self.httpStatus(in: reason) else {
+                return "Redash refused the request."
+            }
+            return "Redash answered with status \(status)."
         }
+    }
+
+    /// Matched on the text because Go's net and http errors arrive as prose. A
+    /// phrase we do not recognise falls back to saying only what we know for
+    /// certain, rather than pasting the error in and hoping it is short.
+    private static func reachabilityPhrase(for reason: String) -> String {
+        let text = reason.lowercased()
+
+        if text.contains("context deadline exceeded") || text.contains("timeout") || text.contains("timed out") {
+            return "The request timed out."
+        }
+        if text.contains("connection refused") {
+            return "The connection was refused."
+        }
+        if text.contains("no such host") || text.contains("server misbehaving") {
+            return "That host could not be found."
+        }
+        if text.contains("network is unreachable") || text.contains("no route to host") {
+            return "The network is unreachable."
+        }
+        if text.contains("certificate") || text.contains("x509") || text.contains("tls") {
+            return "The TLS certificate was rejected."
+        }
+        if let status = httpStatus(in: reason) {
+            return "Redash answered with status \(status)."
+        }
+        return "Redash did not answer."
+    }
+
+    /// The daemon writes these as "… request failed (status 401)".
+    private static func httpStatus(in reason: String) -> Int? {
+        guard let marker = reason.range(of: "status ") else { return nil }
+        let digits = reason[marker.upperBound...].prefix(while: \.isNumber)
+        return digits.isEmpty ? nil : Int(digits)
     }
 
     var remedy: String? {
@@ -186,9 +232,9 @@ enum RedashHealth: Equatable {
         case .ok:
             return nil
         case .unreachable:
-            return "Check your VPN and your connection to Redash. Retrying automatically."
+            return "Check your VPN or network. Retrying automatically."
         case .rejected:
-            return "Check the profile's API key, and that the URL points at your Redash."
+            return "Check the profile's API key and URL."
         }
     }
 }
