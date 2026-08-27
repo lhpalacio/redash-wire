@@ -213,10 +213,11 @@ From the menu you can:
 
 - Start and stop the proxy, and choose which profile it serves. One profile runs
   at a time.
-- Browse that profile's Redash data sources. The menu lists the ones the proxy
-  can't serve in their own section, so you can see why a source is absent. Every
-  servable one copies a `psql` or `mysql` command, or a connection URI, with the
-  data source already filled in as the database name.
+- Browse the running proxy's Redash data sources. The list appears when you
+  start it and empties when you stop, because the proxy is what reports it. The
+  menu keeps the ones it can't serve in their own section, so you can see why a
+  source is absent. Every servable one copies a `psql` or `mysql` command, or a
+  connection URI, with the data source already filled in as the database name.
 - Copy the profile-level details from the Connect submenu: the psql or mysql
   command, the username, the password.
 - See whether Redash itself is answering. The proxy polls it while running, so
@@ -258,10 +259,11 @@ A few decisions behind it that aren't obvious from the outside:
   like a port already in use or a profile that doesn't parse, so the app shows
   the reason and doesn't retry. It restarts one that dies after it was serving,
   with backoff, three times at most.
-- While the proxy runs, the data source list comes from its health events
-  instead of a separate `datasources` call. Two callers asking Redash the same
-  question can get different answers, and the proxy's copy is the one that
-  resolves the database name you connect with.
+- The data source list comes from the running proxy's health events. The app
+  never asks Redash for it directly: two callers asking the same question can
+  get different answers, and the proxy's copy is the one that resolves the
+  database name you connect with. With the proxy stopped there is nothing to
+  list, and the app makes no request.
 - The app switches on the `event` field of each JSON log line, never on the
   message text. A reworded log message used to be enough to break the menu.
 - Copying a password clears it from the clipboard 60 seconds later, unless you

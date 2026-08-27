@@ -197,17 +197,8 @@ struct MenuBarView: View {
     @ViewBuilder
     private var dataSourceSection: some View {
         Menu {
-            if let error = model.dataSourcesError {
-                Text(error.message)
-                if let remedy = error.remedy {
-                    Text(remedy)
-                }
-                refreshButton
-            } else if model.isLoadingDataSources {
-                Text("Loading…")
-            } else if model.dataSources.isEmpty {
-                Text("No data sources")
-                refreshButton
+            if model.dataSources.isEmpty {
+                Text(emptyDataSourceMessage)
             } else {
                 ForEach(model.servableDataSources) { source in
                     Menu(source.name) {
@@ -222,25 +213,25 @@ struct MenuBarView: View {
                         Text("\(source.name) (\(source.type))")
                     }
                 }
-
-                if !supervisor.state.isRunning {
-                    Divider()
-                    refreshButton
-                }
             }
         } label: {
             Label(dataSourceMenuTitle, systemImage: "cylinder.split.1x2")
         }
     }
 
-    /// Only offered while the proxy is stopped. A running proxy refreshes the list
-    /// itself on every health probe, and re-fetching it separately is how the menu
-    /// and the registry that resolves these names drifted apart in the first place.
-    @ViewBuilder
-    private var refreshButton: some View {
-        if !supervisor.state.isRunning {
-            Button("Refresh") { Task { await model.refreshDataSources() } }
+    /// The list is empty for four different reasons and they are worth telling
+    /// apart, since only the last one is about Redash having nothing to serve.
+    private var emptyDataSourceMessage: String {
+        if supervisor.state.isBusy {
+            return "Loading…"
         }
+        if !supervisor.state.isRunning {
+            return "Start the proxy to list data sources"
+        }
+        if let health = supervisor.state.health, !health.isOK {
+            return "Waiting for Redash"
+        }
+        return "No data sources"
     }
 
     private var dataSourceMenuTitle: String {

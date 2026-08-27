@@ -41,6 +41,12 @@ final class ProxySupervisor: ObservableObject {
     @Published private(set) var activeProfile: Profile?
     @Published private(set) var events: [LogEvent] = []
 
+    /// Reported by the running proxy on every health probe, and emptied whenever
+    /// that proxy goes away. It belongs to the process: it comes from the same
+    /// registry that resolves the database name you connect with, so a list left
+    /// behind by a proxy that has stopped would describe a port nothing answers.
+    @Published private(set) var dataSources: [DataSource] = []
+
     private let cli: WireCLI
     private var process: Process?
     /// Held open deliberately: closing it triggers the child's -exit-on-stdin-eof.
@@ -51,11 +57,6 @@ final class ProxySupervisor: ObservableObject {
     /// cold start under -wait-for-redash does exactly that — so the latest health
     /// is held here and applied when the state reaches running.
     private var reportedHealth: RedashHealth = .ok
-
-    /// Called with the daemon's own data source list. While the proxy runs this is
-    /// authoritative: it comes from the same registry that resolves a database
-    /// name, so the menu cannot offer a source the proxy would then fail to find.
-    var onDataSources: (([DataSource]) -> Void)?
 
     private var expectedListeners = 0
     private var seenListeners = 0
@@ -126,6 +127,7 @@ final class ProxySupervisor: ObservableObject {
         stopRequested = false
         reportedHealth = .ok
         lastErrorMessage = nil
+        dataSources = []
         lineBuffer.removeAll()
         state = .starting
 
@@ -217,7 +219,7 @@ final class ProxySupervisor: ObservableObject {
                 let payload = event.fields["sources"],
                 let sources = try? JSONDecoder().decode([DataSource].self, from: Data(payload.utf8))
             else { return }
-            onDataSources?(sources)
+            dataSources = sources
 
         default:
             break
@@ -266,6 +268,9 @@ final class ProxySupervisor: ObservableObject {
     private func handleExit(status: Int32) {
         process = nil
         stdinPipe = nil
+        // Whatever happens next — a backoff restart, a failure, a clean stop —
+        // nothing is serving these any more.
+        dataSources = []
 
         if stopRequested {
             finishStopped()
@@ -306,6 +311,7 @@ final class ProxySupervisor: ObservableObject {
         stopRequested = false
         reachedReady = false
         seenListeners = 0
+        dataSources = []
         state = .stopped
     }
 }

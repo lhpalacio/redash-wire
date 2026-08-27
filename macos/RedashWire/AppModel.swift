@@ -9,10 +9,6 @@ final class AppModel: ObservableObject {
     @Published private(set) var configError: WireError?
     @Published private(set) var selectedProfileName: String?
 
-    @Published private(set) var dataSources: [DataSource] = []
-    @Published private(set) var dataSourcesError: WireError?
-    @Published private(set) var isLoadingDataSources = false
-
     @Published var isShowingOnboarding = false
 
     let cli: WireCLI
@@ -25,14 +21,6 @@ final class AppModel: ObservableObject {
     init(cli: WireCLI = .standard()) {
         self.cli = cli
         self.supervisor = ProxySupervisor(cli: cli)
-
-        // While the proxy runs, its own health poll is the source of the list. It
-        // reads the registry that actually resolves a database name, so the menu
-        // can no longer offer a source the proxy would fail to find.
-        supervisor.onDataSources = { [weak self] sources in
-            self?.dataSources = sources
-            self?.dataSourcesError = nil
-        }
     }
 
 
@@ -45,6 +33,12 @@ final class AppModel: ObservableObject {
         return profiles.first { $0.name == name }
     }
 
+    /// Only a running proxy has data sources. Asking Redash for them while the
+    /// proxy is stopped means an API call nobody asked for, on a network that may
+    /// not reach Redash at all, to populate a menu whose connection strings point
+    /// at a port that is not listening.
+    var dataSources: [DataSource] { supervisor.dataSources }
+
     var servableDataSources: [DataSource] { dataSources.filter(\.isServable) }
     var unservableDataSources: [DataSource] { dataSources.filter { !$0.isServable } }
 
@@ -52,13 +46,6 @@ final class AppModel: ObservableObject {
     func start() async {
         await reloadConfig()
         watchConfigFile()
-
-        // Nothing has published a list yet with the proxy stopped, and a menu whose
-        // data sources appear only after you start something is a menu you have to
-        // learn. This also surfaces an unreachable Redash before you press Start.
-        if !supervisor.state.isRunning {
-            await refreshDataSources()
-        }
 
         // Checks at launch and, for a menu bar app left running for weeks, once a
         // day after that. UpdateChecker decides whether enough time has passed.
@@ -125,10 +112,6 @@ final class AppModel: ObservableObject {
         if supervisor.state.isRunning || supervisor.state.isBusy {
             await supervisor.stop()
         } else if let profile = selectedProfile {
-            // A failed CLI fetch from while the proxy was stopped would otherwise
-            // sit in the menu contradicting the health line the daemon is about to
-            // publish. The running proxy is the better witness; let it answer.
-            dataSourcesError = nil
             supervisor.start(profile: profile)
         }
     }
@@ -136,42 +119,18 @@ final class AppModel: ObservableObject {
     func select(profile: Profile) async {
         guard profile.name != selectedProfileName else { return }
         selectedProfileName = profile.name
-        dataSources = []
-        dataSourcesError = nil
 
-        // Picking a profile while stopped should not start anything.
-        if supervisor.state.isRunning || supervisor.state.isBusy {
-            // The restarted daemon publishes the new profile's sources itself.
-            await supervisor.switchTo(profile: profile)
-            return
-        }
-        await refreshDataSources()
-    }
-
-    /// The stopped-proxy path: with nothing running to publish a list, the CLI is
-    /// asked directly. While the proxy runs, the health events do this instead.
-    func refreshDataSources() async {
-        guard let profile = selectedProfile else { return }
-        isLoadingDataSources = true
-        defer { isLoadingDataSources = false }
-
-        do {
-            dataSources = try await cli.dataSources(profile: profile.name)
-            dataSourcesError = nil
-        } catch let error as WireError {
-            dataSources = []
-            dataSourcesError = error
-        } catch {
-            dataSources = []
-            dataSourcesError = WireError(code: .unknown, message: error.localizedDescription)
-        }
+        // Picking a profile while stopped should not start anything, and there is
+        // nothing to list until something is. The restarted proxy publishes the
+        // new profile's sources itself.
+        guard supervisor.state.isRunning || supervisor.state.isBusy else { return }
+        await supervisor.switchTo(profile: profile)
     }
 
     func runOnboarding(redashURL: String, profile: String, apiKey: String) async throws -> InitResult {
         let result = try await cli.initialize(redashURL: redashURL, profile: profile, apiKey: apiKey)
         await reloadConfig()
         selectedProfileName = result.profile
-        await refreshDataSources()
         return result
     }
 

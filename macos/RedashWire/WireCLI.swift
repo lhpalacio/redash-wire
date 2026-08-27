@@ -12,10 +12,6 @@ struct WireCLI {
         try await runJSON(["config", "-json", "-config", configPath])
     }
 
-    func dataSources(profile: String) async throws -> [DataSource] {
-        try await runJSON(["datasources", "-json", "-config", configPath, "-profile", profile])
-    }
-
     /// The key goes over stdin, never argv, which `ps` exposes.
     func initialize(redashURL: String, profile: String, apiKey: String) async throws -> InitResult {
         try await runJSON(
