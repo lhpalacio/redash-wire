@@ -112,9 +112,13 @@ recovers on its own.
 While serving, the proxy asks Redash for its data sources every 30 seconds. One
 call answers two questions: whether Redash is reachable, and what it holds now,
 so a data source added while the proxy runs shows up without a restart. Two
-failures in a row close the gate. The proxy then drops open SQL sessions with an
-error naming the cause and refuses new ones until a probe succeeds, with the
-ports still bound so recovery needs nothing from you. A query that dies on an
+failures in a row close the gate. The startup probe is the exception: nothing has
+proved Redash reachable yet and there is no session to protect, so one failure is
+enough. While the gate is closed the proxy drops open SQL sessions and refuses
+new ones, with the ports still bound so recovery needs nothing from you.
+Postgres clients are told the reason at login and when they are dropped. A MySQL
+client is told on its next connection or query, because go-mysql owns the write
+side of a session already under way. A query that dies on an
 infrastructure error triggers a probe immediately instead of waiting out the
 interval. A 401, 403 or 404 reads differently from a timeout, and backs off to
 five minutes: a rejected key needs you to edit the config, a dropped VPN does

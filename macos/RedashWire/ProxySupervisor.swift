@@ -192,6 +192,13 @@ final class ProxySupervisor: ObservableObject {
             lastErrorMessage = Self.reason(for: event)
         }
 
+        // Everything the child wrote belongs in the log, but nothing it wrote may
+        // change state once it has exited. stderr is drained on a different task
+        // from terminationHandler, so the last buffered line can arrive after the
+        // process is gone — and would otherwise report a dead proxy as running, or
+        // refill the data sources handleExit just cleared.
+        guard process != nil else { return }
+
         switch event.event {
         case WireEvent.listenerReady:
             // Every configured listener must report in. With both enabled, one

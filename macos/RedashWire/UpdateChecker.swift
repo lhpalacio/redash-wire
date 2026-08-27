@@ -9,7 +9,7 @@ import Foundation
 /// clear the quarantine flag by hand. This points at the release page instead.
 @MainActor
 final class UpdateChecker: ObservableObject {
-    struct Release: Equatable {
+    struct Release: Equatable, Codable {
         let version: String
         let url: URL
         /// The release workflow builds the app in a job of its own, after the one
@@ -24,12 +24,27 @@ final class UpdateChecker: ObservableObject {
     private static let latestRelease = URL(string: "https://api.github.com/repos/lhpalacio/redash-wire/releases/latest")!
     private static let releasesPage = URL(string: "https://github.com/lhpalacio/redash-wire/releases")!
     private static let lastCheckKey = "lastUpdateCheck"
+    private static let knownReleaseKey = "lastKnownRelease"
     private static let interval: TimeInterval = 24 * 60 * 60
 
     /// Set from the tag by release.yml. A locally built app reports whatever
     /// MARKETING_VERSION says, which is genuinely behind once a release exists.
     static var currentVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
+    }
+
+    /// What the last check found, restored across launches. Without this the menu
+    /// row disappears on any relaunch inside the check window: the next background
+    /// check returns early on the timestamp, leaving `available` nil while the
+    /// release it found is still sitting there. Re-tested against the running
+    /// version, so the row also clears itself once you install the update.
+    init() {
+        guard
+            let stored = UserDefaults.standard.data(forKey: Self.knownReleaseKey),
+            let release = try? JSONDecoder().decode(Release.self, from: stored),
+            Self.isNewer(release.version, than: Self.currentVersion)
+        else { return }
+        available = release
     }
 
 
@@ -42,10 +57,10 @@ final class UpdateChecker: ObservableObject {
         do {
             let release = try await fetchLatest()
             if Self.isNewer(release.version, than: Self.currentVersion) {
-                available = release
+                remember(release)
                 present(release)
             } else {
-                available = nil
+                remember(nil)
                 presentUpToDate()
             }
             stampCheck()
@@ -64,7 +79,7 @@ final class UpdateChecker: ObservableObject {
         }
         guard let release = try? await fetchLatest() else { return }
 
-        available = Self.isNewer(release.version, than: Self.currentVersion) ? release : nil
+        remember(Self.isNewer(release.version, than: Self.currentVersion) ? release : nil)
         stampCheck()
     }
 
@@ -115,6 +130,16 @@ final class UpdateChecker: ObservableObject {
             url: url,
             hasMacApp: payload.assets.contains { $0.name.hasSuffix(".zip") && $0.name.contains("macos") }
         )
+    }
+
+    private func remember(_ release: Release?) {
+        available = release
+
+        guard let release, let encoded = try? JSONEncoder().encode(release) else {
+            UserDefaults.standard.removeObject(forKey: Self.knownReleaseKey)
+            return
+        }
+        UserDefaults.standard.set(encoded, forKey: Self.knownReleaseKey)
     }
 
     private func stampCheck() {

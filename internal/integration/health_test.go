@@ -234,6 +234,31 @@ func TestMySQLDropsALiveSessionWhenRedashGoesAway(t *testing.T) {
 	}
 }
 
+func TestMySQLWithNoDatabaseIsToldWhyWhileRedashIsUnreachable(t *testing.T) {
+	// `mysql -u ... -p` with no -D never reaches UseDB during the handshake, so
+	// nothing refuses the connection. It has to learn the reason from its first
+	// command, which means the socket must survive long enough to send one and
+	// the gate has to answer before "No database selected" does.
+	gate := health.NewGate()
+	gate.Fail(health.KindUnreachable, "dial tcp: i/o timeout")
+	addr := startGatedMySQLServer(t, gate)
+
+	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/?allowNativePasswords=true",
+		testUser, testPass, addr))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec("SELECT * FROM users")
+	if err == nil {
+		t.Fatal("a query succeeded while Redash was unreachable")
+	}
+	if !strings.Contains(err.Error(), "unreachable") {
+		t.Errorf("query error = %q, want it to name Redash rather than the missing database", err)
+	}
+}
+
 func TestServersWithoutAGateServeUnconditionally(t *testing.T) {
 	// The wire-protocol tests construct servers with no gate at all; that must
 	// keep meaning "always serve", not "never serve".

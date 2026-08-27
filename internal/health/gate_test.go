@@ -1,6 +1,8 @@
 package health
 
 import (
+	"context"
+	"net"
 	"strings"
 	"testing"
 )
@@ -122,5 +124,51 @@ func TestClientMessageNamesTheCause(t *testing.T) {
 	g.Fail(KindRejected, "status 401")
 	if got := g.ClientMessage(); !strings.Contains(got, "api_key") {
 		t.Errorf("ClientMessage() = %q, want it to point at the API key", got)
+	}
+}
+
+func TestAnInterruptRemembersTheDropAfterRecovery(t *testing.T) {
+	// The session's read was interrupted because the gate closed. If the gate
+	// reopens before the session goroutine gets to look — a recovery probe
+	// landing in the microseconds in between — asking the gate for its current
+	// state would call a deliberate drop an unexplained read error and send the
+	// client nothing at all.
+	g := NewGate()
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	watch := InterruptOnDown(context.Background(), server, g)
+	defer watch.Stop()
+
+	if watch.Dropped() {
+		t.Fatal("Dropped() is true before the gate ever closed")
+	}
+
+	g.Fail(KindUnreachable, "down")
+	g.Recover()
+
+	if !g.Up() {
+		t.Fatal("the gate did not recover")
+	}
+	if !watch.Dropped() {
+		t.Error("Dropped() forgot the drop as soon as the gate recovered")
+	}
+}
+
+func TestASessionStartedAfterRecoveryDoesNotInheritTheDrop(t *testing.T) {
+	g := NewGate()
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	g.Fail(KindUnreachable, "down")
+	g.Recover()
+
+	watch := InterruptOnDown(context.Background(), server, g)
+	defer watch.Stop()
+
+	if watch.Dropped() {
+		t.Error("a session that connected after recovery reports the earlier drop as its own")
 	}
 }

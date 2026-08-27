@@ -139,24 +139,47 @@ func (g *Gate) ClientMessage() string {
 	}
 }
 
+// Interrupt watches the gate on behalf of one session.
+type Interrupt struct {
+	down <-chan struct{}
+	done chan struct{}
+}
+
 // InterruptOnDown arms conn's read deadline when the gate goes down, so a session
 // goroutine blocked reading from its client wakes up and can react to the drop.
 // It deliberately never writes: the session goroutine is the only writer on that
 // connection, and a second one would interleave with an in-flight result.
 //
-// The returned function stops the watch and must be called when the session ends.
-func InterruptOnDown(ctx context.Context, conn net.Conn, g *Gate) func() {
-	done := make(chan struct{})
-	down := g.Down()
+// Stop must be called when the session ends.
+func InterruptOnDown(ctx context.Context, conn net.Conn, g *Gate) *Interrupt {
+	i := &Interrupt{down: g.Down(), done: make(chan struct{})}
 
 	go func() {
 		select {
 		case <-ctx.Done():
-		case <-done:
-		case <-down:
+		case <-i.done:
+		case <-i.down:
 			_ = conn.SetReadDeadline(time.Now())
 		}
 	}()
 
-	return func() { close(done) }
+	return i
 }
+
+// Dropped reports whether the gate closed at any point during this session.
+//
+// It asks about this session's own history rather than the gate's current state.
+// A read that fails here failed because of a deadline this watch armed, and the
+// only thing that arms it is the gate closing; asking the gate instead would let
+// a recovery in the intervening microseconds turn a deliberate drop into an
+// unexplained "receiving message" error with nothing sent to the client.
+func (i *Interrupt) Dropped() bool {
+	select {
+	case <-i.down:
+		return true
+	default:
+		return false
+	}
+}
+
+func (i *Interrupt) Stop() { close(i.done) }

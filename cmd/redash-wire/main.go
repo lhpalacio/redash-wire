@@ -170,8 +170,8 @@ func serve() {
 		redash.WithPollTimeout(cfg.GetPollTimeout()),
 	)
 
-	// The context is created before the first Redash call so a Ctrl-C during a
-	// slow cold start is not swallowed by a 10-second probe.
+	// Hoisted above the first Redash call so the startup probe, the health loop
+	// and both servers share one cancellation scope.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

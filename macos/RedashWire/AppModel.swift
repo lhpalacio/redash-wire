@@ -17,6 +17,7 @@ final class AppModel: ObservableObject {
 
     private var watcher: ConfigWatcher?
     private var updateTask: Task<Void, Never>?
+    private var didStart = false
 
     init(cli: WireCLI = .standard()) {
         self.cli = cli
@@ -44,6 +45,12 @@ final class AppModel: ObservableObject {
 
 
     func start() async {
+        // The menu bar label's .task drives this. It runs once today, but a second
+        // run would leave the first update loop running forever with nothing able
+        // to reach it.
+        guard !didStart else { return }
+        didStart = true
+
         await reloadConfig()
         watchConfigFile()
 

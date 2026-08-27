@@ -77,6 +77,13 @@ func (h *handler) HandleQuery(query string) (*mysql.Result, error) {
 
 	h.logger.Debug("query received", "sql", query)
 
+	// Ahead of everything else, including the no-database-selected reply and the
+	// catalog answers served from the cached registry. All of those are true and
+	// none of them is the reason the query cannot run.
+	if !h.gate.Up() {
+		return nil, mysql.NewError(mysql.ER_UNKNOWN_ERROR, h.gate.ClientMessage())
+	}
+
 	if lower := strings.ToLower(query); strings.HasPrefix(lower, "use ") {
 		dbName := strings.TrimSpace(query[4:])
 		dbName = strings.Trim(dbName, "`;\"'")
@@ -96,12 +103,6 @@ func (h *handler) HandleQuery(query string) (*mysql.Result, error) {
 			mysql.ER_NO_DB_ERROR,
 			"No database selected; use USE <database> (SHOW DATABASES to list available data sources)",
 		)
-	}
-
-	// Narrow window: the gate can drop between the read being interrupted and this
-	// query reaching Redash. Answer from what we know instead of a timeout.
-	if !h.gate.Up() {
-		return nil, mysql.NewError(mysql.ER_UNKNOWN_ERROR, h.gate.ClientMessage())
 	}
 
 	query = h.stripDBQualifier(query)
@@ -132,6 +133,11 @@ func (h *handler) HandleQuery(query string) (*mysql.Result, error) {
 
 func (h *handler) getSchema() []redash.SchemaTable {
 	if h.dataSourceID == 0 {
+		return nil
+	}
+	// Redash is known to be unreachable, so a fetch would sit on the HTTP client's
+	// timeout before returning the empty schema we can hand back right now.
+	if !h.gate.Up() {
 		return nil
 	}
 

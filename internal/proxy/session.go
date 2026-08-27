@@ -71,8 +71,8 @@ func (s *Session) serve(ctx context.Context) {
 
 	// Interrupts the blocked Receive below when Redash goes away, so this
 	// goroutine regains control and sends the FATAL itself.
-	stopWatching := health.InterruptOnDown(ctx, s.conn, s.gate)
-	defer stopWatching()
+	watch := health.InterruptOnDown(ctx, s.conn, s.gate)
+	defer watch.Stop()
 
 	dbName := params["database"]
 	if dbName == "" {
@@ -99,9 +99,9 @@ func (s *Session) serve(ctx context.Context) {
 				return
 			}
 			// Checked after the disconnect cases so a client that left on its own
-			// is not reported as a drop. What lands here while the gate is down is
-			// the read deadline watchGate armed to interrupt this very call.
-			if !s.gate.Up() {
+			// is not reported as a drop. What lands here after the gate closed is
+			// the read deadline the watch armed to interrupt this very call.
+			if watch.Dropped() {
 				s.logger.Info("dropping session", "reason", "redash unavailable", "kind", s.gate.Status().Kind)
 				if err := pgwire.SendFatal(s.conn, pgwire.SQLStateConnectionFailure, s.gate.ClientMessage()); err != nil {
 					s.logger.Debug("sending drop notice to client", "error", err)
@@ -164,6 +164,17 @@ func (s *Session) handleQuery(ctx context.Context, sql string) {
 
 	s.logger.Debug("query received", "sql", sql)
 
+	// Ahead of the catalog answers served from the cached registry and the
+	// no-data-source reply. All of those are true and none of them is the reason
+	// the query cannot run. Only reachable in the window between the gate closing
+	// and the read being interrupted, since a gated proxy refuses at login.
+	if !s.gate.Up() {
+		if err := pgwire.SendError(s.conn, s.gate.ClientMessage()); err != nil {
+			s.logger.Error("sending error to client", "error", err)
+		}
+		return
+	}
+
 	if pgwire.IsLocalQuery(sql) {
 		sources := redash.FilterByType(s.registry.All(), redash.IsPostgresCompatible)
 		if err := pgwire.HandleLocalQuery(s.conn, sql, s.params, sources, s.listenAddr); err != nil {
@@ -183,15 +194,6 @@ func (s *Session) handleQuery(ctx context.Context, sql string) {
 
 	if s.dataSourceID == 0 {
 		if err := pgwire.SendError(s.conn, "no data source selected; connect with a valid database name (use SELECT datname FROM pg_database to list available data sources)"); err != nil {
-			s.logger.Error("sending error to client", "error", err)
-		}
-		return
-	}
-
-	// Narrow window: the gate can drop between watchGate interrupting the read and
-	// this query reaching Redash. Answer from what we know instead of a timeout.
-	if !s.gate.Up() {
-		if err := pgwire.SendError(s.conn, s.gate.ClientMessage()); err != nil {
 			s.logger.Error("sending error to client", "error", err)
 		}
 		return
@@ -248,6 +250,11 @@ func (s *Session) isPostgresBackend() bool {
 
 func (s *Session) getSchema(ctx context.Context) []redash.SchemaTable {
 	if s.dataSourceID == 0 {
+		return nil
+	}
+	// Redash is known to be unreachable, so a fetch would sit on the HTTP client's
+	// timeout before returning the empty schema we can hand back right now.
+	if !s.gate.Up() {
 		return nil
 	}
 

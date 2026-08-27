@@ -145,14 +145,22 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	// go-mysql owns the write side of this connection, so a drop cannot announce
 	// itself with an error packet the way the Postgres side does: an unsolicited
 	// packet the client never asked for is not valid on the wire. Interrupting the
-	// blocked read closes the session instead, and the handler is what gives a
-	// still-connected client the reason, on its next command.
-	stopWatching := health.InterruptOnDown(connCtx, conn, s.gate)
-	defer stopWatching()
+	// blocked read closes the session instead.
+	//
+	// Only worth doing for a session that was working. A client that connects
+	// while the gate is already down (`mysql` with no -D never reaches UseDB, so
+	// nothing refuses it during the handshake) would otherwise have its socket cut
+	// before it could send the command the handler is waiting to answer with a
+	// reason. Left alone, every command it sends gets that reason instead.
+	var watch *health.Interrupt
+	if s.gate.Up() {
+		watch = health.InterruptOnDown(connCtx, conn, s.gate)
+		defer watch.Stop()
+	}
 
 	for !mysqlConn.Closed() {
 		if err := mysqlConn.HandleCommand(); err != nil {
-			if !s.gate.Up() {
+			if watch != nil && watch.Dropped() {
 				logger.Info("dropping session", "reason", "redash unavailable", "kind", s.gate.Status().Kind)
 			} else {
 				logger.Info("mysql client disconnected")
