@@ -1,8 +1,22 @@
 name: Release
 
+# Two ways in, one path through. Run this workflow from the Actions tab (or with
+# scripts/release.sh) and it cuts the tag for you; push a tag by hand and it
+# picks things up from there.
+#
+# The tag has to be created inside this workflow rather than by a separate one
+# that triggers it. A tag pushed with GITHUB_TOKEN does not start another
+# workflow run, so a "prepare release" workflow would leave a tag sitting there
+# with nothing building it.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 0.4.0"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -10,6 +24,9 @@ permissions:
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      number: ${{ steps.resolve.outputs.number }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -17,6 +34,59 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+
+      # One version, whichever way this started: the tag carries the v, the
+      # bundle version never does.
+      - name: Resolve the version
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            number="${INPUT_VERSION#v}"
+          else
+            number="${GITHUB_REF_NAME#v}"
+          fi
+          # CFBundleShortVersionString is meant to be dotted digits, and the app
+          # compares these numerically to decide whether an update exists, so no
+          # prerelease suffixes.
+          if ! echo "$number" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::version must be MAJOR.MINOR.PATCH (got $number)"
+            exit 1
+          fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "tag=v$number" >> "$GITHUB_OUTPUT"
+          echo "Releasing v$number"
+
+      - name: Create the tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+          NUMBER: ${{ steps.resolve.outputs.number }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::$TAG already exists. Start over with: gh release delete $TAG --cleanup-tag"
+            exit 1
+          fi
+
+          git config user.name "Luiz Henrique Gomes Palacio"
+          git config user.email "lhpalacio@outlook.com"
+
+          # build-app.sh stamps MARKETING_VERSION from the tag, so the committed
+          # value only ever surfaces in a build from a checkout with no tag within
+          # reach. That is exactly where it goes stale unnoticed, so land it here.
+          sed -i "s/MARKETING_VERSION = .*;/MARKETING_VERSION = $NUMBER;/" \
+            macos/RedashWire.xcodeproj/project.pbxproj
+          if ! git diff --quiet; then
+            git commit -am "Track the $NUMBER tag in MARKETING_VERSION"
+            git push origin HEAD:main
+          fi
+
+          # Annotated, matching every tag before it: git describe reads either,
+          # but an annotated tag records who cut the release and when.
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "$TAG"
+
       - uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
@@ -33,6 +103,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # On a dispatch this workflow started from main, so name the tag the
+          # previous job just cut rather than building whatever main is by now.
+          ref: ${{ needs.goreleaser.outputs.tag }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -50,10 +123,10 @@ jobs:
       # Matching goreleaser, which strips the leading v, so the app and the CLI
       # report the same version.
       - name: Build the app
-        run: VERSION="${GITHUB_REF_NAME#v}" ./scripts/build-app.sh
+        run: VERSION="${{ needs.goreleaser.outputs.number }}" ./scripts/build-app.sh
       - name: Package the app
-        run: ditto -c -k --keepParent build/RedashWire.app "RedashWire_${GITHUB_REF_NAME#v}_macos_universal.zip"
+        run: ditto -c -k --keepParent build/RedashWire.app "RedashWire_${{ needs.goreleaser.outputs.number }}_macos_universal.zip"
       - name: Attach the app to the release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$GITHUB_REF_NAME" "RedashWire_${GITHUB_REF_NAME#v}_macos_universal.zip" --clobber
+        run: gh release upload "${{ needs.goreleaser.outputs.tag }}" "RedashWire_${{ needs.goreleaser.outputs.number }}_macos_universal.zip" --clobber
