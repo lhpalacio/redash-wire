@@ -32,3 +32,17 @@ jobs:
         uses: golangci/golangci-lint-action@v8
         with:
           version: latest
+
+  macos-app:
+    # The app used to be compiled for the first time during a release, which is
+    # the worst moment to find out that it does not. Building it here means main
+    # is known to produce an app before anything is tagged.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build the app
+        run: ./scripts/build-app.sh

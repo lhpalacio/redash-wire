@@ -100,14 +100,36 @@ vhs /tmp/wizard.tape   # rewrites dev/wizard.gif
 
 ## Releasing (maintainers)
 
-Tag a version and push it; GitHub Actions runs
-[GoReleaser](https://goreleaser.com) to build binaries for Linux and macOS
-(amd64 + arm64), generate checksums, and publish a GitHub release:
+```bash
+scripts/release.sh 0.4.0
+```
+
+That starts the Release workflow and follows it to the end. The workflow bumps
+`MARKETING_VERSION` on main, cuts an annotated tag, runs
+[GoReleaser](https://goreleaser.com) for the Linux and macOS binaries (amd64 +
+arm64) and the checksums, then builds `RedashWire.app` and attaches it to the
+release. Running the workflow from the Actions tab does the same thing; the
+script only adds the checks worth making before a runner starts, and saves you
+watching the tab.
+
+It releases whatever is on `origin/main`, so push first.
+
+Pushing a tag by hand still works:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag -a v0.4.0 -m v0.4.0
+git push origin v0.4.0
 ```
+
+That path skips the `MARKETING_VERSION` bump, so make that commit yourself
+first. The tag is created inside the release workflow rather than by a separate
+one that triggers it, because a tag pushed with `GITHUB_TOKEN` does not start
+another workflow run: a "prepare release" workflow would leave a tag sitting
+there with nothing building it.
+
+If a run fails after the tag exists, re-run the failed job rather than releasing
+again. Starting over means `gh release delete v0.4.0 --cleanup-tag` first, since
+GoReleaser will not publish over an existing release.
 
 `install.sh` downloads from these releases and depends on the archive naming in
 `.goreleaser.yaml`; change them together.
