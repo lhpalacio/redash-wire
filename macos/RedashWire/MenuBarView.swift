@@ -291,6 +291,9 @@ struct MenuBarView: View {
     private func copyActions(for source: DataSource) -> some View {
         if let profile = model.selectedProfile {
             if source.wire == "postgres" {
+                if let uri = ConnectionStrings.postgresURI(profile: profile, database: source.name) {
+                    openInClientButton(uri: uri)
+                }
                 if let command = ConnectionStrings.psql(profile: profile, database: source.name) {
                     Button("Copy psql command") { Clipboard.copySecret(command) }
                 }
@@ -298,6 +301,9 @@ struct MenuBarView: View {
                     Button("Copy connection URI") { Clipboard.copySecret(uri) }
                 }
             } else if source.wire == "mysql" {
+                if let uri = ConnectionStrings.mysqlURI(profile: profile, database: source.name) {
+                    openInClientButton(uri: uri)
+                }
                 if let command = ConnectionStrings.mysql(profile: profile, database: source.name) {
                     Button("Copy mysql command") { Clipboard.copySecret(command) }
                 }
@@ -306,6 +312,16 @@ struct MenuBarView: View {
                 }
             }
             Button("Copy database name") { Clipboard.copy(source.name) }
+        }
+    }
+
+
+    /// Absent when nothing on this Mac claims the scheme, rather than a button
+    /// that opens nothing.
+    @ViewBuilder
+    private func openInClientButton(uri: String) -> some View {
+        if let handler = ClientApp.handler(for: uri) {
+            Button("Open in \(handler.name)") { ClientApp.open(uri, with: handler) }
         }
     }
 

@@ -236,7 +236,9 @@ From the menu you can:
   source is absent. A section whose listener the profile leaves off says so,
   and names the config key that turns it on. Every servable one copies a `psql`
   or `mysql` command, or a connection URI, with the data source already filled
-  in as the database name.
+  in as the database name. If an app on your Mac claims `postgresql://` or
+  `mysql://` links, as TablePlus, Postico and DBeaver do, the source also
+  offers to open in it directly.
 - Copy the profile-level details from the Connect submenu: the psql or mysql
   command, the username, the password.
 - See whether Redash itself is answering. The proxy polls it while running, so
