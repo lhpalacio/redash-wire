@@ -13,7 +13,7 @@ struct RedashWireApp: App {
         .menuBarExtraStyle(.menu)
 
         Window("redash-wire Logs", id: "logs") {
-            LogWindow(supervisor: model.supervisor)
+            LogWindow(log: model.supervisor.log)
         }
         .defaultSize(width: 760, height: 440)
 

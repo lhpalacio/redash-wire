@@ -36,11 +36,12 @@ final class ProxySupervisor: ObservableObject {
     /// mid-shutdown.
     private static let terminationGrace: TimeInterval = 7
 
-    private static let maxEvents = 5_000
-
     @Published private(set) var state: State = .stopped
     @Published private(set) var activeProfile: Profile?
-    @Published private(set) var events: [LogEvent] = []
+
+    /// Every line the child wrote. Its own object, so the log window is the only
+    /// view that re-renders per line.
+    let log = LogStore()
 
     /// Reported by the running proxy on every health probe, and emptied whenever
     /// that proxy goes away. It belongs to the process: it comes from the same
@@ -138,10 +139,6 @@ final class ProxySupervisor: ObservableObject {
         await restart(profile: profile)
     }
 
-    func clearLog() {
-        events.removeAll()
-    }
-
     /// The proxy's own timer would notice within an interval. A path change is
     /// earlier evidence, so ask it to probe now: a VPN that just dropped shows as
     /// unreachable in a second or two, and one that just came back as green.
@@ -221,10 +218,7 @@ final class ProxySupervisor: ObservableObject {
     }
 
     private func record(_ event: LogEvent) {
-        events.append(event)
-        if events.count > Self.maxEvents {
-            events.removeFirst(events.count - Self.maxEvents)
-        }
+        log.append(event)
 
         if event.level >= .error {
             lastErrorMessage = Self.reason(for: event)
