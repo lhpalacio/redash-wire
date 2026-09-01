@@ -186,6 +186,24 @@ func serve() {
 	registry := redash.NewSwappableRegistry(nil)
 	checker := health.NewChecker(redashClient, registry, gate, logger)
 
+	// SIGUSR1 asks for a health probe now. The menu bar app sends it when the
+	// Mac's network path changes, so a VPN dropping or coming back is checked
+	// within a second rather than at the next tick; `kill -USR1` does the same
+	// by hand. Registered before anything binds, because an unhandled SIGUSR1
+	// kills the process, and the app only signals a proxy that has bound.
+	probeNow := make(chan os.Signal, 1)
+	signal.Notify(probeNow, syscall.SIGUSR1)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-probeNow:
+				gate.Suspect()
+			}
+		}
+	}()
+
 	// The first probe is also the startup check. Without -wait-for-redash a
 	// failure is still fatal, so the CLI and the Docker image behave exactly as
 	// they always have; under a supervisor it closes the gate instead and the

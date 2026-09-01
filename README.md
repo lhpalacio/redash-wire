@@ -124,7 +124,9 @@ Postgres clients are told the reason at login and when they are dropped. A MySQL
 client is told on its next connection or query, because go-mysql owns the write
 side of a session already under way. A query that dies on an
 infrastructure error triggers a probe immediately instead of waiting out the
-interval. A 401, 403 or 404 reads differently from a timeout, and backs off to
+interval. So does SIGUSR1: the macOS app sends it when the network changes, and
+`kill -USR1 $(pgrep redash-wire)` asks for a probe by hand. A 401, 403 or 404
+reads differently from a timeout, and backs off to
 five minutes: a rejected key needs you to edit the config, a dropped VPN does
 not.
 
@@ -233,7 +235,9 @@ From the menu you can:
   command, the username, the password.
 - See whether Redash itself is answering. The proxy polls it while running, so
   the menu says so within about fifteen seconds of the VPN dropping, rather
-  than the next time a query fails.
+  than the next time a query fails. The app also watches the Mac's network
+  path and asks the proxy to check the moment an interface comes or goes, so
+  a VPN dropping or reconnecting usually shows within a second or two.
 - Follow the proxy's log stream in a window you can filter by level and by text.
 - Turn on launch at login.
 - Check for a new release. It compares the app's version against the latest tag

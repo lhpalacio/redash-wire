@@ -1,6 +1,7 @@
 import Combine
 import Darwin
 import Foundation
+import Network
 
 /// Owns the redash-wire child process, one profile at a time.
 @MainActor
@@ -65,9 +66,13 @@ final class ProxySupervisor: ObservableObject {
     private var restartAttempts = 0
     private var restartTask: Task<Void, Never>?
     private var lastErrorMessage: String?
+    private var pathWatcher: NetworkPathWatcher?
 
     init(cli: WireCLI) {
         self.cli = cli
+        pathWatcher = NetworkPathWatcher { [weak self] in
+            Task { @MainActor [weak self] in self?.networkPathChanged() }
+        }
     }
 
 
@@ -116,6 +121,18 @@ final class ProxySupervisor: ObservableObject {
 
     func clearLog() {
         events.removeAll()
+    }
+
+    /// The proxy's own timer would notice within an interval. A path change is
+    /// earlier evidence, so ask it to probe now: a VPN that just dropped shows as
+    /// unreachable in a second or two, and one that just came back as green.
+    ///
+    /// Only a proxy that has bound its listeners gets the signal. The daemon
+    /// registers its SIGUSR1 handler before it binds, and an unhandled SIGUSR1
+    /// kills a process.
+    private func networkPathChanged() {
+        guard reachedReady, let process, process.isRunning else { return }
+        kill(process.processIdentifier, SIGUSR1)
     }
 
 
@@ -320,5 +337,28 @@ final class ProxySupervisor: ObservableObject {
         seenListeners = 0
         dataSources = []
         state = .stopped
+    }
+}
+
+/// Reports each change to the Mac's network path. A VPN coming or going shows up
+/// here as an interface appearing or disappearing, seconds before the proxy's
+/// timer would find out on its own. The first update describes the path as it
+/// already is, so it is swallowed.
+private final class NetworkPathWatcher {
+    private let monitor = NWPathMonitor()
+    private var lastPath: NWPath?
+
+    init(onChange: @escaping @Sendable () -> Void) {
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            defer { self.lastPath = path }
+            guard let last = self.lastPath, last != path else { return }
+            onChange()
+        }
+        monitor.start(queue: DispatchQueue(label: "redash-wire.network-path"))
+    }
+
+    deinit {
+        monitor.cancel()
     }
 }
