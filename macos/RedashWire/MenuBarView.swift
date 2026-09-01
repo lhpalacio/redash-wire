@@ -240,6 +240,11 @@ struct MenuBarView: View {
                         Divider()
                     }
                     Text(group.title)
+                    if let key = group.missingListenerKey {
+                        // Otherwise the copy actions shrink to "Copy database
+                        // name" with nothing to say why.
+                        Text("Set \(key) in the profile to connect to these.")
+                    }
                     ForEach(group.sources) { source in
                         Menu(source.name) {
                             copyActions(for: source)

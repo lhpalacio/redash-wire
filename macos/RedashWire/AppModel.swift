@@ -47,6 +47,10 @@ final class AppModel: ObservableObject {
         let wire: String
         let title: String
         let sources: [DataSource]
+        /// The config key that would turn the listener on, when the selected
+        /// profile has none for this wire. The proxy can serve these sources,
+        /// but not on this profile, and the copy actions would have no port.
+        let missingListenerKey: String?
         var id: String { wire }
     }
 
@@ -58,7 +62,31 @@ final class AppModel: ObservableObject {
         let byWire = Dictionary(grouping: servableDataSources, by: \.wire)
         let wires = known.filter { byWire[$0] != nil } + byWire.keys.filter { !known.contains($0) }.sorted()
         return wires.map { wire in
-            DataSourceGroup(wire: wire, title: Self.wireTitle(wire), sources: byWire[wire] ?? [])
+            let missing = Self.listenerKey(for: wire).flatMap { key in
+                listenerAddress(for: wire).isEmpty ? key : nil
+            }
+            return DataSourceGroup(
+                wire: wire,
+                title: Self.wireTitle(wire) + (missing == nil ? "" : " (listener off)"),
+                sources: byWire[wire] ?? [],
+                missingListenerKey: missing
+            )
+        }
+    }
+
+    private func listenerAddress(for wire: String) -> String {
+        switch wire {
+        case "postgres": return selectedProfile?.postgresListenAddr ?? ""
+        case "mysql": return selectedProfile?.mysqlListenAddr ?? ""
+        default: return ""
+        }
+    }
+
+    private static func listenerKey(for wire: String) -> String? {
+        switch wire {
+        case "postgres": return "postgres_listen_addr"
+        case "mysql": return "mysql_listen_addr"
+        default: return nil
         }
     }
 
