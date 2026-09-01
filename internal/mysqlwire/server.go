@@ -34,7 +34,8 @@ type Server struct {
 
 type ServerOption func(*Server)
 
-// WithGate makes the server refuse and drop sessions while Redash is unreachable.
+// WithGate makes the server refuse logins and answer queries with the reason
+// while Redash is unreachable.
 // Without it the server serves unconditionally, which is what the wire-protocol
 // tests want.
 func WithGate(g *health.Gate) ServerOption {
@@ -142,29 +143,12 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 
 	logger.Info("mysql client connected", "user", mysqlConn.GetUser())
 
-	// go-mysql owns the write side of this connection, so a drop cannot announce
-	// itself with an error packet the way the Postgres side does: an unsolicited
-	// packet the client never asked for is not valid on the wire. Interrupting the
-	// blocked read closes the session instead.
-	//
-	// Only worth doing for a session that was working. A client that connects
-	// while the gate is already down (`mysql` with no -D never reaches UseDB, so
-	// nothing refuses it during the handshake) would otherwise have its socket cut
-	// before it could send the command the handler is waiting to answer with a
-	// reason. Left alone, every command it sends gets that reason instead.
-	var watch *health.Interrupt
-	if s.gate.Up() {
-		watch = health.InterruptOnDown(connCtx, conn, s.gate)
-		defer watch.Stop()
-	}
-
+	// A session that is open when Redash goes away keeps its socket: the handler
+	// answers every command with the reason until the gate reopens, which is the
+	// only place go-mysql lets the proxy speak on an established connection.
 	for !mysqlConn.Closed() {
 		if err := mysqlConn.HandleCommand(); err != nil {
-			if watch != nil && watch.Dropped() {
-				logger.Info("dropping session", "reason", "redash unavailable", "kind", s.gate.Status().Kind)
-			} else {
-				logger.Info("mysql client disconnected")
-			}
+			logger.Info("mysql client disconnected")
 			return
 		}
 	}

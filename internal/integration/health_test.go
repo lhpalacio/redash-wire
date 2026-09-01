@@ -119,7 +119,7 @@ func TestPGRefusalPointsAtTheKeyWhenRedashRejectedUs(t *testing.T) {
 	}
 }
 
-func TestPGDropsALiveSessionWhenRedashGoesAway(t *testing.T) {
+func TestPGKeepsALiveSessionWhenRedashGoesAway(t *testing.T) {
 	gate := health.NewGate()
 	addr := startGatedPGServer(t, gate)
 
@@ -127,33 +127,31 @@ func TestPGDropsALiveSessionWhenRedashGoesAway(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
+	defer conn.Close(context.Background())
 	ctx := context.Background()
 	if _, err := conn.Exec(ctx, "SELECT * FROM users"); err != nil {
-		t.Fatalf("query before the drop: %v", err)
+		t.Fatalf("query before the outage: %v", err)
 	}
 
 	gate.Fail(health.KindUnreachable, "the vpn went away")
 
-	// Keep issuing queries until the socket is gone: whichever lands first, the
-	// interrupted read or the query-time gate check, the session must not survive
-	// a proxy that can no longer serve it.
-	var firstErr error
-	deadline := time.Now().Add(5 * time.Second)
-	for !conn.IsClosed() && time.Now().Before(deadline) {
-		_, err := conn.Exec(ctx, "SELECT * FROM users")
-		if err != nil && firstErr == nil {
-			firstErr = err
-		}
-		if err == nil {
-			time.Sleep(20 * time.Millisecond)
-		}
+	// The socket survives. A wrong call by the checker then costs one query,
+	// not a reconnect dialog in every client that was open; the query itself
+	// names the cause, which is where the person is looking.
+	_, err = conn.Exec(ctx, "SELECT * FROM users")
+	if err == nil {
+		t.Fatal("a query succeeded while Redash was unreachable")
+	}
+	if !strings.Contains(err.Error(), "unreachable") {
+		t.Errorf("query error = %q, want it to name Redash as the cause", err)
+	}
+	if conn.IsClosed() {
+		t.Fatal("the live session was dropped; the client would have to reconnect")
 	}
 
-	if !conn.IsClosed() {
-		t.Fatal("the live session survived Redash going away")
-	}
-	if firstErr == nil || !strings.Contains(firstErr.Error(), "unreachable") {
-		t.Errorf("first error after the drop = %v, want it to name Redash as the cause", firstErr)
+	gate.Recover()
+	if _, err := conn.Exec(ctx, "SELECT * FROM users"); err != nil {
+		t.Fatalf("query on the same session after recovery: %v", err)
 	}
 }
 
@@ -205,32 +203,39 @@ func TestMySQLRefusesWhileRedashIsUnreachable(t *testing.T) {
 	}
 }
 
-func TestMySQLDropsALiveSessionWhenRedashGoesAway(t *testing.T) {
+func TestMySQLKeepsALiveSessionWhenRedashGoesAway(t *testing.T) {
 	gate := health.NewGate()
 	addr := startGatedMySQLServer(t, gate)
 
 	db := connectMySQL(t, addr, mysqlDatabase)
-	if _, err := db.Exec("SELECT * FROM users"); err != nil {
-		t.Fatalf("query before the drop: %v", err)
+	ctx := context.Background()
+	// One pinned connection, so the pool cannot hide a dropped socket behind a
+	// fresh dial.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("conn: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "SELECT * FROM users"); err != nil {
+		t.Fatalf("query before the outage: %v", err)
 	}
 
 	gate.Fail(health.KindUnreachable, "the vpn went away")
 
-	// Unlike the Postgres side, this error does not name Redash: go-mysql owns the
-	// write side of an established connection, and an error packet the client
-	// never asked for is not valid on the wire. The session is dropped and the
-	// client sees a broken connection; the reason reaches it on the reconnect,
-	// which TestMySQLRefusesWhileRedashIsUnreachable covers.
-	var err error
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err = db.Exec("SELECT * FROM users"); err != nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	// go-mysql only lets the proxy speak in answer to a command, and keeping the
+	// socket is what makes that enough: the reason reaches the client on the
+	// query, where before the session was cut and the client saw a broken pipe.
+	_, err = conn.ExecContext(ctx, "SELECT * FROM users")
 	if err == nil {
-		t.Fatal("the live session survived Redash going away")
+		t.Fatal("a query succeeded while Redash was unreachable")
+	}
+	if !strings.Contains(err.Error(), "unreachable") {
+		t.Errorf("query error = %q, want it to name Redash as the cause", err)
+	}
+
+	gate.Recover()
+	if _, err := conn.ExecContext(ctx, "SELECT * FROM users"); err != nil {
+		t.Fatalf("query on the same session after recovery: %v", err)
 	}
 }
 

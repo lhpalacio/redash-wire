@@ -121,11 +121,11 @@ there is no session to protect, so one failure is enough. Without
 `-wait-for-redash` that failure exits, so the startup probe gets 10 seconds
 instead of 5 and one slow first answer doesn't stop a start that would have
 worked; with the flag it gets the usual 5, since every second it waits is a
-second nothing is bound. While the gate is closed the proxy drops open SQL sessions and
-refuses new ones, with the ports still bound so recovery needs nothing from you.
-Postgres clients are told the reason at login and when they are dropped. A MySQL
-client is told on its next connection or query, because go-mysql owns the write
-side of a session already under way. A query that dies on an
+second nothing is bound. While the gate is closed the proxy refuses new sessions and answers every
+query on an open one with the reason, keeping the connection: a wrong call by
+the checker then costs one query rather than a reconnect in every open client.
+The ports stay bound, so recovery needs nothing from you and the same session
+serves again once Redash answers. A query that dies on an
 infrastructure error triggers a probe immediately instead of waiting out the
 interval. So does SIGUSR1: the macOS app sends it when the network changes, and
 `kill -USR1 $(pgrep redash-wire)` asks for a probe by hand. A 401, 403 or 404

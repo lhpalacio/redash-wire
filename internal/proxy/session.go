@@ -69,11 +69,6 @@ func (s *Session) serve(ctx context.Context) {
 	_ = s.conn.SetReadDeadline(time.Time{})
 	s.params = params
 
-	// Interrupts the blocked Receive below when Redash goes away, so this
-	// goroutine regains control and sends the FATAL itself.
-	watch := health.InterruptOnDown(ctx, s.conn, s.gate)
-	defer watch.Stop()
-
 	dbName := params["database"]
 	if dbName == "" {
 		dbName = params["user"]
@@ -96,16 +91,6 @@ func (s *Session) serve(ctx context.Context) {
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || isConnClosed(err) {
 				s.logger.Info("client disconnected")
-				return
-			}
-			// Checked after the disconnect cases so a client that left on its own
-			// is not reported as a drop. What lands here after the gate closed is
-			// the read deadline the watch armed to interrupt this very call.
-			if watch.Dropped() {
-				s.logger.Info("dropping session", "reason", "redash unavailable", "kind", s.gate.Status().Kind)
-				if err := pgwire.SendFatal(s.conn, pgwire.SQLStateConnectionFailure, s.gate.ClientMessage()); err != nil {
-					s.logger.Debug("sending drop notice to client", "error", err)
-				}
 				return
 			}
 			s.logger.Error("receiving message", "error", err)
@@ -166,8 +151,10 @@ func (s *Session) handleQuery(ctx context.Context, sql string) {
 
 	// Ahead of the catalog answers served from the cached registry and the
 	// no-data-source reply. All of those are true and none of them is the reason
-	// the query cannot run. Only reachable in the window between the gate closing
-	// and the read being interrupted, since a gated proxy refuses at login.
+	// the query cannot run. This is also how a session that was open when Redash
+	// went away learns about it: the socket stays, and every query is answered
+	// with the reason until the gate reopens, so a false alarm costs one query
+	// rather than a reconnect.
 	if !s.gate.Up() {
 		if err := pgwire.SendError(s.conn, s.gate.ClientMessage()); err != nil {
 			s.logger.Error("sending error to client", "error", err)

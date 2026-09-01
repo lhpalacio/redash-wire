@@ -1,14 +1,10 @@
 // Package health tracks whether Redash is reachable and gates the wire servers on
 // the answer. A proxy that cannot reach Redash cannot serve anything, so it says
-// so at connect time instead of accepting a session that fails one query later.
+// so at login and on every query while that lasts, instead of accepting a session
+// that fails one query later.
 package health
 
-import (
-	"context"
-	"net"
-	"sync"
-	"time"
-)
+import "sync"
 
 // Kind separates a failure that should clear on its own from one that needs
 // someone to edit the config. They deserve different words in the UI and
@@ -30,42 +26,34 @@ type Status struct {
 	Reason string
 }
 
-// Gate is the shared answer to "can we serve right now?". It is a state machine
-// plus a broadcast: transitions are decided by the Checker, and sessions learn
-// about them by selecting on Down rather than polling.
+// Gate is the shared answer to "can we serve right now?". Transitions are
+// decided by the Checker; sessions ask at login and before every query.
+//
+// It used to broadcast a drop so that open sessions could be torn down the
+// moment it closed. That made a wrong call cost every client a reconnect, and
+// with detection now a matter of seconds a wrong call is the risk worth
+// designing for. An open session keeps its socket and is answered with the
+// reason on each query until the gate reopens, so a false alarm costs one query.
 type Gate struct {
 	mu     sync.Mutex
 	up     bool
 	kind   Kind
 	reason string
 
-	// Closed for as long as the gate is down, and replaced with a fresh open
-	// channel on recovery. A session that starts while the gate is already down
-	// therefore sees a channel that is closed from the start.
-	downCh chan struct{}
-
 	// Depth 1: a burst of failing queries only needs to wake the checker once,
 	// and Suspect must never block the session goroutine that calls it.
 	suspect chan struct{}
 }
 
-// NewGate returns a gate that starts up. Nothing observes it before the first
-// probe (serve runs one before it binds any listener), and starting up is what
-// lets a server constructed without a checker serve unconditionally.
+// NewGate returns a gate that starts up. Starting up is what lets a server
+// constructed without a checker serve unconditionally; serve closes it by hand
+// before binding under -wait-for-redash, where nothing has been proved yet.
 func NewGate() *Gate {
 	return &Gate{
 		up:      true,
 		kind:    KindOK,
-		downCh:  make(chan struct{}),
 		suspect: make(chan struct{}, 1),
 	}
-}
-
-// Down fires when the gate goes down, and is already closed if it is down now.
-func (g *Gate) Down() <-chan struct{} {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.downCh
 }
 
 func (g *Gate) Status() Status {
@@ -94,7 +82,6 @@ func (g *Gate) Fail(kind Kind, reason string) bool {
 		return false
 	}
 	g.up = false
-	close(g.downCh)
 	return true
 }
 
@@ -109,14 +96,13 @@ func (g *Gate) Recover() bool {
 		return false
 	}
 	g.up = true
-	g.downCh = make(chan struct{})
 	return true
 }
 
 // Suspect asks the checker to probe now rather than at its next tick. A session
 // whose query just died on an infrastructure error has better evidence than the
-// timer does, and calling this is how the gate trips in seconds instead of a
-// minute. Never blocks.
+// timer does, and calling this is how the gate trips in seconds instead of an
+// interval. Never blocks.
 func (g *Gate) Suspect() {
 	select {
 	case g.suspect <- struct{}{}:
@@ -138,48 +124,3 @@ func (g *Gate) ClientMessage() string {
 		return "redash-wire: Redash is unreachable; the proxy will serve queries again once it recovers"
 	}
 }
-
-// Interrupt watches the gate on behalf of one session.
-type Interrupt struct {
-	down <-chan struct{}
-	done chan struct{}
-}
-
-// InterruptOnDown arms conn's read deadline when the gate goes down, so a session
-// goroutine blocked reading from its client wakes up and can react to the drop.
-// It deliberately never writes: the session goroutine is the only writer on that
-// connection, and a second one would interleave with an in-flight result.
-//
-// Stop must be called when the session ends.
-func InterruptOnDown(ctx context.Context, conn net.Conn, g *Gate) *Interrupt {
-	i := &Interrupt{down: g.Down(), done: make(chan struct{})}
-
-	go func() {
-		select {
-		case <-ctx.Done():
-		case <-i.done:
-		case <-i.down:
-			_ = conn.SetReadDeadline(time.Now())
-		}
-	}()
-
-	return i
-}
-
-// Dropped reports whether the gate closed at any point during this session.
-//
-// It asks about this session's own history rather than the gate's current state.
-// A read that fails here failed because of a deadline this watch armed, and the
-// only thing that arms it is the gate closing; asking the gate instead would let
-// a recovery in the intervening microseconds turn a deliberate drop into an
-// unexplained "receiving message" error with nothing sent to the client.
-func (i *Interrupt) Dropped() bool {
-	select {
-	case <-i.down:
-		return true
-	default:
-		return false
-	}
-}
-
-func (i *Interrupt) Stop() { close(i.done) }
