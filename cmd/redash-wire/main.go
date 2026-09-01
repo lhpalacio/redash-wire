@@ -222,26 +222,30 @@ func serve() {
 		}
 	}()
 
-	// The first probe is also the startup check. Without -wait-for-redash a
-	// failure is still fatal, so the CLI and the Docker image behave exactly as
-	// they always have; under a supervisor it closes the gate instead and the
-	// proxy comes up ready to recover on its own.
-	if err := checker.Probe(ctx); err != nil && !*waitForRedash {
-		os.Exit(1)
-	}
-
-	sources := registry.All()
-	// An empty list means the key authenticated but sees nothing, which is a
-	// Redash permissions problem rather than a connectivity one. Under a
-	// supervisor that is a state worth showing; on the command line it is still
-	// what it always was, nothing to serve.
-	if len(sources) == 0 && !*waitForRedash {
-		logger.Error("no data sources found")
-		os.Exit(1)
+	if *waitForRedash {
+		// Nothing has proved Redash reachable, and under a supervisor the answer
+		// is a state to show rather than a reason to exit, so bind first and let
+		// the checker's loop make the first probe. The gate starts closed for the
+		// window in between: a client that connects before the answer is refused
+		// with a reason, not served from an empty registry.
+		gate.Fail(health.KindUnreachable, "waiting for the first check")
+	} else {
+		// The first probe is also the startup check, and a failure is fatal: a
+		// script or a container wants the exit, not a proxy that binds and waits.
+		if err := checker.Probe(ctx); err != nil {
+			os.Exit(1)
+		}
+		// An empty list means the key authenticated but sees nothing, which is a
+		// Redash permissions problem rather than a connectivity one: nothing to
+		// serve.
+		if len(registry.All()) == 0 {
+			logger.Error("no data sources found")
+			os.Exit(1)
+		}
 	}
 
 	if !machineReadable {
-		printBanner(cfg, resolved.Path, sources, session)
+		printBanner(cfg, resolved.Path, registry.All(), gate.Up(), session)
 	}
 
 	sigCh := make(chan os.Signal, 1)
@@ -347,7 +351,7 @@ func warnDefaultCredentials(logger *slog.Logger, cfg *config.Config) {
 	}
 }
 
-func printBanner(cfg *config.Config, configPath string, sources []redash.DataSource, session *redash.SessionInfo) {
+func printBanner(cfg *config.Config, configPath string, sources []redash.DataSource, checked bool, session *redash.SessionInfo) {
 	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render("redash-wire")
 	label := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	value := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
@@ -380,7 +384,12 @@ func printBanner(cfg *config.Config, configPath string, sources []redash.DataSou
 	if session != nil && session.ClientConfig.Version != "" {
 		redashLines = append(redashLines, line("Version", session.ClientConfig.Version))
 	}
-	redashLines = append(redashLines, line("Sources", formatSourceCount(sources)))
+	if checked {
+		redashLines = append(redashLines, line("Sources", formatSourceCount(sources)))
+	} else {
+		// -wait-for-redash binds before it probes, so the list is not known yet.
+		redashLines = append(redashLines, line("Sources", "checking…"))
+	}
 	redashBox := boxStyle.Render(fmt.Sprintf("%s\n%s", defaultTitle("Redash"), strings.Join(redashLines, "\n")))
 
 	var serverBoxes []string

@@ -160,6 +160,10 @@ enum WireEvent {
 /// off the running state rather than standing alone, because a stopped proxy has
 /// no opinion about Redash: nothing is asking it.
 enum RedashHealth: Equatable {
+    /// The listeners are bound but no probe has answered yet. The proxy binds
+    /// before it asks under -wait-for-redash, so this is what a start looks like
+    /// for the first few seconds; it is neither green nor amber.
+    case checking
     case ok
     /// A network problem, a timeout, or a 5xx. Expected to clear on its own.
     case unreachable(String)
@@ -182,7 +186,7 @@ enum RedashHealth: Equatable {
     /// causes are worth reading.
     var summary: String? {
         switch self {
-        case .ok:
+        case .checking, .ok:
             return nil
         case .unreachable(let reason):
             return Self.reachabilityPhrase(for: reason)
@@ -230,7 +234,7 @@ enum RedashHealth: Equatable {
 
     var remedy: String? {
         switch self {
-        case .ok:
+        case .checking, .ok:
             return nil
         case .unreachable:
             return "Check your VPN or network. Retrying automatically."

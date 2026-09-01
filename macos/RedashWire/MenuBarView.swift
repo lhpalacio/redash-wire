@@ -57,6 +57,8 @@ struct MenuBarView: View {
         if case .failed(let reason) = supervisor.state {
             Text(reason.fittedToMenu())
             showLogsButton
+        } else if case .running(_, .checking) = supervisor.state {
+            Text("Waiting for the first answer from Redash…")
         } else if let health = supervisor.state.health, !health.isOK {
             // The listeners are bound but nothing behind them can be served, so
             // the addresses would be a lie. Show the cause and the fix instead.
@@ -104,6 +106,8 @@ struct MenuBarView: View {
             return "Starting — \(name)"
         case .running(let since, .ok):
             return "Running — \(name) (\(Self.uptime(since: since)))"
+        case .running(_, .checking):
+            return "Checking Redash — \(name)"
         case .running(_, .unreachable):
             return "Redash unreachable — \(name)"
         case .running(_, .rejected):
@@ -119,7 +123,7 @@ struct MenuBarView: View {
     private static func statusColor(for state: ProxySupervisor.State) -> NSColor {
         switch state {
         case .stopped: return .systemGray
-        case .starting: return .systemYellow
+        case .starting, .running(_, .checking): return .systemYellow
         case .running(_, .ok): return .systemGreen
         case .running(_, .unreachable): return .systemOrange
         case .running(_, .rejected): return .systemRed
@@ -264,6 +268,9 @@ struct MenuBarView: View {
         }
         if !supervisor.state.isRunning {
             return "Start the proxy to list data sources"
+        }
+        if supervisor.state.health == .checking {
+            return "Checking Redash…"
         }
         if let health = supervisor.state.health, !health.isOK {
             return "Waiting for Redash"

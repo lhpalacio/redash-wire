@@ -24,6 +24,7 @@ final class ProxyTrackerTests: XCTestCase {
         var tracker = ProxyTracker()
         tracker.start(profile())
         tracker.record(event(WireEvent.listenerReady), now: t0)
+        tracker.record(event(WireEvent.redashUp), now: t0)
         return tracker
     }
 
@@ -36,6 +37,21 @@ final class ProxyTrackerTests: XCTestCase {
         XCTAssertEqual(tracker.state, .starting, "one bound port out of two does not make the proxy usable")
 
         tracker.record(event(WireEvent.listenerReady), now: t0)
+        XCTAssertTrue(tracker.state.isRunning)
+    }
+
+    func testBoundListenersAreCheckingUntilTheFirstProbeAnswers() {
+        // The daemon binds before it asks Redash, so for a few seconds the ports
+        // are open and nothing is known. Showing green there is the lie the
+        // health work exists to prevent; showing amber would flash a slashed
+        // icon on every healthy start.
+        var tracker = ProxyTracker()
+        tracker.start(profile())
+        tracker.record(event(WireEvent.listenerReady), now: t0)
+        XCTAssertEqual(tracker.state, .running(since: t0, redash: .checking))
+        XCTAssertNil(tracker.state.health?.summary)
+
+        tracker.record(event(WireEvent.redashUp), now: t0)
         XCTAssertEqual(tracker.state, .running(since: t0, redash: .ok))
     }
 

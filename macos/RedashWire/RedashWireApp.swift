@@ -57,7 +57,7 @@ private struct MenuBarLabel: View {
             return "bolt.slash.circle.fill"
         case .running(_, .rejected):
             return "exclamationmark.triangle.fill"
-        case .starting:
+        case .starting, .running(_, .checking):
             return "bolt.horizontal.circle"
         case .failed:
             return "exclamationmark.triangle.fill"

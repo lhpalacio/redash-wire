@@ -71,6 +71,7 @@ type Checker struct {
 	threshold        int
 
 	failures    int
+	probed      bool
 	everUp      bool
 	lastKind    Kind
 	fingerprint string
@@ -112,6 +113,13 @@ func NewChecker(lister redash.DataSourceLister, registry *redash.SwappableRegist
 // timer to the confirm delay, so the threshold is met in seconds rather than an
 // interval later.
 func (c *Checker) Run(ctx context.Context) {
+	// Under -wait-for-redash serve binds before it probes, so nothing has asked
+	// Redash anything yet and the first probe must not wait an interval. Without
+	// the flag serve probed already and this is a no-op.
+	if !c.probed {
+		_ = c.Probe(ctx)
+	}
+
 	timer := time.NewTimer(c.nextInterval())
 	defer timer.Stop()
 
@@ -134,6 +142,7 @@ func (c *Checker) Run(ctx context.Context) {
 // moves the gate, and emits the events the app listens for. serve calls it once
 // before binding, so a cold start and a mid-session drop travel the same path.
 func (c *Checker) Probe(ctx context.Context) error {
+	c.probed = true
 	timeout := c.timeout
 	if !c.everUp {
 		timeout = c.startupTimeout

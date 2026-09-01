@@ -74,10 +74,10 @@ struct ProxyTracker: Equatable {
     /// exit a crash rather than a failure to start.
     private(set) var reachedReady = false
 
-    /// The daemon can report Redash down before the listeners finish binding — a
-    /// cold start under -wait-for-redash does exactly that — so the latest health
-    /// is held here and applied when the state reaches running.
-    private var reportedHealth: RedashHealth = .ok
+    /// The latest health the daemon reported, held here because it can arrive
+    /// before or after the listeners bind, and applied whenever the state is
+    /// running. Nothing has answered at launch, so it starts as checking.
+    private var reportedHealth: RedashHealth = .checking
     private var expectedListeners = 0
     private var seenListeners = 0
     private var restartAttempts = 0
@@ -103,7 +103,7 @@ struct ProxyTracker: Equatable {
         expectedListeners = profile.enabledListenerCount
         seenListeners = 0
         reachedReady = false
-        reportedHealth = .ok
+        reportedHealth = .checking
         lastErrorMessage = nil
         snapshot.dataSources = []
         nextProbeAt = nil

@@ -104,10 +104,11 @@ a supervising app that gets force-quit leaves the proxy running and still
 holding its listen ports.
 
 `-wait-for-redash` changes what an unreachable Redash means at startup. Without
-it the proxy exits 1, which is what a script or a container wants. With it the
-proxy binds its listeners anyway and refuses connections until Redash answers,
-so a supervising app that launches before the VPN is up gets a proxy that
-recovers on its own.
+it the proxy probes Redash first and exits 1 if that fails, which is what a
+script or a container wants. With it the proxy binds its listeners first and
+probes afterwards, refusing connections with a reason until the answer comes,
+so a supervising app that launches before the VPN is up gets a proxy that is
+bound at once and recovers on its own.
 
 While serving, the proxy asks Redash for its data sources every 10 seconds,
 giving each answer 5 seconds to arrive. One call answers two questions: whether
@@ -253,9 +254,10 @@ From the menu you can:
 - Open `config.yaml` in a text editor with Settings…, and apply your edits with
   Reload Configuration.
 - Read the proxy's state off the dot beside the status line: grey stopped,
-  yellow starting, green running, amber running but cut off from Redash, red
-  failed or a rejected API key. The menu bar icon carries the same distinction,
-  since that's the part you can see without opening anything.
+  yellow starting or bound but still waiting for Redash's first answer, green
+  running, amber running but cut off from Redash, red failed or a rejected API
+  key. The menu bar icon carries the same distinction, since that's the part
+  you can see without opening anything.
 
 The first run opens a setup sheet that asks for your Redash URL and API key and
 hands them to `redash-wire init`. Only the binary ever writes `config.yaml`, so
@@ -275,7 +277,9 @@ A few decisions behind it that aren't obvious from the outside:
   leave an orphan behind still holding the listen ports.
 - It also passes `-wait-for-redash`. An unreachable Redash is then a state the
   menu shows rather than a reason to exit, and the proxy recovers by itself when
-  the VPN comes back.
+  the VPN comes back. The listeners bind before the first probe, so the menu
+  goes from Starting to a bound proxy in well under a second and says
+  "Checking Redash" until the first answer arrives.
 - A proxy that dies before it ever starts listening died of something permanent,
   like a port already in use or a profile that doesn't parse, so the app shows
   the reason and doesn't retry. It restarts one that dies after it was serving,

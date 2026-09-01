@@ -424,3 +424,59 @@ func TestARejectedKeyCountsDownToTheLongBackoff(t *testing.T) {
 		t.Errorf("redash_down events = %v, want one carrying retry_in_seconds=300: a rejected key backs off", down)
 	}
 }
+
+func TestRunProbesAtOnceWhenNothingHasProbedYet(t *testing.T) {
+	// Under -wait-for-redash the listeners bind before anything asks Redash, so
+	// the checker's loop is the first probe and must not wait an interval. The
+	// gate starts closed in that mode, so a success here is also the edge that
+	// tells the app it can go green.
+	lister := &stubLister{results: []listResult{{sources: sources()}}, probed: make(chan struct{}, 4)}
+	gate := health.NewGate()
+	gate.Fail(health.KindUnreachable, "waiting for the first check")
+	logger, log := newCapture()
+	checker := health.NewChecker(lister, redash.NewSwappableRegistry(nil), gate, logger,
+		health.WithInterval(time.Hour))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go checker.Run(ctx)
+
+	select {
+	case <-lister.probed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not probe on entry: the app would sit at 'checking' for a whole interval")
+	}
+	deadline := time.Now().Add(time.Second)
+	for !gate.Up() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !gate.Up() {
+		t.Fatal("the gate did not open after the first successful probe")
+	}
+	if len(log.events(health.EventRedashUp)) != 1 {
+		t.Error("opening a gate that started closed emitted no redash_up, so the app would never leave 'checking'")
+	}
+}
+
+func TestRunDoesNotRepeatAProbeAlreadyMade(t *testing.T) {
+	// Without -wait-for-redash serve probes before binding; the loop must not
+	// ask again the instant it starts, or every start costs two calls.
+	lister := &stubLister{results: []listResult{{sources: sources()}}, probed: make(chan struct{}, 4)}
+	gate := health.NewGate()
+	logger, _ := newCapture()
+	checker := health.NewChecker(lister, redash.NewSwappableRegistry(nil), gate, logger,
+		health.WithInterval(time.Hour))
+
+	checker.Probe(context.Background())
+	<-lister.probed
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go checker.Run(ctx)
+
+	select {
+	case <-lister.probed:
+		t.Fatal("Run repeated the probe serve had just made")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
