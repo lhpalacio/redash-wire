@@ -299,7 +299,9 @@ A few decisions behind it that aren't obvious from the outside:
 - Settings… opens the config with whatever app claims `.yaml`, or TextEdit if
   nothing does.
 - Reload Configuration restarts a running proxy only when the profile it serves
-  changed. The file watcher never restarts it: one save fires the watcher
+  changed, and starts a failed one on the selected profile, since a failed
+  proxy is the one you were editing the config to fix. A stopped proxy stays
+  stopped. The file watcher never restarts it: one save fires the watcher
   several times, because the config is written with a temp file and a rename and
   editors leave swap files in the same directory.
 - The ⌘, and ⇧⌘, shortcuts work only while the menu is open. Without a Dock

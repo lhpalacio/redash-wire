@@ -133,6 +133,15 @@ final class AppModel: ObservableObject {
     func reloadConfig(applyToRunning: Bool = false) async {
         let running = applyToRunning ? supervisor.activeProfile : nil
         await readConfig()
+        guard applyToRunning else { return }
+
+        // A failed proxy is the one whose config you were editing to fix, and
+        // reloading is the moment to find out whether it worked. A stopped one
+        // stays stopped: that was a choice, not a failure.
+        if case .failed = supervisor.state, let profile = selectedProfile {
+            supervisor.start(profile: profile)
+            return
+        }
 
         // An edit to some other profile is not a reason to restart this one.
         guard
