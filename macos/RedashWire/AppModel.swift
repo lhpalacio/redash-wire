@@ -54,6 +54,13 @@ final class AppModel: ObservableObject {
         await reloadConfig()
         watchConfigFile()
 
+        // A menu bar app launched at login exists to have the proxy up. Under
+        // -wait-for-redash a missing VPN is a state the menu shows, not a reason
+        // to hold back, so there is nothing to wait for here.
+        if let profile = selectedProfile {
+            await run(profile)
+        }
+
         // Checks at launch and, for a menu bar app left running for weeks, once a
         // day after that. UpdateChecker decides whether enough time has passed.
         updateTask = Task { [weak self] in
@@ -126,19 +133,30 @@ final class AppModel: ObservableObject {
     func select(profile: Profile) async {
         guard profile.name != selectedProfileName else { return }
         selectedProfileName = profile.name
-
-        // Picking a profile while stopped should not start anything, and there is
-        // nothing to list until something is. The restarted proxy publishes the
-        // new profile's sources itself.
-        guard supervisor.state.isRunning || supervisor.state.isBusy else { return }
-        await supervisor.switchTo(profile: profile)
+        await run(profile)
     }
 
     func runOnboarding(redashURL: String, profile: String, apiKey: String) async throws -> InitResult {
         let result = try await cli.initialize(redashURL: redashURL, profile: profile, apiKey: apiKey)
         await reloadConfig()
         selectedProfileName = result.profile
+        if let profile = selectedProfile {
+            await run(profile)
+        }
         return result
+    }
+
+    /// Picking a profile means run it. A live proxy comes back up on the new one
+    /// and publishes its data sources itself; a stopped or failed one is started,
+    /// since switching away from a profile that failed is the usual way out of
+    /// that state. An invalid profile is started too: the binary is the one that
+    /// reads the config, so it reports the reason and the menu shows it as failed.
+    private func run(_ profile: Profile) async {
+        if supervisor.state.isRunning || supervisor.state.isBusy {
+            await supervisor.switchTo(profile: profile)
+        } else {
+            supervisor.start(profile: profile)
+        }
     }
 
 

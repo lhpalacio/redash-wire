@@ -215,8 +215,11 @@ own. It has no Dock icon, needs macOS 13 or newer, and starts and stops
 
 From the menu you can:
 
-- Start and stop the proxy, and choose which profile it serves. One profile runs
-  at a time.
+- Choose which profile the proxy serves, and start and stop it. Picking a
+  profile runs it: a live proxy restarts on the new one, a stopped or failed
+  one starts. One profile runs at a time. The app starts `default_profile` on
+  its own at launch, so with Launch at Login on the proxy is up before you
+  open the menu.
 - Browse the running proxy's Redash data sources. The list appears when you
   start it and empties when you stop, because the proxy is what reports it. The
   menu keeps the ones it can't serve in their own section, so you can see why a
