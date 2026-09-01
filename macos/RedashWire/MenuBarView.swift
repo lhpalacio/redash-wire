@@ -229,9 +229,17 @@ struct MenuBarView: View {
             if model.dataSources.isEmpty {
                 Text(emptyDataSourceMessage)
             } else {
-                ForEach(model.servableDataSources) { source in
-                    Menu(source.name) {
-                        copyActions(for: source)
+                // One section per wire protocol, so the list reads as "these
+                // are Postgres, these are MySQL" rather than one run of names.
+                ForEach(Array(model.dataSourceGroups.enumerated()), id: \.element.id) { index, group in
+                    if index > 0 {
+                        Divider()
+                    }
+                    Text(group.title)
+                    ForEach(group.sources) { source in
+                        Menu(source.name) {
+                            copyActions(for: source)
+                        }
                     }
                 }
 

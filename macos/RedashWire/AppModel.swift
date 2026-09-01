@@ -43,6 +43,33 @@ final class AppModel: ObservableObject {
     var servableDataSources: [DataSource] { dataSources.filter(\.isServable) }
     var unservableDataSources: [DataSource] { dataSources.filter { !$0.isServable } }
 
+    struct DataSourceGroup: Identifiable {
+        let wire: String
+        let title: String
+        let sources: [DataSource]
+        var id: String { wire }
+    }
+
+    /// Servable sources by the protocol they are served over, Postgres first.
+    /// A wire this app does not know gets its raw name rather than being
+    /// dropped, since a newer binary may add one.
+    var dataSourceGroups: [DataSourceGroup] {
+        let known = ["postgres", "mysql"]
+        let byWire = Dictionary(grouping: servableDataSources, by: \.wire)
+        let wires = known.filter { byWire[$0] != nil } + byWire.keys.filter { !known.contains($0) }.sorted()
+        return wires.map { wire in
+            DataSourceGroup(wire: wire, title: Self.wireTitle(wire), sources: byWire[wire] ?? [])
+        }
+    }
+
+    private static func wireTitle(_ wire: String) -> String {
+        switch wire {
+        case "postgres": return "PostgreSQL"
+        case "mysql": return "MySQL"
+        default: return wire
+        }
+    }
+
 
     func start() async {
         // The menu bar label's .task drives this. It runs once today, but a second
