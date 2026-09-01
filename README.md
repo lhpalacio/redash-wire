@@ -116,9 +116,11 @@ proxy runs shows up without a restart. Two failures in a row close the gate,
 and the second probe runs a second after the first fails rather than a full
 interval later, so a dropped VPN closes the gate in about ten seconds. The
 startup probe is the exception: nothing has proved Redash reachable yet and
-there is no session to protect, so one failure is enough, and it gets 10
-seconds instead of 5 so one slow first answer doesn't stop a start that would
-have worked. While the gate is closed the proxy drops open SQL sessions and
+there is no session to protect, so one failure is enough. Without
+`-wait-for-redash` that failure exits, so the startup probe gets 10 seconds
+instead of 5 and one slow first answer doesn't stop a start that would have
+worked; with the flag it gets the usual 5, since every second it waits is a
+second nothing is bound. While the gate is closed the proxy drops open SQL sessions and
 refuses new ones, with the ports still bound so recovery needs nothing from you.
 Postgres clients are told the reason at login and when they are dropped. A MySQL
 client is told on its next connection or query, because go-mysql owns the write

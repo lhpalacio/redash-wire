@@ -175,16 +175,34 @@ func serve() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	session, err := redashClient.GetSession(ctx)
-	if err != nil {
-		logger.Warn("fetching session info", "error", err)
+	// The session only decorates the banner, and the banner is off when a program
+	// is reading. Under the app this call used to run first with nothing but the
+	// HTTP client's 30s limit, so a black-holed VPN meant half a minute of
+	// "Starting" before the first probe even began. On the terminal it keeps a
+	// short budget for the same reason: it is decoration, not the check.
+	var session *redash.SessionInfo
+	if !machineReadable {
+		sessionCtx, cancelSession := context.WithTimeout(ctx, 5*time.Second)
+		var err error
+		if session, err = redashClient.GetSession(sessionCtx); err != nil {
+			logger.Warn("fetching session info", "error", err)
+		}
+		cancelSession()
 	}
 
 	// One health checker owns both "is Redash reachable" and "what data sources
 	// exist": proving the first and answering the second are the same request.
+	//
+	// The startup probe's longer budget exists for the case where one failure
+	// exits. Under a supervisor it is just the first probe, and every second it
+	// waits is a second the menu says "Starting" with nothing bound.
+	var checkerOpts []health.Option
+	if *waitForRedash {
+		checkerOpts = append(checkerOpts, health.WithStartupTimeout(health.DefaultTimeout))
+	}
 	gate := health.NewGate()
 	registry := redash.NewSwappableRegistry(nil)
-	checker := health.NewChecker(redashClient, registry, gate, logger)
+	checker := health.NewChecker(redashClient, registry, gate, logger, checkerOpts...)
 
 	// SIGUSR1 asks for a health probe now. The menu bar app sends it when the
 	// Mac's network path changes, so a VPN dropping or coming back is checked
