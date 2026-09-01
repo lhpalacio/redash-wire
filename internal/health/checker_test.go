@@ -379,3 +379,48 @@ func TestTheStartupProbeGetsTheLongerTimeout(t *testing.T) {
 		t.Errorf("steady-state probe budget = %s, want about 5s", lister.budgets[1])
 	}
 }
+
+func TestFailedProbesSayWhenTheNextOneIs(t *testing.T) {
+	// The menu counts down to the next probe, so every failed probe has to say
+	// how far away that is: the edge that closes the gate, and each one after.
+	lister := &stubLister{results: []listResult{{err: errors.New("dial tcp: i/o timeout")}}}
+	gate := health.NewGate()
+	logger, log := newCapture()
+	checker := health.NewChecker(lister, redash.NewSwappableRegistry(nil), gate, logger,
+		health.WithInterval(10*time.Second))
+
+	checker.Probe(context.Background()) // the startup probe is authoritative: gate closes
+	checker.Probe(context.Background()) // still down
+
+	down := log.events(health.EventRedashDown)
+	if len(down) != 1 || down[0]["retry_in_seconds"] != float64(10) {
+		t.Errorf("redash_down events = %v, want one carrying retry_in_seconds=10", down)
+	}
+	retry := log.events(health.EventRedashRetry)
+	if len(retry) != 1 || retry[0]["retry_in_seconds"] != float64(10) {
+		t.Fatalf("redash_retry events = %v, want one carrying retry_in_seconds=10", retry)
+	}
+	// The app runs without -debug, so a Debug line would never reach it.
+	if retry[0]["level"] != "INFO" {
+		t.Errorf("redash_retry logged at %v, want INFO so the app sees it", retry[0]["level"])
+	}
+}
+
+func TestARejectedKeyCountsDownToTheLongBackoff(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	gate := health.NewGate()
+	logger, log := newCapture()
+	checker := health.NewChecker(redash.NewClient(server.URL, "bad-key"), redash.NewSwappableRegistry(nil), gate, logger,
+		health.WithRejectedInterval(5*time.Minute))
+
+	checker.Probe(context.Background())
+
+	down := log.events(health.EventRedashDown)
+	if len(down) != 1 || down[0]["retry_in_seconds"] != float64(300) {
+		t.Errorf("redash_down events = %v, want one carrying retry_in_seconds=300: a rejected key backs off", down)
+	}
+}

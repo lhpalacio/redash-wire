@@ -152,6 +152,7 @@ enum WireEvent {
     static let listenerReady = "listener_ready"
     static let redashUp = "redash_up"
     static let redashDown = "redash_down"
+    static let redashRetry = "redash_retry"
     static let dataSources = "datasources_refreshed"
 }
 

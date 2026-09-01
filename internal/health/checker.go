@@ -18,7 +18,11 @@ const (
 	EventListenerReady = "listener_ready"
 	EventRedashUp      = "redash_up"
 	EventRedashDown    = "redash_down"
-	EventDataSources   = "datasources_refreshed"
+	// A probe that failed while the gate was already down. Both this and
+	// EventRedashDown carry retry_in_seconds, the delay until the next probe,
+	// so the app can count down to it instead of showing a state with no end.
+	EventRedashRetry = "redash_retry"
+	EventDataSources = "datasources_refreshed"
 )
 
 const (
@@ -186,10 +190,15 @@ func (c *Checker) recordFailure(err error) {
 	// Re-announce when the kind changes even though the gate was already down: an
 	// unreachable Redash that starts answering 401 needs a different fix, and the
 	// app is showing the old sentence until it hears otherwise.
-	if c.gate.Fail(kind, err.Error()) || kind != c.lastKind {
-		c.logger.Error("redash is unreachable", "event", EventRedashDown, "kind", kind, "error", err)
+	transitioned := c.gate.Fail(kind, err.Error())
+	// Read after the gate moved, so it is the cadence the new state gets.
+	retryIn := int(c.nextInterval() / time.Second)
+	if transitioned || kind != c.lastKind {
+		c.logger.Error("redash is unreachable", "event", EventRedashDown, "kind", kind, "error", err, "retry_in_seconds", retryIn)
 	} else {
-		c.logger.Debug("redash still unreachable", "kind", kind, "error", err)
+		// Info, not Debug: the app runs without -debug, and this is the line
+		// that restarts its countdown.
+		c.logger.Info("redash still unreachable", "event", EventRedashRetry, "kind", kind, "error", err, "retry_in_seconds", retryIn)
 	}
 	c.lastKind = kind
 }

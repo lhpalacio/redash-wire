@@ -66,11 +66,16 @@ struct MenuBarView: View {
             if let remedy = health.remedy {
                 Text(remedy)
             }
+            if let line = retryLine {
+                Text(line)
+            }
             showLogsButton
         } else if supervisor.state.isRunning, let profile = model.selectedProfile {
             ForEach(listenerLines(for: profile), id: \.self) { line in
                 Text(line)
             }
+        } else if supervisor.state.isBusy, let restart = supervisor.pendingRestart {
+            Text("Restarting in \(Self.countdown(to: restart.at, now: supervisor.now)) (attempt \(restart.attempt) of \(restart.limit))")
         }
 
         if let error = model.configError {
@@ -145,6 +150,20 @@ struct MenuBarView: View {
             lines.append("MySQL  \(profile.mysqlListenAddr)")
         }
         return lines
+    }
+
+    /// Reads `now` so the row re-renders on every tick. Once the count reaches
+    /// zero the probe is in flight for up to its timeout, which is not a number.
+    private var retryLine: String? {
+        guard let at = supervisor.nextProbeAt else { return nil }
+        let remaining = at.timeIntervalSince(supervisor.now)
+        return remaining > 0.5 ? "Retrying in \(Self.countdown(to: at, now: supervisor.now))" : "Retrying now…"
+    }
+
+    private static func countdown(to date: Date, now: Date) -> String {
+        let seconds = max(0, Int(date.timeIntervalSince(now).rounded(.up)))
+        if seconds < 60 { return "\(seconds)s" }
+        return "\(seconds / 60)m \(seconds % 60)s"
     }
 
     private static func uptime(since: Date) -> String {

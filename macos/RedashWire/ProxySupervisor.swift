@@ -48,6 +48,30 @@ final class ProxySupervisor: ObservableObject {
     /// behind by a proxy that has stopped would describe a port nothing answers.
     @Published private(set) var dataSources: [DataSource] = []
 
+    /// When the running proxy will next ask Redash, as it said on its last failed
+    /// probe. Nil while Redash is answering. The menu counts down to it, so an
+    /// amber state has a visible end instead of a wait of unknown length.
+    @Published private(set) var nextProbeAt: Date? {
+        didSet { updateTicker() }
+    }
+
+    /// A restart scheduled after a crash, with which attempt it is.
+    struct PendingRestart: Equatable {
+        let at: Date
+        let attempt: Int
+        let limit: Int
+    }
+
+    @Published private(set) var pendingRestart: PendingRestart? {
+        didSet { updateTicker() }
+    }
+
+    /// Ticks once a second while a countdown is showing, so the menu re-renders
+    /// it. It is the only thing that changes while the proxy waits, and nothing
+    /// should read it for any other purpose.
+    @Published private(set) var now = Date()
+    private var tickTask: Task<Void, Never>?
+
     private let cli: WireCLI
     private var process: Process?
     /// Held open deliberately: closing it triggers the child's -exit-on-stdin-eof.
@@ -135,6 +159,22 @@ final class ProxySupervisor: ObservableObject {
         kill(process.processIdentifier, SIGUSR1)
     }
 
+    /// One task for both countdowns; it lives only while there is one to show.
+    private func updateTicker() {
+        let counting = nextProbeAt != nil || pendingRestart != nil
+        if counting, tickTask == nil {
+            tickTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(1))
+                    self?.now = Date()
+                }
+            }
+        } else if !counting {
+            tickTask?.cancel()
+            tickTask = nil
+        }
+    }
+
 
     private func launch(profile: Profile) {
         activeProfile = profile
@@ -145,6 +185,8 @@ final class ProxySupervisor: ObservableObject {
         reportedHealth = .ok
         lastErrorMessage = nil
         dataSources = []
+        nextProbeAt = nil
+        pendingRestart = nil
         lineBuffer.removeAll()
         state = .starting
 
@@ -232,10 +274,15 @@ final class ProxySupervisor: ObservableObject {
                 kind: event.fields["kind"],
                 reason: event.fields["error"] ?? event.message
             )
+            nextProbeAt = Self.retryDate(from: event)
             applyHealth()
+
+        case WireEvent.redashRetry:
+            nextProbeAt = Self.retryDate(from: event)
 
         case WireEvent.redashUp:
             reportedHealth = .ok
+            nextProbeAt = nil
             applyHealth()
 
         case WireEvent.dataSources:
@@ -261,6 +308,13 @@ final class ProxySupervisor: ObservableObject {
     private static func reason(for event: LogEvent) -> String {
         guard let detail = event.fields["error"], !detail.isEmpty else { return event.message }
         return "\(event.message): \(detail)"
+    }
+
+    /// Counted from receipt rather than the event's own timestamp, which has
+    /// whole-second precision and would start the countdown up to a second off.
+    private static func retryDate(from event: LogEvent) -> Date? {
+        guard let raw = event.fields["retry_in_seconds"], let seconds = Double(raw) else { return nil }
+        return Date().addingTimeInterval(seconds)
     }
 
     private static func parse(line: Data) -> LogEvent? {
@@ -295,6 +349,7 @@ final class ProxySupervisor: ObservableObject {
         // Whatever happens next — a backoff restart, a failure, a clean stop —
         // nothing is serving these any more.
         dataSources = []
+        nextProbeAt = nil
 
         if stopRequested {
             finishStopped()
@@ -322,6 +377,11 @@ final class ProxySupervisor: ObservableObject {
             return
         }
 
+        pendingRestart = PendingRestart(
+            at: Date().addingTimeInterval(TimeInterval(delay.components.seconds)),
+            attempt: restartAttempts,
+            limit: Self.backoffDelays.count
+        )
         restartTask = Task { [weak self] in
             try? await Task.sleep(for: delay)
             guard !Task.isCancelled else { return }
@@ -336,6 +396,8 @@ final class ProxySupervisor: ObservableObject {
         reachedReady = false
         seenListeners = 0
         dataSources = []
+        nextProbeAt = nil
+        pendingRestart = nil
         state = .stopped
     }
 }
