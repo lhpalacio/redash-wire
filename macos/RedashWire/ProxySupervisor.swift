@@ -49,11 +49,14 @@ final class ProxySupervisor: ObservableObject {
     @Published private(set) var dataSources: [DataSource] = []
 
     /// When the running proxy will next ask Redash, as it said on its last failed
-    /// probe. Nil while Redash is answering. The menu counts down to it, so an
-    /// amber state has a visible end instead of a wait of unknown length.
-    @Published private(set) var nextProbeAt: Date? {
-        didSet { updateTicker() }
-    }
+    /// probe. Nil while Redash is answering. The menu shows how far off it is, so
+    /// an amber state has a visible end instead of a wait of unknown length.
+    ///
+    /// Nothing ticks. The menu is a real NSMenu that SwiftUI rebuilds on every
+    /// published change, and a change every second made its submenus blink and
+    /// impossible to navigate. The menu body runs when the menu opens, which is
+    /// when anyone reads it, so a value computed then is the right one.
+    @Published private(set) var nextProbeAt: Date?
 
     /// A restart scheduled after a crash, with which attempt it is.
     struct PendingRestart: Equatable {
@@ -62,15 +65,7 @@ final class ProxySupervisor: ObservableObject {
         let limit: Int
     }
 
-    @Published private(set) var pendingRestart: PendingRestart? {
-        didSet { updateTicker() }
-    }
-
-    /// Ticks once a second while a countdown is showing, so the menu re-renders
-    /// it. It is the only thing that changes while the proxy waits, and nothing
-    /// should read it for any other purpose.
-    @Published private(set) var now = Date()
-    private var tickTask: Task<Void, Never>?
+    @Published private(set) var pendingRestart: PendingRestart?
 
     private let cli: WireCLI
     private var process: Process?
@@ -157,22 +152,6 @@ final class ProxySupervisor: ObservableObject {
     private func networkPathChanged() {
         guard reachedReady, let process, process.isRunning else { return }
         kill(process.processIdentifier, SIGUSR1)
-    }
-
-    /// One task for both countdowns; it lives only while there is one to show.
-    private func updateTicker() {
-        let counting = nextProbeAt != nil || pendingRestart != nil
-        if counting, tickTask == nil {
-            tickTask = Task { [weak self] in
-                while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(1))
-                    self?.now = Date()
-                }
-            }
-        } else if !counting {
-            tickTask?.cancel()
-            tickTask = nil
-        }
     }
 
 

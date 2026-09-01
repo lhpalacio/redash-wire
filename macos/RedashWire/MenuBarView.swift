@@ -75,7 +75,7 @@ struct MenuBarView: View {
                 Text(line)
             }
         } else if supervisor.state.isBusy, let restart = supervisor.pendingRestart {
-            Text("Restarting in \(Self.countdown(to: restart.at, now: supervisor.now)) (attempt \(restart.attempt) of \(restart.limit))")
+            Text("Restarting in \(Self.countdown(to: restart.at)) (attempt \(restart.attempt) of \(restart.limit))")
         }
 
         if let error = model.configError {
@@ -152,16 +152,16 @@ struct MenuBarView: View {
         return lines
     }
 
-    /// Reads `now` so the row re-renders on every tick. Once the count reaches
-    /// zero the probe is in flight for up to its timeout, which is not a number.
+    /// Computed when the menu opens, like the uptime above it; see `nextProbeAt`
+    /// for why it does not tick. Once the count reaches zero the probe is in
+    /// flight for up to its timeout, which is not a number.
     private var retryLine: String? {
         guard let at = supervisor.nextProbeAt else { return nil }
-        let remaining = at.timeIntervalSince(supervisor.now)
-        return remaining > 0.5 ? "Retrying in \(Self.countdown(to: at, now: supervisor.now))" : "Retrying now…"
+        return at.timeIntervalSinceNow > 0.5 ? "Retrying in \(Self.countdown(to: at))" : "Retrying now…"
     }
 
-    private static func countdown(to date: Date, now: Date) -> String {
-        let seconds = max(0, Int(date.timeIntervalSince(now).rounded(.up)))
+    private static func countdown(to date: Date) -> String {
+        let seconds = max(0, Int(date.timeIntervalSinceNow.rounded(.up)))
         if seconds < 60 { return "\(seconds)s" }
         return "\(seconds / 60)m \(seconds % 60)s"
     }

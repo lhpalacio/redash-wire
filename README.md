@@ -239,8 +239,9 @@ From the menu you can:
   than the next time a query fails. The app also watches the Mac's network
   path and asks the proxy to check the moment an interface comes or goes, so
   a VPN dropping or reconnecting usually shows within a second or two. While
-  Redash is away the menu counts down to the next check, and while the app
-  waits to restart a proxy that crashed it counts down to that too.
+  Redash is away the menu says how long until the next check, and while the
+  app waits to restart a proxy that crashed it says how long until that too.
+  Like the uptime, the number is as of when you opened the menu.
 - Follow the proxy's log stream in a window you can filter by level and by text.
 - Turn on launch at login.
 - Check for a new release. It compares the app's version against the latest tag
