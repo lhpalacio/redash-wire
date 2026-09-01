@@ -22,11 +22,25 @@ const (
 )
 
 const (
-	DefaultInterval = 30 * time.Second
-	DefaultTimeout  = 10 * time.Second
+	// The interval bounds how long a dropped VPN can go unnoticed, since the
+	// timer is what finds it when no query is running. A data source list is a
+	// small GET, so ten seconds costs Redash little and keeps the menu honest.
+	DefaultInterval = 10 * time.Second
+	DefaultTimeout  = 5 * time.Second
+
+	// The startup probe is authoritative on one failure, so it gets the patience
+	// the steady-state probes give up: a Redash that is slow to answer once at
+	// launch should not stop a CLI start that would have worked a moment later.
+	DefaultStartupTimeout = 10 * time.Second
+
+	// How long after a first failure the confirming probe runs. Waiting a full
+	// interval was most of the time between a VPN dropping and the menu saying
+	// so; one second still separates the two probes enough that a single lost
+	// packet does not fail both.
+	DefaultConfirmDelay = time.Second
 
 	// A rejected key does not fix itself, so back off hard instead of hammering a
-	// wall every 30 seconds for the rest of the session.
+	// wall every ten seconds for the rest of the session.
 	DefaultRejectedInterval = 5 * time.Minute
 
 	// Two failures to trip, one success to clear. The asymmetry is deliberate:
@@ -46,8 +60,10 @@ type Checker struct {
 	logger   *slog.Logger
 
 	interval         time.Duration
+	confirmDelay     time.Duration
 	rejectedInterval time.Duration
 	timeout          time.Duration
+	startupTimeout   time.Duration
 	threshold        int
 
 	failures    int
@@ -64,6 +80,8 @@ func WithFailureThreshold(n int) Option   { return func(c *Checker) { c.threshol
 func WithRejectedInterval(d time.Duration) Option {
 	return func(c *Checker) { c.rejectedInterval = d }
 }
+func WithConfirmDelay(d time.Duration) Option   { return func(c *Checker) { c.confirmDelay = d } }
+func WithStartupTimeout(d time.Duration) Option { return func(c *Checker) { c.startupTimeout = d } }
 
 func NewChecker(lister redash.DataSourceLister, registry *redash.SwappableRegistry, gate *Gate, logger *slog.Logger, opts ...Option) *Checker {
 	c := &Checker{
@@ -72,8 +90,10 @@ func NewChecker(lister redash.DataSourceLister, registry *redash.SwappableRegist
 		gate:             gate,
 		logger:           logger,
 		interval:         DefaultInterval,
+		confirmDelay:     DefaultConfirmDelay,
 		rejectedInterval: DefaultRejectedInterval,
 		timeout:          DefaultTimeout,
+		startupTimeout:   DefaultStartupTimeout,
 		threshold:        DefaultFailureThreshold,
 		lastKind:         KindOK,
 	}
@@ -84,7 +104,9 @@ func NewChecker(lister redash.DataSourceLister, registry *redash.SwappableRegist
 }
 
 // Run probes on a timer until ctx is cancelled, and out of band whenever a
-// session reports a suspicious query failure.
+// session reports a suspicious query failure. A first failure shortens the
+// timer to the confirm delay, so the threshold is met in seconds rather than an
+// interval later.
 func (c *Checker) Run(ctx context.Context) {
 	timer := time.NewTimer(c.nextInterval())
 	defer timer.Stop()
@@ -108,7 +130,11 @@ func (c *Checker) Run(ctx context.Context) {
 // moves the gate, and emits the events the app listens for. serve calls it once
 // before binding, so a cold start and a mid-session drop travel the same path.
 func (c *Checker) Probe(ctx context.Context) error {
-	probeCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	timeout := c.timeout
+	if !c.everUp {
+		timeout = c.startupTimeout
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	sources, err := c.lister.ListDataSources(probeCtx)
@@ -189,8 +215,15 @@ func (c *Checker) publish(sources []redash.DataSource) {
 }
 
 func (c *Checker) nextInterval() time.Duration {
-	if s := c.gate.Status(); !s.Up && s.Kind == KindRejected {
+	s := c.gate.Status()
+	if !s.Up && s.Kind == KindRejected {
 		return c.rejectedInterval
+	}
+	// A failure the threshold absorbed. The gate is still up over a Redash that
+	// just did not answer, and every live session is betting on that; settle it
+	// now rather than at the next tick.
+	if s.Up && c.failures > 0 {
+		return c.confirmDelay
 	}
 	return c.interval
 }

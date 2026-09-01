@@ -109,13 +109,17 @@ proxy binds its listeners anyway and refuses connections until Redash answers,
 so a supervising app that launches before the VPN is up gets a proxy that
 recovers on its own.
 
-While serving, the proxy asks Redash for its data sources every 30 seconds. One
-call answers two questions: whether Redash is reachable, and what it holds now,
-so a data source added while the proxy runs shows up without a restart. Two
-failures in a row close the gate. The startup probe is the exception: nothing has
-proved Redash reachable yet and there is no session to protect, so one failure is
-enough. While the gate is closed the proxy drops open SQL sessions and refuses
-new ones, with the ports still bound so recovery needs nothing from you.
+While serving, the proxy asks Redash for its data sources every 10 seconds,
+giving each answer 5 seconds to arrive. One call answers two questions: whether
+Redash is reachable, and what it holds now, so a data source added while the
+proxy runs shows up without a restart. Two failures in a row close the gate,
+and the second probe runs a second after the first fails rather than a full
+interval later, so a dropped VPN closes the gate in about ten seconds. The
+startup probe is the exception: nothing has proved Redash reachable yet and
+there is no session to protect, so one failure is enough, and it gets 10
+seconds instead of 5 so one slow first answer doesn't stop a start that would
+have worked. While the gate is closed the proxy drops open SQL sessions and
+refuses new ones, with the ports still bound so recovery needs nothing from you.
 Postgres clients are told the reason at login and when they are dropped. A MySQL
 client is told on its next connection or query, because go-mysql owns the write
 side of a session already under way. A query that dies on an
@@ -228,8 +232,8 @@ From the menu you can:
 - Copy the profile-level details from the Connect submenu: the psql or mysql
   command, the username, the password.
 - See whether Redash itself is answering. The proxy polls it while running, so
-  the menu says so within a minute of the VPN dropping, rather than the next
-  time a query fails.
+  the menu says so within about fifteen seconds of the VPN dropping, rather
+  than the next time a query fails.
 - Follow the proxy's log stream in a window you can filter by level and by text.
 - Turn on launch at login.
 - Check for a new release. It compares the app's version against the latest tag
