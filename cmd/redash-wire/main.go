@@ -175,37 +175,77 @@ func serve() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	session, err := redashClient.GetSession(ctx)
-	if err != nil {
-		logger.Warn("fetching session info", "error", err)
+	// The session only decorates the banner, and the banner is off when a program
+	// is reading. Under the app this call used to run first with nothing but the
+	// HTTP client's 30s limit, so a black-holed VPN meant half a minute of
+	// "Starting" before the first probe even began. On the terminal it keeps a
+	// short budget for the same reason: it is decoration, not the check.
+	var session *redash.SessionInfo
+	if !machineReadable {
+		sessionCtx, cancelSession := context.WithTimeout(ctx, 5*time.Second)
+		var err error
+		if session, err = redashClient.GetSession(sessionCtx); err != nil {
+			logger.Warn("fetching session info", "error", err)
+		}
+		cancelSession()
 	}
 
 	// One health checker owns both "is Redash reachable" and "what data sources
 	// exist": proving the first and answering the second are the same request.
+	//
+	// The startup probe's longer budget exists for the case where one failure
+	// exits. Under a supervisor it is just the first probe, and every second it
+	// waits is a second the menu says "Starting" with nothing bound.
+	var checkerOpts []health.Option
+	if *waitForRedash {
+		checkerOpts = append(checkerOpts, health.WithStartupTimeout(health.DefaultTimeout))
+	}
 	gate := health.NewGate()
 	registry := redash.NewSwappableRegistry(nil)
-	checker := health.NewChecker(redashClient, registry, gate, logger)
+	checker := health.NewChecker(redashClient, registry, gate, logger, checkerOpts...)
 
-	// The first probe is also the startup check. Without -wait-for-redash a
-	// failure is still fatal, so the CLI and the Docker image behave exactly as
-	// they always have; under a supervisor it closes the gate instead and the
-	// proxy comes up ready to recover on its own.
-	if err := checker.Probe(ctx); err != nil && !*waitForRedash {
-		os.Exit(1)
-	}
+	// SIGUSR1 asks for a health probe now. The menu bar app sends it when the
+	// Mac's network path changes, so a VPN dropping or coming back is checked
+	// within a second rather than at the next tick; `kill -USR1` does the same
+	// by hand. Registered before anything binds, because an unhandled SIGUSR1
+	// kills the process, and the app only signals a proxy that has bound.
+	probeNow := make(chan os.Signal, 1)
+	signal.Notify(probeNow, syscall.SIGUSR1)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-probeNow:
+				gate.Suspect()
+			}
+		}
+	}()
 
-	sources := registry.All()
-	// An empty list means the key authenticated but sees nothing, which is a
-	// Redash permissions problem rather than a connectivity one. Under a
-	// supervisor that is a state worth showing; on the command line it is still
-	// what it always was, nothing to serve.
-	if len(sources) == 0 && !*waitForRedash {
-		logger.Error("no data sources found")
-		os.Exit(1)
+	if *waitForRedash {
+		// Nothing has proved Redash reachable, and under a supervisor the answer
+		// is a state to show rather than a reason to exit, so bind first and let
+		// the checker's loop make the first probe. The gate starts closed for the
+		// window in between: a client that connects before the answer is refused
+		// with a reason, not served from an empty registry.
+		gate.Fail(health.KindUnreachable, "waiting for the first check")
+	} else {
+		// The first probe is also the startup check, and a failure is fatal: a
+		// script or a container wants the exit, not a proxy that binds and waits.
+		if err := checker.Probe(ctx); err != nil {
+			os.Exit(1)
+		}
+		// An empty list means the key authenticated but sees nothing, which is a
+		// Redash permissions problem rather than a connectivity one: nothing to
+		// serve.
+		if len(registry.All()) == 0 {
+			logger.Error("no data sources found")
+			os.Exit(1)
+		}
 	}
 
 	if !machineReadable {
-		printBanner(cfg, resolved.Path, sources, session)
+		printBanner(cfg, resolved.Path, registry.All(), gate.Up(), session)
 	}
 
 	sigCh := make(chan os.Signal, 1)
@@ -311,7 +351,7 @@ func warnDefaultCredentials(logger *slog.Logger, cfg *config.Config) {
 	}
 }
 
-func printBanner(cfg *config.Config, configPath string, sources []redash.DataSource, session *redash.SessionInfo) {
+func printBanner(cfg *config.Config, configPath string, sources []redash.DataSource, checked bool, session *redash.SessionInfo) {
 	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render("redash-wire")
 	label := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	value := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
@@ -344,7 +384,12 @@ func printBanner(cfg *config.Config, configPath string, sources []redash.DataSou
 	if session != nil && session.ClientConfig.Version != "" {
 		redashLines = append(redashLines, line("Version", session.ClientConfig.Version))
 	}
-	redashLines = append(redashLines, line("Sources", formatSourceCount(sources)))
+	if checked {
+		redashLines = append(redashLines, line("Sources", formatSourceCount(sources)))
+	} else {
+		// -wait-for-redash binds before it probes, so the list is not known yet.
+		redashLines = append(redashLines, line("Sources", "checking…"))
+	}
 	redashBox := boxStyle.Render(fmt.Sprintf("%s\n%s", defaultTitle("Redash"), strings.Join(redashLines, "\n")))
 
 	var serverBoxes []string

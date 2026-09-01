@@ -44,5 +44,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Test the app's core
+        run: swift test --package-path macos
       - name: Build the app
         run: ./scripts/build-app.sh

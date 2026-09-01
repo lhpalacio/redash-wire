@@ -8,12 +8,12 @@ struct RedashWireApp: App {
         MenuBarExtra {
             MenuRoot(model: model)
         } label: {
-            MenuBarLabel(model: model)
+            MenuBarLabel(model: model, supervisor: model.supervisor)
         }
         .menuBarExtraStyle(.menu)
 
         Window("redash-wire Logs", id: "logs") {
-            LogWindow(supervisor: model.supervisor)
+            LogWindow(log: model.supervisor.log)
         }
         .defaultSize(width: 760, height: 440)
 
@@ -25,8 +25,13 @@ struct RedashWireApp: App {
 }
 
 /// Rendered at launch, unlike the menu contents, so loading starts here.
+///
+/// Observes the supervisor itself. Reading its state through the model is not
+/// enough: a nested ObservableObject does not publish through its parent, so the
+/// icon would keep the state it had at launch.
 private struct MenuBarLabel: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var supervisor: ProxySupervisor
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -45,14 +50,14 @@ private struct MenuBarLabel: View {
     /// gets its own, because leaving it looking healthy is the thing that made a
     /// disconnected VPN invisible until a query failed.
     private var symbolName: String {
-        switch model.supervisor.state {
+        switch supervisor.state {
         case .running(_, .ok):
             return "bolt.horizontal.circle.fill"
         case .running(_, .unreachable):
             return "bolt.slash.circle.fill"
         case .running(_, .rejected):
             return "exclamationmark.triangle.fill"
-        case .starting:
+        case .starting, .running(_, .checking):
             return "bolt.horizontal.circle"
         case .failed:
             return "exclamationmark.triangle.fill"

@@ -1,82 +1,64 @@
 import Combine
 import Darwin
 import Foundation
+import Network
 
-/// Owns the redash-wire child process, one profile at a time.
+/// Owns the redash-wire child process, one profile at a time. What the process
+/// means is decided by `ProxyTracker`; this class spawns, feeds and stops it,
+/// and publishes the tracker's snapshot for the menu.
 @MainActor
 final class ProxySupervisor: ObservableObject {
-    enum State: Equatable {
-        case stopped
-        case starting
-        /// Running says the listeners are bound; `redash` says whether anything
-        /// behind them can be served. The two are separate facts, and conflating
-        /// them is what let the menu show green while every query failed.
-        case running(since: Date, redash: RedashHealth)
-        case failed(String)
-
-        var isRunning: Bool {
-            if case .running = self { return true }
-            return false
-        }
-
-        var isBusy: Bool { self == .starting }
-
-        /// Nil unless running: a stopped proxy is not asking Redash anything.
-        var health: RedashHealth? {
-            if case .running(_, let redash) = self { return redash }
-            return nil
-        }
-    }
-
-    /// Its length is also the attempt limit.
-    private static let backoffDelays: [Duration] = [.seconds(1), .seconds(2), .seconds(4)]
+    typealias State = ProxyTracker.State
+    typealias PendingRestart = ProxyTracker.PendingRestart
 
     /// Longer than the daemon's own 5s force-exit timer, so SIGKILL never lands
     /// mid-shutdown.
     private static let terminationGrace: TimeInterval = 7
 
-    private static let maxEvents = 5_000
+    /// Assigned only when it differs, because the menu is a real NSMenu that
+    /// SwiftUI rebuilds on every published change, and a rebuild closes whatever
+    /// submenu is open.
+    @Published private(set) var snapshot = ProxyTracker.Snapshot()
 
-    @Published private(set) var state: State = .stopped
-    @Published private(set) var activeProfile: Profile?
-    @Published private(set) var events: [LogEvent] = []
-
+    var state: State { snapshot.state }
+    var activeProfile: Profile? { snapshot.activeProfile }
     /// Reported by the running proxy on every health probe, and emptied whenever
     /// that proxy goes away. It belongs to the process: it comes from the same
     /// registry that resolves the database name you connect with, so a list left
     /// behind by a proxy that has stopped would describe a port nothing answers.
-    @Published private(set) var dataSources: [DataSource] = []
+    var dataSources: [DataSource] { snapshot.dataSources }
+    var pendingRestart: PendingRestart? { snapshot.pendingRestart }
+
+    /// Not published: see `ProxyTracker.nextProbeAt`. The menu reads it when it
+    /// opens.
+    private(set) var nextProbeAt: Date?
+
+    /// Every line the child wrote. Its own object, so the log window is the only
+    /// view that re-renders per line.
+    let log = LogStore()
 
     private let cli: WireCLI
+    private var tracker = ProxyTracker()
     private var process: Process?
     /// Held open deliberately: closing it triggers the child's -exit-on-stdin-eof.
     private var stdinPipe: Pipe?
     private var lineBuffer = Data()
-
-    /// The daemon can report Redash down before the listeners finish binding — a
-    /// cold start under -wait-for-redash does exactly that — so the latest health
-    /// is held here and applied when the state reaches running.
-    private var reportedHealth: RedashHealth = .ok
-
-    private var expectedListeners = 0
-    private var seenListeners = 0
-    private var reachedReady = false
     private var stopRequested = false
-    private var restartAttempts = 0
     private var restartTask: Task<Void, Never>?
-    private var lastErrorMessage: String?
+    private var pathWatcher: NetworkPathWatcher?
 
     init(cli: WireCLI) {
         self.cli = cli
+        pathWatcher = NetworkPathWatcher { [weak self] in
+            Task { @MainActor [weak self] in self?.networkPathChanged() }
+        }
     }
 
 
     func start(profile: Profile) {
         guard process == nil else { return }
-        // A manual start clears the budget, so a retry after three crashes is not
-        // born exhausted.
-        restartAttempts = 0
-        launch(profile: profile)
+        tracker.start(profile)
+        spawn(profile)
     }
 
     func stop() async {
@@ -84,7 +66,9 @@ final class ProxySupervisor: ObservableObject {
         restartTask = nil
 
         guard let process, process.isRunning else {
-            finishStopped()
+            tracker.stopped()
+            stopRequested = false
+            publish()
             return
         }
 
@@ -114,22 +98,23 @@ final class ProxySupervisor: ObservableObject {
         await restart(profile: profile)
     }
 
-    func clearLog() {
-        events.removeAll()
+    /// The proxy's own timer would notice within an interval. A path change is
+    /// earlier evidence, so ask it to probe now: a VPN that just dropped shows as
+    /// unreachable in a second or two, and one that just came back as green.
+    ///
+    /// Only a proxy that has bound its listeners gets the signal. The daemon
+    /// registers its SIGUSR1 handler before it binds, and an unhandled SIGUSR1
+    /// kills a process.
+    private func networkPathChanged() {
+        guard tracker.reachedReady, let process, process.isRunning else { return }
+        kill(process.processIdentifier, SIGUSR1)
     }
 
 
-    private func launch(profile: Profile) {
-        activeProfile = profile
-        expectedListeners = profile.enabledListenerCount
-        seenListeners = 0
-        reachedReady = false
+    private func spawn(_ profile: Profile) {
         stopRequested = false
-        reportedHealth = .ok
-        lastErrorMessage = nil
-        dataSources = []
         lineBuffer.removeAll()
-        state = .starting
+        publish()
 
         let process = Process()
         process.executableURL = cli.binaryURL
@@ -162,7 +147,8 @@ final class ProxySupervisor: ObservableObject {
         do {
             try process.run()
         } catch {
-            state = .failed("could not start \(cli.binaryURL.lastPathComponent): \(error.localizedDescription)")
+            tracker.launchFailed("could not start \(cli.binaryURL.lastPathComponent): \(error.localizedDescription)")
+            publish()
             return
         }
 
@@ -177,20 +163,13 @@ final class ProxySupervisor: ObservableObject {
         while let newline = lineBuffer.firstIndex(of: UInt8(ascii: "\n")) {
             let line = lineBuffer[lineBuffer.startIndex..<newline]
             lineBuffer.removeSubrange(lineBuffer.startIndex...newline)
-            guard !line.isEmpty, let event = Self.parse(line: Data(line)) else { continue }
+            guard !line.isEmpty, let event = LogEvent.parse(line: Data(line)) else { continue }
             record(event)
         }
     }
 
     private func record(_ event: LogEvent) {
-        events.append(event)
-        if events.count > Self.maxEvents {
-            events.removeFirst(events.count - Self.maxEvents)
-        }
-
-        if event.level >= .error {
-            lastErrorMessage = Self.reason(for: event)
-        }
+        log.append(event)
 
         // Everything the child wrote belongs in the log, but nothing it wrote may
         // change state once it has exited. stderr is drained on a different task
@@ -199,126 +178,54 @@ final class ProxySupervisor: ObservableObject {
         // refill the data sources handleExit just cleared.
         guard process != nil else { return }
 
-        switch event.event {
-        case WireEvent.listenerReady:
-            // Every configured listener must report in. With both enabled, one
-            // bound port does not make the proxy usable.
-            seenListeners += 1
-            if !reachedReady && seenListeners >= max(expectedListeners, 1) {
-                reachedReady = true
-                restartAttempts = 0
-                state = .running(since: Date(), redash: reportedHealth)
-            }
-
-        case WireEvent.redashDown:
-            reportedHealth = RedashHealth(
-                kind: event.fields["kind"],
-                reason: event.fields["error"] ?? event.message
-            )
-            applyHealth()
-
-        case WireEvent.redashUp:
-            reportedHealth = .ok
-            applyHealth()
-
-        case WireEvent.dataSources:
-            guard
-                let payload = event.fields["sources"],
-                let sources = try? JSONDecoder().decode([DataSource].self, from: Data(payload.utf8))
-            else { return }
-            dataSources = sources
-
-        default:
-            break
-        }
+        tracker.record(event, now: Date())
+        publish()
     }
-
-    private func applyHealth() {
-        guard case .running(let since, let current) = state, current != reportedHealth else { return }
-        state = .running(since: since, redash: reportedHealth)
-    }
-
-    /// slog puts the headline in `msg` and the diagnosis in `error`. Keeping only
-    /// the message is what turned "cannot reach Redash: dial tcp ... i/o timeout"
-    /// into a bare "fetching data sources" in the menu.
-    private static func reason(for event: LogEvent) -> String {
-        guard let detail = event.fields["error"], !detail.isEmpty else { return event.message }
-        return "\(event.message): \(detail)"
-    }
-
-    private static func parse(line: Data) -> LogEvent? {
-        guard
-            let object = try? JSONSerialization.jsonObject(with: line),
-            let record = object as? [String: Any]
-        else { return nil }
-
-        let message = record["msg"] as? String ?? ""
-        let level = (record["level"] as? String).flatMap(LogEvent.Level.init(rawValue:)) ?? .info
-        let time = (record["time"] as? String).flatMap(Self.timestampParser.date(from:)) ?? Date()
-        let event = record["event"] as? String
-
-        var fields: [String: String] = [:]
-        for (key, value) in record where !["msg", "level", "time", "event"].contains(key) {
-            fields[key] = String(describing: value)
-        }
-
-        return LogEvent(time: time, level: level, event: event, message: message, fields: fields)
-    }
-
-    private static let timestampParser: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter
-    }()
-
 
     private func handleExit(status: Int32) {
         process = nil
         stdinPipe = nil
-        // Whatever happens next — a backoff restart, a failure, a clean stop —
-        // nothing is serving these any more.
-        dataSources = []
 
-        if stopRequested {
-            finishStopped()
-            return
-        }
+        let outcome = tracker.exit(status: status, stopRequested: stopRequested, now: Date())
+        stopRequested = false
+        publish()
 
-        // Nothing bound, so the cause is permanent: a rejected key, a port in use,
-        // an invalid profile. A retry loop would only hide it.
-        guard reachedReady else {
-            state = .failed(lastErrorMessage ?? "redash-wire stopped before it began listening (status \(status))")
-            return
-        }
-
-        guard restartAttempts < Self.backoffDelays.count else {
-            state = .failed(lastErrorMessage ?? "redash-wire keeps stopping after \(restartAttempts) restarts")
-            return
-        }
-
-        let delay = Self.backoffDelays[restartAttempts]
-        restartAttempts += 1
-        state = .starting
-
-        guard let profile = activeProfile else {
-            state = .failed("redash-wire stopped and no profile is selected")
-            return
-        }
-
+        guard case .restart(let profile, let delay) = outcome else { return }
         restartTask = Task { [weak self] in
             try? await Task.sleep(for: delay)
-            guard !Task.isCancelled else { return }
-            self?.launch(profile: profile)
+            guard !Task.isCancelled, let self else { return }
+            self.tracker.launch(profile)
+            self.spawn(profile)
         }
     }
 
-    private func finishStopped() {
-        process = nil
-        stdinPipe = nil
-        stopRequested = false
-        reachedReady = false
-        seenListeners = 0
-        dataSources = []
-        state = .stopped
+    private func publish() {
+        nextProbeAt = tracker.nextProbeAt
+        if tracker.snapshot != snapshot {
+            snapshot = tracker.snapshot
+        }
+    }
+}
+
+/// Reports each change to the Mac's network path. A VPN coming or going shows up
+/// here as an interface appearing or disappearing, seconds before the proxy's
+/// timer would find out on its own. The first update describes the path as it
+/// already is, so it is swallowed.
+private final class NetworkPathWatcher {
+    private let monitor = NWPathMonitor()
+    private var lastPath: NWPath?
+
+    init(onChange: @escaping @Sendable () -> Void) {
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            defer { self.lastPath = path }
+            guard let last = self.lastPath, last != path else { return }
+            onChange()
+        }
+        monitor.start(queue: DispatchQueue(label: "redash-wire.network-path"))
+    }
+
+    deinit {
+        monitor.cancel()
     }
 }

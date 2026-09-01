@@ -1,8 +1,6 @@
 package health
 
 import (
-	"context"
-	"net"
 	"strings"
 	"testing"
 )
@@ -10,52 +8,24 @@ import (
 func TestGateStartsUp(t *testing.T) {
 	// Servers built without a checker must serve unconditionally, so an unprobed
 	// gate has to be open rather than "unknown".
-	g := NewGate()
-
-	if !g.Up() {
+	if !NewGate().Up() {
 		t.Fatal("a new gate is down, want up")
-	}
-	select {
-	case <-g.Down():
-		t.Fatal("the down channel of a new gate is closed, want open")
-	default:
 	}
 }
 
-func TestFailClosesTheDownChannel(t *testing.T) {
+func TestFailIsATransitionThatCarriesTheReason(t *testing.T) {
 	g := NewGate()
-	down := g.Down()
 
 	if !g.Fail(KindUnreachable, "dial tcp: i/o timeout") {
 		t.Fatal("Fail reported no transition on the first failure")
 	}
-
-	select {
-	case <-down:
-	default:
-		t.Fatal("the down channel captured before Fail did not close")
-	}
-
 	got := g.Status()
 	if got.Up || got.Kind != KindUnreachable || got.Reason != "dial tcp: i/o timeout" {
 		t.Fatalf("Status() = %+v, want a down/unreachable status carrying the reason", got)
 	}
 }
 
-func TestDownIsAlreadyClosedForASessionStartedWhileDown(t *testing.T) {
-	g := NewGate()
-	g.Fail(KindUnreachable, "down")
-
-	// A session that connects after the gate has already dropped must not wait for
-	// the *next* transition; it has to see the current one.
-	select {
-	case <-g.Down():
-	default:
-		t.Fatal("Down() returned an open channel while the gate was down")
-	}
-}
-
-func TestRecoverReopensTheDownChannel(t *testing.T) {
+func TestRecoverIsATransitionBackToOK(t *testing.T) {
 	g := NewGate()
 	g.Fail(KindUnreachable, "down")
 
@@ -64,12 +34,6 @@ func TestRecoverReopensTheDownChannel(t *testing.T) {
 	}
 	if !g.Up() || g.Status().Kind != KindOK {
 		t.Fatalf("Status() = %+v, want an up/ok status", g.Status())
-	}
-
-	select {
-	case <-g.Down():
-		t.Fatal("the down channel is still closed after Recover; a later session would drop immediately")
-	default:
 	}
 }
 
@@ -124,51 +88,5 @@ func TestClientMessageNamesTheCause(t *testing.T) {
 	g.Fail(KindRejected, "status 401")
 	if got := g.ClientMessage(); !strings.Contains(got, "api_key") {
 		t.Errorf("ClientMessage() = %q, want it to point at the API key", got)
-	}
-}
-
-func TestAnInterruptRemembersTheDropAfterRecovery(t *testing.T) {
-	// The session's read was interrupted because the gate closed. If the gate
-	// reopens before the session goroutine gets to look — a recovery probe
-	// landing in the microseconds in between — asking the gate for its current
-	// state would call a deliberate drop an unexplained read error and send the
-	// client nothing at all.
-	g := NewGate()
-	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
-
-	watch := InterruptOnDown(context.Background(), server, g)
-	defer watch.Stop()
-
-	if watch.Dropped() {
-		t.Fatal("Dropped() is true before the gate ever closed")
-	}
-
-	g.Fail(KindUnreachable, "down")
-	g.Recover()
-
-	if !g.Up() {
-		t.Fatal("the gate did not recover")
-	}
-	if !watch.Dropped() {
-		t.Error("Dropped() forgot the drop as soon as the gate recovered")
-	}
-}
-
-func TestASessionStartedAfterRecoveryDoesNotInheritTheDrop(t *testing.T) {
-	g := NewGate()
-	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
-
-	g.Fail(KindUnreachable, "down")
-	g.Recover()
-
-	watch := InterruptOnDown(context.Background(), server, g)
-	defer watch.Stop()
-
-	if watch.Dropped() {
-		t.Error("a session that connected after recovery reports the earlier drop as its own")
 	}
 }

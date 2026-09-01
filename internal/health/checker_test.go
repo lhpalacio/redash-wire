@@ -295,3 +295,188 @@ func TestTheStartupProbeIsAuthoritative(t *testing.T) {
 		t.Error("a failed startup probe emitted no redash_down event, so the app would show green")
 	}
 }
+
+func TestAFirstFailureIsConfirmedWithinTheConfirmDelay(t *testing.T) {
+	// A working proxy sees one failure. Waiting a whole interval to confirm it
+	// used to be most of the time between a VPN dropping and the menu saying so,
+	// so the checker must come back for the second look almost at once.
+	lister := &stubLister{results: []listResult{
+		{sources: sources()},
+		{err: errors.New("dial tcp: i/o timeout")},
+	}, probed: make(chan struct{}, 4)}
+	gate := health.NewGate()
+	logger, _ := newCapture()
+	// An interval long enough that a second probe arriving within the deadline
+	// can only have come from the confirm delay, never from the timer.
+	checker := health.NewChecker(lister, redash.NewSwappableRegistry(nil), gate, logger,
+		health.WithInterval(time.Hour), health.WithConfirmDelay(10*time.Millisecond))
+
+	checker.Probe(context.Background()) // the success that makes the next failure a blip
+	<-lister.probed
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go checker.Run(ctx)
+
+	gate.Suspect() // first failure
+	<-lister.probed
+	if !gate.Up() {
+		t.Fatal("the gate dropped on the first failure, so the confirm delay had nothing to confirm")
+	}
+
+	select {
+	case <-lister.probed: // the confirming probe
+	case <-time.After(5 * time.Second):
+		t.Fatal("no confirming probe within 5s of the first failure: the gate would wait a full interval")
+	}
+	// Run applies the result after the lister returns; give it a moment to do so.
+	deadline := time.Now().Add(time.Second)
+	for gate.Up() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if gate.Up() {
+		t.Fatal("the gate is still up after the confirming probe failed")
+	}
+}
+
+// deadlineLister records how much time each probe was given, which is the
+// deadline on the context the checker hands it.
+type deadlineLister struct {
+	budgets []time.Duration
+}
+
+func (d *deadlineLister) ListDataSources(ctx context.Context) ([]redash.DataSource, error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		d.budgets = append(d.budgets, 0)
+	} else {
+		d.budgets = append(d.budgets, time.Until(deadline))
+	}
+	return sources(), nil
+}
+
+func TestTheStartupProbeGetsTheLongerTimeout(t *testing.T) {
+	// The startup probe is authoritative on one failure, so it keeps the patience
+	// the steady-state probes give up. One slow first answer must not stop a
+	// start that would have worked a moment later.
+	lister := &deadlineLister{}
+	gate := health.NewGate()
+	logger, _ := newCapture()
+	checker := health.NewChecker(lister, redash.NewSwappableRegistry(nil), gate, logger,
+		health.WithTimeout(5*time.Second), health.WithStartupTimeout(10*time.Second))
+
+	checker.Probe(context.Background())
+	checker.Probe(context.Background())
+
+	if len(lister.budgets) != 2 {
+		t.Fatalf("recorded %d probes, want 2", len(lister.budgets))
+	}
+	within := func(got, want time.Duration) bool { return got > want-time.Second && got <= want }
+	if !within(lister.budgets[0], 10*time.Second) {
+		t.Errorf("startup probe budget = %s, want about 10s", lister.budgets[0])
+	}
+	if !within(lister.budgets[1], 5*time.Second) {
+		t.Errorf("steady-state probe budget = %s, want about 5s", lister.budgets[1])
+	}
+}
+
+func TestFailedProbesSayWhenTheNextOneIs(t *testing.T) {
+	// The menu counts down to the next probe, so every failed probe has to say
+	// how far away that is: the edge that closes the gate, and each one after.
+	lister := &stubLister{results: []listResult{{err: errors.New("dial tcp: i/o timeout")}}}
+	gate := health.NewGate()
+	logger, log := newCapture()
+	checker := health.NewChecker(lister, redash.NewSwappableRegistry(nil), gate, logger,
+		health.WithInterval(10*time.Second))
+
+	checker.Probe(context.Background()) // the startup probe is authoritative: gate closes
+	checker.Probe(context.Background()) // still down
+
+	down := log.events(health.EventRedashDown)
+	if len(down) != 1 || down[0]["retry_in_seconds"] != float64(10) {
+		t.Errorf("redash_down events = %v, want one carrying retry_in_seconds=10", down)
+	}
+	retry := log.events(health.EventRedashRetry)
+	if len(retry) != 1 || retry[0]["retry_in_seconds"] != float64(10) {
+		t.Fatalf("redash_retry events = %v, want one carrying retry_in_seconds=10", retry)
+	}
+	// The app runs without -debug, so a Debug line would never reach it.
+	if retry[0]["level"] != "INFO" {
+		t.Errorf("redash_retry logged at %v, want INFO so the app sees it", retry[0]["level"])
+	}
+}
+
+func TestARejectedKeyCountsDownToTheLongBackoff(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	gate := health.NewGate()
+	logger, log := newCapture()
+	checker := health.NewChecker(redash.NewClient(server.URL, "bad-key"), redash.NewSwappableRegistry(nil), gate, logger,
+		health.WithRejectedInterval(5*time.Minute))
+
+	checker.Probe(context.Background())
+
+	down := log.events(health.EventRedashDown)
+	if len(down) != 1 || down[0]["retry_in_seconds"] != float64(300) {
+		t.Errorf("redash_down events = %v, want one carrying retry_in_seconds=300: a rejected key backs off", down)
+	}
+}
+
+func TestRunProbesAtOnceWhenNothingHasProbedYet(t *testing.T) {
+	// Under -wait-for-redash the listeners bind before anything asks Redash, so
+	// the checker's loop is the first probe and must not wait an interval. The
+	// gate starts closed in that mode, so a success here is also the edge that
+	// tells the app it can go green.
+	lister := &stubLister{results: []listResult{{sources: sources()}}, probed: make(chan struct{}, 4)}
+	gate := health.NewGate()
+	gate.Fail(health.KindUnreachable, "waiting for the first check")
+	logger, log := newCapture()
+	checker := health.NewChecker(lister, redash.NewSwappableRegistry(nil), gate, logger,
+		health.WithInterval(time.Hour))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go checker.Run(ctx)
+
+	select {
+	case <-lister.probed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not probe on entry: the app would sit at 'checking' for a whole interval")
+	}
+	deadline := time.Now().Add(time.Second)
+	for !gate.Up() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !gate.Up() {
+		t.Fatal("the gate did not open after the first successful probe")
+	}
+	if len(log.events(health.EventRedashUp)) != 1 {
+		t.Error("opening a gate that started closed emitted no redash_up, so the app would never leave 'checking'")
+	}
+}
+
+func TestRunDoesNotRepeatAProbeAlreadyMade(t *testing.T) {
+	// Without -wait-for-redash serve probes before binding; the loop must not
+	// ask again the instant it starts, or every start costs two calls.
+	lister := &stubLister{results: []listResult{{sources: sources()}}, probed: make(chan struct{}, 4)}
+	gate := health.NewGate()
+	logger, _ := newCapture()
+	checker := health.NewChecker(lister, redash.NewSwappableRegistry(nil), gate, logger,
+		health.WithInterval(time.Hour))
+
+	checker.Probe(context.Background())
+	<-lister.probed
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go checker.Run(ctx)
+
+	select {
+	case <-lister.probed:
+		t.Fatal("Run repeated the probe serve had just made")
+	case <-time.After(300 * time.Millisecond):
+	}
+}

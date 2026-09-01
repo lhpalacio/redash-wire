@@ -104,23 +104,32 @@ a supervising app that gets force-quit leaves the proxy running and still
 holding its listen ports.
 
 `-wait-for-redash` changes what an unreachable Redash means at startup. Without
-it the proxy exits 1, which is what a script or a container wants. With it the
-proxy binds its listeners anyway and refuses connections until Redash answers,
-so a supervising app that launches before the VPN is up gets a proxy that
-recovers on its own.
+it the proxy probes Redash first and exits 1 if that fails, which is what a
+script or a container wants. With it the proxy binds its listeners first and
+probes afterwards, refusing connections with a reason until the answer comes,
+so a supervising app that launches before the VPN is up gets a proxy that is
+bound at once and recovers on its own.
 
-While serving, the proxy asks Redash for its data sources every 30 seconds. One
-call answers two questions: whether Redash is reachable, and what it holds now,
-so a data source added while the proxy runs shows up without a restart. Two
-failures in a row close the gate. The startup probe is the exception: nothing has
-proved Redash reachable yet and there is no session to protect, so one failure is
-enough. While the gate is closed the proxy drops open SQL sessions and refuses
-new ones, with the ports still bound so recovery needs nothing from you.
-Postgres clients are told the reason at login and when they are dropped. A MySQL
-client is told on its next connection or query, because go-mysql owns the write
-side of a session already under way. A query that dies on an
+While serving, the proxy asks Redash for its data sources every 10 seconds,
+giving each answer 5 seconds to arrive. One call answers two questions: whether
+Redash is reachable, and what it holds now, so a data source added while the
+proxy runs shows up without a restart. Two failures in a row close the gate,
+and the second probe runs a second after the first fails rather than a full
+interval later, so a dropped VPN closes the gate in about ten seconds. The
+startup probe is the exception: nothing has proved Redash reachable yet and
+there is no session to protect, so one failure is enough. Without
+`-wait-for-redash` that failure exits, so the startup probe gets 10 seconds
+instead of 5 and one slow first answer doesn't stop a start that would have
+worked; with the flag it gets the usual 5, since every second it waits is a
+second nothing is bound. While the gate is closed the proxy refuses new sessions and answers every
+query on an open one with the reason, keeping the connection: a wrong call by
+the checker then costs one query rather than a reconnect in every open client.
+The ports stay bound, so recovery needs nothing from you and the same session
+serves again once Redash answers. A query that dies on an
 infrastructure error triggers a probe immediately instead of waiting out the
-interval. A 401, 403 or 404 reads differently from a timeout, and backs off to
+interval. So does SIGUSR1: the macOS app sends it when the network changes, and
+`kill -USR1 $(pgrep redash-wire)` asks for a probe by hand. A 401, 403 or 404
+reads differently from a timeout, and backs off to
 five minutes: a rejected key needs you to edit the config, a dropped VPN does
 not.
 
@@ -215,18 +224,31 @@ own. It has no Dock icon, needs macOS 13 or newer, and starts and stops
 
 From the menu you can:
 
-- Start and stop the proxy, and choose which profile it serves. One profile runs
-  at a time.
+- Choose which profile the proxy serves, and start and stop it. Picking a
+  profile runs it: a live proxy restarts on the new one, a stopped or failed
+  one starts. One profile runs at a time. The app starts `default_profile` on
+  its own at launch, so with Launch at Login on the proxy is up before you
+  open the menu.
 - Browse the running proxy's Redash data sources. The list appears when you
   start it and empties when you stop, because the proxy is what reports it. The
-  menu keeps the ones it can't serve in their own section, so you can see why a
-  source is absent. Every servable one copies a `psql` or `mysql` command, or a
-  connection URI, with the data source already filled in as the database name.
+  list is split into a PostgreSQL section and a MySQL section, and the menu
+  keeps the ones it can't serve in their own section, so you can see why a
+  source is absent. A section whose listener the profile leaves off says so,
+  and names the config key that turns it on. Every servable one copies a `psql`
+  or `mysql` command, or a connection URI, with the data source already filled
+  in as the database name. If an app on your Mac claims `postgresql://` or
+  `mysql://` links, as TablePlus, Postico and DBeaver do, the source also
+  offers to open in it directly.
 - Copy the profile-level details from the Connect submenu: the psql or mysql
   command, the username, the password.
 - See whether Redash itself is answering. The proxy polls it while running, so
-  the menu says so within a minute of the VPN dropping, rather than the next
-  time a query fails.
+  the menu says so within about fifteen seconds of the VPN dropping, rather
+  than the next time a query fails. The app also watches the Mac's network
+  path and asks the proxy to check the moment an interface comes or goes, so
+  a VPN dropping or reconnecting usually shows within a second or two. While
+  Redash is away the menu says how long until the next check, and while the
+  app waits to restart a proxy that crashed it says how long until that too.
+  Like the uptime, the number is as of when you opened the menu.
 - Follow the proxy's log stream in a window you can filter by level and by text.
 - Turn on launch at login.
 - Check for a new release. It compares the app's version against the latest tag
@@ -236,9 +258,10 @@ From the menu you can:
 - Open `config.yaml` in a text editor with Settings…, and apply your edits with
   Reload Configuration.
 - Read the proxy's state off the dot beside the status line: grey stopped,
-  yellow starting, green running, amber running but cut off from Redash, red
-  failed or a rejected API key. The menu bar icon carries the same distinction,
-  since that's the part you can see without opening anything.
+  yellow starting or bound but still waiting for Redash's first answer, green
+  running, amber running but cut off from Redash, red failed or a rejected API
+  key. The menu bar icon carries the same distinction, since that's the part
+  you can see without opening anything.
 
 The first run opens a setup sheet that asks for your Redash URL and API key and
 hands them to `redash-wire init`. Only the binary ever writes `config.yaml`, so
@@ -258,11 +281,14 @@ A few decisions behind it that aren't obvious from the outside:
   leave an orphan behind still holding the listen ports.
 - It also passes `-wait-for-redash`. An unreachable Redash is then a state the
   menu shows rather than a reason to exit, and the proxy recovers by itself when
-  the VPN comes back.
+  the VPN comes back. The listeners bind before the first probe, so the menu
+  goes from Starting to a bound proxy in well under a second and says
+  "Checking Redash" until the first answer arrives.
 - A proxy that dies before it ever starts listening died of something permanent,
   like a port already in use or a profile that doesn't parse, so the app shows
   the reason and doesn't retry. It restarts one that dies after it was serving,
-  with backoff, three times at most.
+  with backoff, three times in a row at most; a proxy that served for a minute
+  before dying starts a fresh streak.
 - The data source list comes from the running proxy's health events. The app
   never asks Redash for it directly: two callers asking the same question can
   get different answers, and the proxy's copy is the one that resolves the
@@ -275,7 +301,9 @@ A few decisions behind it that aren't obvious from the outside:
 - Settings… opens the config with whatever app claims `.yaml`, or TextEdit if
   nothing does.
 - Reload Configuration restarts a running proxy only when the profile it serves
-  changed. The file watcher never restarts it: one save fires the watcher
+  changed, and starts a failed one on the selected profile, since a failed
+  proxy is the one you were editing the config to fix. A stopped proxy stays
+  stopped. The file watcher never restarts it: one save fires the watcher
   several times, because the config is written with a temp file and a rename and
   editors leave swap files in the same directory.
 - The ⌘, and ⇧⌘, shortcuts work only while the menu is open. Without a Dock

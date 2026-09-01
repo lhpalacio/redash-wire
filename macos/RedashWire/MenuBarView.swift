@@ -57,6 +57,8 @@ struct MenuBarView: View {
         if case .failed(let reason) = supervisor.state {
             Text(reason.fittedToMenu())
             showLogsButton
+        } else if case .running(_, .checking) = supervisor.state {
+            Text("Waiting for the first answer from Redash…")
         } else if let health = supervisor.state.health, !health.isOK {
             // The listeners are bound but nothing behind them can be served, so
             // the addresses would be a lie. Show the cause and the fix instead.
@@ -66,11 +68,16 @@ struct MenuBarView: View {
             if let remedy = health.remedy {
                 Text(remedy)
             }
+            if let line = retryLine {
+                Text(line)
+            }
             showLogsButton
         } else if supervisor.state.isRunning, let profile = model.selectedProfile {
             ForEach(listenerLines(for: profile), id: \.self) { line in
                 Text(line)
             }
+        } else if supervisor.state.isBusy, let restart = supervisor.pendingRestart {
+            Text("Restarting in \(Self.countdown(to: restart.at)) (attempt \(restart.attempt) of \(restart.limit))")
         }
 
         if let error = model.configError {
@@ -99,6 +106,8 @@ struct MenuBarView: View {
             return "Starting — \(name)"
         case .running(let since, .ok):
             return "Running — \(name) (\(Self.uptime(since: since)))"
+        case .running(_, .checking):
+            return "Checking Redash — \(name)"
         case .running(_, .unreachable):
             return "Redash unreachable — \(name)"
         case .running(_, .rejected):
@@ -114,7 +123,7 @@ struct MenuBarView: View {
     private static func statusColor(for state: ProxySupervisor.State) -> NSColor {
         switch state {
         case .stopped: return .systemGray
-        case .starting: return .systemYellow
+        case .starting, .running(_, .checking): return .systemYellow
         case .running(_, .ok): return .systemGreen
         case .running(_, .unreachable): return .systemOrange
         case .running(_, .rejected): return .systemRed
@@ -145,6 +154,20 @@ struct MenuBarView: View {
             lines.append("MySQL  \(profile.mysqlListenAddr)")
         }
         return lines
+    }
+
+    /// Computed when the menu opens, like the uptime above it; see `nextProbeAt`
+    /// for why it does not tick. Once the count reaches zero the probe is in
+    /// flight for up to its timeout, which is not a number.
+    private var retryLine: String? {
+        guard let at = supervisor.nextProbeAt else { return nil }
+        return at.timeIntervalSinceNow > 0.5 ? "Retrying in \(Self.countdown(to: at))" : "Retrying now…"
+    }
+
+    private static func countdown(to date: Date) -> String {
+        let seconds = max(0, Int(date.timeIntervalSinceNow.rounded(.up)))
+        if seconds < 60 { return "\(seconds)s" }
+        return "\(seconds / 60)m \(seconds % 60)s"
     }
 
     private static func uptime(since: Date) -> String {
@@ -210,9 +233,22 @@ struct MenuBarView: View {
             if model.dataSources.isEmpty {
                 Text(emptyDataSourceMessage)
             } else {
-                ForEach(model.servableDataSources) { source in
-                    Menu(source.name) {
-                        copyActions(for: source)
+                // One section per wire protocol, so the list reads as "these
+                // are Postgres, these are MySQL" rather than one run of names.
+                ForEach(Array(model.dataSourceGroups.enumerated()), id: \.element.id) { index, group in
+                    if index > 0 {
+                        Divider()
+                    }
+                    Text(group.title)
+                    if let key = group.missingListenerKey {
+                        // Otherwise the copy actions shrink to "Copy database
+                        // name" with nothing to say why.
+                        Text("Set \(key) in the profile to connect to these.")
+                    }
+                    ForEach(group.sources) { source in
+                        Menu(source.name) {
+                            copyActions(for: source)
+                        }
                     }
                 }
 
@@ -238,6 +274,9 @@ struct MenuBarView: View {
         if !supervisor.state.isRunning {
             return "Start the proxy to list data sources"
         }
+        if supervisor.state.health == .checking {
+            return "Checking Redash…"
+        }
         if let health = supervisor.state.health, !health.isOK {
             return "Waiting for Redash"
         }
@@ -252,6 +291,9 @@ struct MenuBarView: View {
     private func copyActions(for source: DataSource) -> some View {
         if let profile = model.selectedProfile {
             if source.wire == "postgres" {
+                if let uri = ConnectionStrings.postgresURI(profile: profile, database: source.name) {
+                    openInClientButton(uri: uri)
+                }
                 if let command = ConnectionStrings.psql(profile: profile, database: source.name) {
                     Button("Copy psql command") { Clipboard.copySecret(command) }
                 }
@@ -259,6 +301,9 @@ struct MenuBarView: View {
                     Button("Copy connection URI") { Clipboard.copySecret(uri) }
                 }
             } else if source.wire == "mysql" {
+                if let uri = ConnectionStrings.mysqlURI(profile: profile, database: source.name) {
+                    openInClientButton(uri: uri)
+                }
                 if let command = ConnectionStrings.mysql(profile: profile, database: source.name) {
                     Button("Copy mysql command") { Clipboard.copySecret(command) }
                 }
@@ -267,6 +312,16 @@ struct MenuBarView: View {
                 }
             }
             Button("Copy database name") { Clipboard.copy(source.name) }
+        }
+    }
+
+
+    /// Absent when nothing on this Mac claims the scheme, rather than a button
+    /// that opens nothing.
+    @ViewBuilder
+    private func openInClientButton(uri: String) -> some View {
+        if let handler = ClientApp.handler(for: uri) {
+            Button("Open in \(handler.name)") { ClientApp.open(uri, with: handler) }
         }
     }
 

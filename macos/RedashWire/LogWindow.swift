@@ -1,12 +1,34 @@
 import SwiftUI
 
+/// The proxy's log stream, kept apart from the object the menu observes. The
+/// menu is a real NSMenu that SwiftUI rebuilds on every published change, and a
+/// TablePlus opening five connections writes five lines; with the log on the
+/// supervisor, each one rebuilt the menu under the cursor.
+@MainActor
+final class LogStore: ObservableObject {
+    private static let maxEvents = 5_000
+
+    @Published private(set) var events: [LogEvent] = []
+
+    func append(_ event: LogEvent) {
+        events.append(event)
+        if events.count > Self.maxEvents {
+            events.removeFirst(events.count - Self.maxEvents)
+        }
+    }
+
+    func clear() {
+        events.removeAll()
+    }
+}
+
 struct LogWindow: View {
-    @ObservedObject var supervisor: ProxySupervisor
+    @ObservedObject var log: LogStore
     @State private var minimumLevel: LogEvent.Level = .debug
     @State private var searchText = ""
 
     private var visibleEvents: [LogEvent] {
-        supervisor.events.filter { event in
+        log.events.filter { event in
             guard event.level >= minimumLevel else { return false }
             guard !searchText.isEmpty else { return true }
             return event.message.localizedCaseInsensitiveContains(searchText)
@@ -39,14 +61,14 @@ struct LogWindow: View {
 
             Spacer()
 
-            Text("\(visibleEvents.count) of \(supervisor.events.count)")
+            Text("\(visibleEvents.count) of \(log.events.count)")
                 .foregroundStyle(.secondary)
                 .font(.callout)
 
             Button("Copy") { Clipboard.copy(plainText) }
                 .disabled(visibleEvents.isEmpty)
-            Button("Clear") { supervisor.clearLog() }
-                .disabled(supervisor.events.isEmpty)
+            Button("Clear") { log.clear() }
+                .disabled(log.events.isEmpty)
         }
         .padding(10)
         .glassBar()
@@ -54,7 +76,7 @@ struct LogWindow: View {
 
     @ViewBuilder
     private var eventList: some View {
-        if supervisor.events.isEmpty {
+        if log.events.isEmpty {
             VStack {
                 Spacer()
                 Text("No log output yet.")
@@ -73,7 +95,7 @@ struct LogWindow: View {
                 }
                 .listStyle(.plain)
                 .font(.system(.body, design: .monospaced))
-                .onChange(of: supervisor.events.count) { _ in
+                .onChange(of: log.events.count) { _ in
                     guard let last = visibleEvents.last else { return }
                     withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                 }

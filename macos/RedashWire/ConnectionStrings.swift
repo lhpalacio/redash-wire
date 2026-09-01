@@ -72,6 +72,45 @@ enum ConnectionStrings {
     }
 }
 
+/// The app that opens `postgresql://` or `mysql://` links on this Mac. TablePlus,
+/// Postico and DBeaver all register the schemes, so one click on a data source
+/// opens a connection with the database filled in; nothing here knows which one
+/// is installed.
+enum ClientApp {
+    struct Handler: Equatable {
+        let name: String
+        let url: URL
+    }
+
+    /// Looked up once per scheme. Launch Services is quick, but the menu asks
+    /// once per data source every time it opens, and the answer only changes
+    /// when an app is installed or removed.
+    private static var cache: [String: Handler?] = [:]
+
+    static func handler(for uri: String) -> Handler? {
+        guard let url = URL(string: uri), let scheme = url.scheme else { return nil }
+        if let cached = cache[scheme] { return cached }
+
+        let found = NSWorkspace.shared.urlForApplication(toOpen: url).map { appURL in
+            Handler(name: displayName(of: appURL), url: appURL)
+        }
+        cache[scheme] = found
+        return found
+    }
+
+    static func open(_ uri: String, with handler: Handler) {
+        guard let url = URL(string: uri) else { return }
+        NSWorkspace.shared.open([url], withApplicationAt: handler.url, configuration: NSWorkspace.OpenConfiguration())
+    }
+
+    private static func displayName(of appURL: URL) -> String {
+        let info = Bundle(url: appURL)?.infoDictionary
+        return (info?["CFBundleDisplayName"] as? String)
+            ?? (info?["CFBundleName"] as? String)
+            ?? appURL.deletingPathExtension().lastPathComponent
+    }
+}
+
 enum Clipboard {
     /// The convention history tools honor to skip logging an item.
     private static let concealedType = NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")

@@ -152,6 +152,7 @@ enum WireEvent {
     static let listenerReady = "listener_ready"
     static let redashUp = "redash_up"
     static let redashDown = "redash_down"
+    static let redashRetry = "redash_retry"
     static let dataSources = "datasources_refreshed"
 }
 
@@ -159,6 +160,10 @@ enum WireEvent {
 /// off the running state rather than standing alone, because a stopped proxy has
 /// no opinion about Redash: nothing is asking it.
 enum RedashHealth: Equatable {
+    /// The listeners are bound but no probe has answered yet. The proxy binds
+    /// before it asks under -wait-for-redash, so this is what a start looks like
+    /// for the first few seconds; it is neither green nor amber.
+    case checking
     case ok
     /// A network problem, a timeout, or a 5xx. Expected to clear on its own.
     case unreachable(String)
@@ -181,7 +186,7 @@ enum RedashHealth: Equatable {
     /// causes are worth reading.
     var summary: String? {
         switch self {
-        case .ok:
+        case .checking, .ok:
             return nil
         case .unreachable(let reason):
             return Self.reachabilityPhrase(for: reason)
@@ -229,7 +234,7 @@ enum RedashHealth: Equatable {
 
     var remedy: String? {
         switch self {
-        case .ok:
+        case .checking, .ok:
             return nil
         case .unreachable:
             return "Check your VPN or network. Retrying automatically."
@@ -274,4 +279,32 @@ struct LogEvent: Identifiable, Equatable {
             .map { "\($0.key)=\($0.value)" }
             .joined(separator: " ")
     }
+
+    /// One line of the daemon's `-log-format json` stream. Anything that is not
+    /// a JSON object is dropped: the stream is the contract, and a stray line
+    /// is not part of it.
+    static func parse(line: Data) -> LogEvent? {
+        guard
+            let object = try? JSONSerialization.jsonObject(with: line),
+            let record = object as? [String: Any]
+        else { return nil }
+
+        let message = record["msg"] as? String ?? ""
+        let level = (record["level"] as? String).flatMap(Level.init(rawValue:)) ?? .info
+        let time = (record["time"] as? String).flatMap(Self.timestampParser.date(from:)) ?? Date()
+        let event = record["event"] as? String
+
+        var fields: [String: String] = [:]
+        for (key, value) in record where !["msg", "level", "time", "event"].contains(key) {
+            fields[key] = String(describing: value)
+        }
+
+        return LogEvent(time: time, level: level, event: event, message: message, fields: fields)
+    }
+
+    private static let timestampParser: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
 }

@@ -43,6 +43,61 @@ final class AppModel: ObservableObject {
     var servableDataSources: [DataSource] { dataSources.filter(\.isServable) }
     var unservableDataSources: [DataSource] { dataSources.filter { !$0.isServable } }
 
+    struct DataSourceGroup: Identifiable {
+        let wire: String
+        let title: String
+        let sources: [DataSource]
+        /// The config key that would turn the listener on, when the selected
+        /// profile has none for this wire. The proxy can serve these sources,
+        /// but not on this profile, and the copy actions would have no port.
+        let missingListenerKey: String?
+        var id: String { wire }
+    }
+
+    /// Servable sources by the protocol they are served over, Postgres first.
+    /// A wire this app does not know gets its raw name rather than being
+    /// dropped, since a newer binary may add one.
+    var dataSourceGroups: [DataSourceGroup] {
+        let known = ["postgres", "mysql"]
+        let byWire = Dictionary(grouping: servableDataSources, by: \.wire)
+        let wires = known.filter { byWire[$0] != nil } + byWire.keys.filter { !known.contains($0) }.sorted()
+        return wires.map { wire in
+            let missing = Self.listenerKey(for: wire).flatMap { key in
+                listenerAddress(for: wire).isEmpty ? key : nil
+            }
+            return DataSourceGroup(
+                wire: wire,
+                title: Self.wireTitle(wire) + (missing == nil ? "" : " (listener off)"),
+                sources: byWire[wire] ?? [],
+                missingListenerKey: missing
+            )
+        }
+    }
+
+    private func listenerAddress(for wire: String) -> String {
+        switch wire {
+        case "postgres": return selectedProfile?.postgresListenAddr ?? ""
+        case "mysql": return selectedProfile?.mysqlListenAddr ?? ""
+        default: return ""
+        }
+    }
+
+    private static func listenerKey(for wire: String) -> String? {
+        switch wire {
+        case "postgres": return "postgres_listen_addr"
+        case "mysql": return "mysql_listen_addr"
+        default: return nil
+        }
+    }
+
+    private static func wireTitle(_ wire: String) -> String {
+        switch wire {
+        case "postgres": return "PostgreSQL"
+        case "mysql": return "MySQL"
+        default: return wire
+        }
+    }
+
 
     func start() async {
         // The menu bar label's .task drives this. It runs once today, but a second
@@ -53,6 +108,13 @@ final class AppModel: ObservableObject {
 
         await reloadConfig()
         watchConfigFile()
+
+        // A menu bar app launched at login exists to have the proxy up. Under
+        // -wait-for-redash a missing VPN is a state the menu shows, not a reason
+        // to hold back, so there is nothing to wait for here.
+        if let profile = selectedProfile {
+            await run(profile)
+        }
 
         // Checks at launch and, for a menu bar app left running for weeks, once a
         // day after that. UpdateChecker decides whether enough time has passed.
@@ -71,6 +133,15 @@ final class AppModel: ObservableObject {
     func reloadConfig(applyToRunning: Bool = false) async {
         let running = applyToRunning ? supervisor.activeProfile : nil
         await readConfig()
+        guard applyToRunning else { return }
+
+        // A failed proxy is the one whose config you were editing to fix, and
+        // reloading is the moment to find out whether it worked. A stopped one
+        // stays stopped: that was a choice, not a failure.
+        if case .failed = supervisor.state, let profile = selectedProfile {
+            supervisor.start(profile: profile)
+            return
+        }
 
         // An edit to some other profile is not a reason to restart this one.
         guard
@@ -126,19 +197,30 @@ final class AppModel: ObservableObject {
     func select(profile: Profile) async {
         guard profile.name != selectedProfileName else { return }
         selectedProfileName = profile.name
-
-        // Picking a profile while stopped should not start anything, and there is
-        // nothing to list until something is. The restarted proxy publishes the
-        // new profile's sources itself.
-        guard supervisor.state.isRunning || supervisor.state.isBusy else { return }
-        await supervisor.switchTo(profile: profile)
+        await run(profile)
     }
 
     func runOnboarding(redashURL: String, profile: String, apiKey: String) async throws -> InitResult {
         let result = try await cli.initialize(redashURL: redashURL, profile: profile, apiKey: apiKey)
         await reloadConfig()
         selectedProfileName = result.profile
+        if let profile = selectedProfile {
+            await run(profile)
+        }
         return result
+    }
+
+    /// Picking a profile means run it. A live proxy comes back up on the new one
+    /// and publishes its data sources itself; a stopped or failed one is started,
+    /// since switching away from a profile that failed is the usual way out of
+    /// that state. An invalid profile is started too: the binary is the one that
+    /// reads the config, so it reports the reason and the menu shows it as failed.
+    private func run(_ profile: Profile) async {
+        if supervisor.state.isRunning || supervisor.state.isBusy {
+            await supervisor.switchTo(profile: profile)
+        } else {
+            supervisor.start(profile: profile)
+        }
     }
 
 
