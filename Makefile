@@ -1,4 +1,4 @@
-.PHONY: build run clean test test-race cover lint vet licenses docker dev-up dev-setup dev-down dev-logs macos macos-run
+.PHONY: build run clean test test-race cover lint vet licenses docker dev-up dev-setup dev-down dev-logs macos macos-run macos-test
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -ldflags "-X main.version=$(VERSION)"
@@ -41,6 +41,11 @@ macos:
 
 macos-run: macos
 	open build/RedashWire.app
+
+# Tests the app's process-free core (macos/RedashWire/Core) through the SwiftPM
+# package in macos/. Needs only the Command Line Tools.
+macos-test:
+	swift test --package-path macos
 
 clean:
 	rm -rf bin/ build/ coverage.out coverage.html

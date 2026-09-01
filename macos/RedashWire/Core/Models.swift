@@ -275,4 +275,32 @@ struct LogEvent: Identifiable, Equatable {
             .map { "\($0.key)=\($0.value)" }
             .joined(separator: " ")
     }
+
+    /// One line of the daemon's `-log-format json` stream. Anything that is not
+    /// a JSON object is dropped: the stream is the contract, and a stray line
+    /// is not part of it.
+    static func parse(line: Data) -> LogEvent? {
+        guard
+            let object = try? JSONSerialization.jsonObject(with: line),
+            let record = object as? [String: Any]
+        else { return nil }
+
+        let message = record["msg"] as? String ?? ""
+        let level = (record["level"] as? String).flatMap(Level.init(rawValue:)) ?? .info
+        let time = (record["time"] as? String).flatMap(Self.timestampParser.date(from:)) ?? Date()
+        let event = record["event"] as? String
+
+        var fields: [String: String] = [:]
+        for (key, value) in record where !["msg", "level", "time", "event"].contains(key) {
+            fields[key] = String(describing: value)
+        }
+
+        return LogEvent(time: time, level: level, event: event, message: message, fields: fields)
+    }
+
+    private static let timestampParser: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
 }

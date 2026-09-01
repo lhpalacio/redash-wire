@@ -55,6 +55,20 @@ files are in `macos/RedashWire/`. Adding a file needs no project edit, which
 also keeps `project.pbxproj` out of most diffs. Opening the project needs
 Xcode 16 or newer; older versions can't read a synchronized group.
 
+`macos/RedashWire/Core/` holds the parts that own no process and no window:
+the models the JSON contract decodes into, and `ProxyTracker`, which turns
+the daemon's log stream and exit codes into the state the menu shows. The
+SwiftPM package in `macos/Package.swift` compiles that folder on its own and
+runs the tests in `macos/Tests/`:
+
+```bash
+make macos-test  # swift test --package-path macos; Command Line Tools suffice
+```
+
+Keep anything that needs AppKit, a `Process`, or SwiftUI out of `Core/`, or
+the package stops building. That constraint is the point: it is what makes
+the state machine testable without a running proxy.
+
 The app runs the copy of `redash-wire` inside its bundle. To point it at a
 local build instead, set `REDASH_WIRE_BINARY` and launch the executable directly
 so it inherits the variable:

@@ -279,7 +279,8 @@ A few decisions behind it that aren't obvious from the outside:
 - A proxy that dies before it ever starts listening died of something permanent,
   like a port already in use or a profile that doesn't parse, so the app shows
   the reason and doesn't retry. It restarts one that dies after it was serving,
-  with backoff, three times at most.
+  with backoff, three times in a row at most; a proxy that served for a minute
+  before dying starts a fresh streak.
 - The data source list comes from the running proxy's health events. The app
   never asks Redash for it directly: two callers asking the same question can
   get different answers, and the proxy's copy is the one that resolves the

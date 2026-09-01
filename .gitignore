@@ -14,3 +14,6 @@ build/
 # Xcode per-user state, created the first time the project is opened.
 xcuserdata/
 *.xcuserstate
+
+# SwiftPM output for the app's core package (swift test --package-path macos)
+macos/.build/
