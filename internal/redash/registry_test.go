@@ -41,6 +41,44 @@ func TestLookup(t *testing.T) {
 	}
 }
 
+func TestLookupPrefersExactCaseThenDeterministicFallback(t *testing.T) {
+	// Redash returns sources in no particular order, so building a case-insensitive
+	// map last-wins made "Prod" vs "prod" resolve differently from one refresh to
+	// the next. An exact-case match must win outright, and a purely
+	// case-insensitive hit must resolve deterministically (lowest id).
+	t.Run("exact case wins over a case-insensitive sibling", func(t *testing.T) {
+		reg := NewDataSourceRegistry([]DataSource{
+			{ID: 10, Name: "prod", Type: "pg"},
+			{ID: 20, Name: "Prod", Type: "pg"},
+		})
+		if ds, ok := reg.Lookup("Prod"); !ok || ds.ID != 20 {
+			t.Errorf(`Lookup("Prod") = %+v (ok=%v), want the exact-case source id 20`, ds, ok)
+		}
+		if ds, ok := reg.Lookup("prod"); !ok || ds.ID != 10 {
+			t.Errorf(`Lookup("prod") = %+v (ok=%v), want the exact-case source id 10`, ds, ok)
+		}
+	})
+
+	t.Run("case-insensitive fallback picks the lowest id regardless of order", func(t *testing.T) {
+		// Same two names, opposite input orders: the ambiguous lookup must land on
+		// the same (lowest-id) source both times.
+		forward := NewDataSourceRegistry([]DataSource{
+			{ID: 20, Name: "Staging", Type: "pg"},
+			{ID: 5, Name: "staging", Type: "pg"},
+		})
+		reverse := NewDataSourceRegistry([]DataSource{
+			{ID: 5, Name: "staging", Type: "pg"},
+			{ID: 20, Name: "Staging", Type: "pg"},
+		})
+		// "STAGING" matches neither exactly, so both must fall back to id 5.
+		f, okF := forward.Lookup("STAGING")
+		r, okR := reverse.Lookup("STAGING")
+		if !okF || !okR || f.ID != 5 || r.ID != 5 {
+			t.Errorf("ambiguous lookup resolved nondeterministically: forward=%+v reverse=%+v", f, r)
+		}
+	})
+}
+
 func TestAll(t *testing.T) {
 	reg := newTestRegistry(t)
 

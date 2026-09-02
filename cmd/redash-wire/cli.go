@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"strings"
@@ -154,13 +155,23 @@ func loadProfile(flagPath, profile string) (*config.Config, *cliError) {
 
 	cfg, err := config.Load(res.Path, profile)
 	if err != nil {
-		var notFound *config.ProfileNotFoundError
-		if errors.As(err, &notFound) {
-			return nil, fail(codeProfileNotFound, err)
-		}
-		return nil, fail(codeInvalidConfig, err)
+		return nil, classifyLoadError(err)
 	}
 	return cfg, nil
+}
+
+// A file that could not be read at all (permissions, a directory) is io_error;
+// one that was read but did not parse or validate is invalid_config.
+func classifyLoadError(err error) *cliError {
+	var notFound *config.ProfileNotFoundError
+	if errors.As(err, &notFound) {
+		return fail(codeProfileNotFound, err)
+	}
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) {
+		return fail(codeIOError, err)
+	}
+	return fail(codeInvalidConfig, err)
 }
 
 // Redash answers a rejected API key with 404, not 401. A 404 is ambiguous, since

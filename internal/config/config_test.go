@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -385,5 +386,51 @@ func TestGetPollTimeout(t *testing.T) {
 				t.Errorf("GetPollTimeout() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// A default_profile naming a missing profile stops serve, so the report for the
+// same file has to say so instead of calling every profile valid.
+func TestLoadAll_DefaultProfileMissing(t *testing.T) {
+	path := writeYAML(t, `
+postgres_listen_addr: 127.0.0.1:15432
+default_profile: prod
+profiles:
+  dev:
+    redash_url: https://dev.example.com
+    api_key: dev-key
+`)
+
+	_, err := LoadAll(path)
+	if err == nil || !strings.Contains(err.Error(), `default_profile "prod" not found`) {
+		t.Fatalf("LoadAll: got %v, want a default_profile error", err)
+	}
+
+	// Serve keeps its own error on this file, and -profile still works.
+	var notFound *ProfileNotFoundError
+	if _, err := Load(path, ""); !errors.As(err, &notFound) {
+		t.Errorf("Load without a profile: got %v, want ProfileNotFoundError", err)
+	}
+	if _, err := Load(path, "dev"); err != nil {
+		t.Errorf("Load with an explicit profile: %v", err)
+	}
+}
+
+// No default_profile at all is fine for the report: -profile picks one.
+func TestLoadAll_NoDefaultProfile(t *testing.T) {
+	path := writeYAML(t, `
+postgres_listen_addr: 127.0.0.1:15432
+profiles:
+  dev:
+    redash_url: https://dev.example.com
+    api_key: dev-key
+`)
+
+	sum, err := LoadAll(path)
+	if err != nil {
+		t.Fatalf("LoadAll: %v", err)
+	}
+	if len(sum.Profiles) != 1 || sum.Profiles[0].Err != nil {
+		t.Errorf("unexpected summary: %+v", sum.Profiles)
 	}
 }

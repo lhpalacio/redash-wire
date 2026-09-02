@@ -21,6 +21,10 @@ struct ProxyTracker: Equatable {
 
         var isBusy: Bool { self == .starting }
 
+        /// Up, or on its way up: there is a process, or a restart timer about
+        /// to spawn one. What Stop has to act on, whatever the config says.
+        var isActive: Bool { isRunning || isBusy }
+
         /// Nil unless running: a stopped proxy is not asking Redash anything.
         var health: RedashHealth? {
             if case .running(_, let redash) = self { return redash }
@@ -81,7 +85,14 @@ struct ProxyTracker: Equatable {
     private var expectedListeners = 0
     private var seenListeners = 0
     private var restartAttempts = 0
+    /// The daemon's latest error-level line, from its structured log.
     private var lastErrorMessage: String?
+    /// The Go runtime's `panic:` or `fatal error:` headline, when the process
+    /// wrote one. Only the first counts: what follows is the trace.
+    private var crashMessage: String?
+    /// The first plain-text line, for a daemon that fails before its logger
+    /// exists and says so in prose.
+    private var firstRawLine: String?
 
     var state: State { snapshot.state }
     var activeProfile: Profile? { snapshot.activeProfile }
@@ -105,6 +116,8 @@ struct ProxyTracker: Equatable {
         reachedReady = false
         reportedHealth = .checking
         lastErrorMessage = nil
+        crashMessage = nil
+        firstRawLine = nil
         snapshot.dataSources = []
         nextProbeAt = nil
         snapshot.pendingRestart = nil
@@ -119,7 +132,14 @@ struct ProxyTracker: Equatable {
     /// One line from a process that is still alive. The supervisor drops lines
     /// that arrive after the exit, so this never resurrects a dead proxy.
     mutating func record(_ event: LogEvent, now: Date) {
-        if event.level >= .error {
+        if event.isRaw {
+            if firstRawLine == nil {
+                firstRawLine = event.message
+            }
+            if crashMessage == nil, Self.isCrashHeadline(event.message) {
+                crashMessage = event.message
+            }
+        } else if event.level >= .error {
             lastErrorMessage = Self.reason(for: event)
         }
 
@@ -177,7 +197,7 @@ struct ProxyTracker: Equatable {
         // Nothing bound, so the cause is permanent: a rejected key, a port in use,
         // an invalid profile. A retry loop would only hide it.
         guard reachedReady else {
-            snapshot.state = .failed(lastErrorMessage ?? "redash-wire stopped before it began listening (status \(status))")
+            snapshot.state = .failed(exitReason(or: "redash-wire stopped before it began listening (status \(status))"))
             return .failed
         }
 
@@ -186,7 +206,7 @@ struct ProxyTracker: Equatable {
         }
 
         guard restartAttempts < Self.backoffDelays.count else {
-            snapshot.state = .failed(lastErrorMessage ?? "redash-wire keeps stopping after \(restartAttempts) restarts")
+            snapshot.state = .failed(exitReason(or: "redash-wire keeps stopping after \(restartAttempts) restarts"))
             return .failed
         }
 
@@ -220,6 +240,18 @@ struct ProxyTracker: Equatable {
     private mutating func applyHealth() {
         guard case .running(let since, let current) = snapshot.state, current != reportedHealth else { return }
         snapshot.state = .running(since: since, redash: reportedHealth)
+    }
+
+    /// A panic outranks the daemon's last error, which is usually unrelated: a
+    /// proxy that logged redash_down and then crashed used to be reported as
+    /// "redash is unreachable". Prose the daemon wrote before its logger existed
+    /// is the reason only when there is no other.
+    private func exitReason(or fallback: String) -> String {
+        crashMessage ?? lastErrorMessage ?? firstRawLine ?? fallback
+    }
+
+    private static func isCrashHeadline(_ line: String) -> Bool {
+        line.hasPrefix("panic:") || line.hasPrefix("fatal error:")
     }
 
     /// slog puts the headline in `msg` and the diagnosis in `error`. Keeping only

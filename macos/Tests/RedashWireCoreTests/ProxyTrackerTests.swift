@@ -178,6 +178,44 @@ final class ProxyTrackerTests: XCTestCase {
         XCTAssertEqual(tracker.exit(status: 143, stopRequested: true, now: t0), .stopped)
         XCTAssertEqual(tracker.state, .stopped)
     }
+
+    func testAPanicOutranksAnEarlierUnrelatedErrorAsTheReason() {
+        // Redash went away, then the daemon crashed for a reason of its own.
+        // The last error line is about Redash; the panic is why it stopped.
+        var tracker = running()
+        tracker.record(event(WireEvent.redashDown, level: .error, message: "redash is unreachable", fields: ["kind": "unreachable", "error": "dial tcp: connection refused"]), now: t0)
+        tracker.record(.raw(line: "panic: runtime error: index out of range [5] with length 3", now: t0), now: t0)
+        tracker.record(.raw(line: "goroutine 1 [running]:", now: t0), now: t0)
+        tracker.record(.raw(line: "main.main()", now: t0), now: t0)
+
+        for _ in 0..<3 {
+            _ = tracker.exit(status: 2, stopRequested: false, now: t0)
+            tracker.launch(profile())
+            tracker.record(event(WireEvent.listenerReady), now: t0)
+            tracker.record(.raw(line: "panic: runtime error: index out of range [5] with length 3", now: t0), now: t0)
+        }
+        XCTAssertEqual(tracker.exit(status: 2, stopRequested: false, now: t0), .failed)
+        XCTAssertEqual(tracker.state, .failed("panic: runtime error: index out of range [5] with length 3"),
+                       "the headline, not the trace that follows it")
+    }
+
+    func testProseBeforeTheLoggerExistsIsTheReasonOnlyWhenThereIsNoOther() {
+        // The daemon prints "error: …" in plain text when it fails before its
+        // JSON logger is set up. That used to be dropped, leaving only the
+        // exit status.
+        var tracker = ProxyTracker()
+        tracker.start(profile())
+        tracker.record(.raw(line: "error: unknown log format \"xml\"", now: t0), now: t0)
+        _ = tracker.exit(status: 1, stopRequested: false, now: t0)
+        XCTAssertEqual(tracker.state, .failed("error: unknown log format \"xml\""))
+
+        tracker.start(profile())
+        tracker.record(event(nil, level: .error, message: "loading config", fields: ["error": "no such profile"]), now: t0)
+        tracker.record(.raw(line: "some stray line", now: t0), now: t0)
+        _ = tracker.exit(status: 1, stopRequested: false, now: t0)
+        XCTAssertEqual(tracker.state, .failed("loading config: no such profile"),
+                       "a structured error outranks plain text that is not a crash")
+    }
 }
 
 final class LogEventTests: XCTestCase {
@@ -197,9 +235,19 @@ final class LogEventTests: XCTestCase {
         XCTAssertEqual(event?.time, ISO8601DateFormatter().date(from: "2026-09-01T16:55:48-03:00"))
     }
 
-    func testALineThatIsNotAJSONObjectIsDropped() {
+    func testALineThatIsNotAJSONObjectDoesNotParseButCanBeKeptRaw() {
         XCTAssertNil(LogEvent.parse(line: Data("panic: something".utf8)))
         XCTAssertNil(LogEvent.parse(line: Data("[1,2]".utf8)))
+
+        // A Go panic used to vanish before it reached the log window, which
+        // left a crash with no trace anywhere.
+        let now = Date()
+        let raw = LogEvent.raw(line: "panic: something", now: now)
+        XCTAssertEqual(raw.level, .error)
+        XCTAssertEqual(raw.message, "panic: something")
+        XCTAssertTrue(raw.isRaw)
+        XCTAssertNil(raw.event)
+        XCTAssertFalse(LogEvent.parse(line: Data(#"{"msg":"x"}"#.utf8))?.isRaw ?? true)
     }
 
     func testAnUnknownLevelReadsAsInfo() {

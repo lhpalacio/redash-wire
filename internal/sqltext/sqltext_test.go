@@ -24,7 +24,7 @@ func TestStatements(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := Statements(tt.sql)
+			got := Postgres.Statements(tt.sql)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("Statements(%q) = %#v, want %#v", tt.sql, got, tt.want)
 			}
@@ -35,35 +35,54 @@ func TestStatements(t *testing.T) {
 func TestStatementsEdgeCases(t *testing.T) {
 	tests := []struct {
 		name string
+		d    Dialect
 		sql  string
 		want []string
 	}{
-		{"dollar quote with tag", "SELECT $tag$a;b$tag$ ; SELECT 2", []string{"SELECT $tag$a;b$tag$", "SELECT 2"}},
-		{"unterminated single quote", "SELECT 'abc; SELECT 2", []string{"SELECT 'abc; SELECT 2"}},
-		{"unterminated block comment", "SELECT 1 /* ; SELECT 2", []string{"SELECT 1 /* ; SELECT 2"}},
-		{"backslash escaped quote (mysql single)", `SELECT 'a\'; b'; SELECT 2`, []string{`SELECT 'a\'; b'`, "SELECT 2"}},
-		{"backslash escaped quote (mysql double)", `SELECT "a\"; b"; SELECT 2`, []string{`SELECT "a\"; b"`, "SELECT 2"}},
-		{"backtick identifier with semicolon", "SELECT `a;b`; SELECT 2", []string{"SELECT `a;b`", "SELECT 2"}},
-		{"only comments", "-- just a comment\n", nil},
+		{"dollar quote with tag", Postgres, "SELECT $tag$a;b$tag$ ; SELECT 2", []string{"SELECT $tag$a;b$tag$", "SELECT 2"}},
+		{"unterminated single quote", Postgres, "SELECT 'abc; SELECT 2", []string{"SELECT 'abc; SELECT 2"}},
+		{"unterminated block comment", Postgres, "SELECT 1 /* ; SELECT 2", []string{"SELECT 1 /* ; SELECT 2"}},
+		{"backslash escaped quote (mysql single)", MySQL, `SELECT 'a\'; b'; SELECT 2`, []string{`SELECT 'a\'; b'`, "SELECT 2"}},
+		{"backslash escaped quote (mysql double)", MySQL, `SELECT "a\"; b"; SELECT 2`, []string{`SELECT "a\"; b"`, "SELECT 2"}},
+		{"backtick identifier with semicolon", MySQL, "SELECT `a;b`; SELECT 2", []string{"SELECT `a;b`", "SELECT 2"}},
+		{"only comments", Postgres, "-- just a comment\n", nil},
+
+		// Postgres: a backslash is an ordinary byte, so 'C:\' is a complete
+		// literal and the second statement is visible to the splitter.
+		{"backslash ends a postgres literal", Postgres, `SELECT 'C:\'; DELETE FROM users --'`, []string{`SELECT 'C:\'`, "DELETE FROM users --'"}},
+		{"backslash inside postgres literal is plain", Postgres, `SELECT 'a\b'; SELECT 2`, []string{`SELECT 'a\b'`, "SELECT 2"}},
+		{"postgres E-string honors backslash", Postgres, `SELECT E'it\'s; here'; SELECT 2`, []string{`SELECT E'it\'s; here'`, "SELECT 2"}},
+		{"identifier ending in e is not an E-string", Postgres, `SELECT type'\'; SELECT 2`, []string{`SELECT type'\'`, "SELECT 2"}},
+		{"mysql backslash-terminated literal swallows the rest", MySQL, `SELECT 'C:\'; SELECT 2`, []string{`SELECT 'C:\'; SELECT 2`}},
+
+		// Comments.
+		{"postgres nested block comment", Postgres, "SELECT 1 /* a /* b */ ; DROP TABLE x */", []string{"SELECT 1 /* a /* b */ ; DROP TABLE x */"}},
+		{"mysql block comment does not nest", MySQL, "SELECT 1 /* a /* b */ ; SELECT 2 */", []string{"SELECT 1 /* a /* b */", "SELECT 2 */"}},
+		{"mysql hash comment", MySQL, "SELECT 1; # trailing note", []string{"SELECT 1"}},
+		{"mysql hash comment hides a quote", MySQL, "SELECT 1; # it's fine\nSELECT 2", []string{"SELECT 1", "# it's fine\nSELECT 2"}},
+		{"postgres hash is code", Postgres, "SELECT 1 # 2; SELECT 3", []string{"SELECT 1 # 2", "SELECT 3"}},
+
+		// MySQL has no dollar quoting; $ is an identifier byte.
+		{"mysql dollar in identifier", MySQL, "SELECT a$b$c; SELECT 2", []string{"SELECT a$b$c", "SELECT 2"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := Statements(tt.sql)
+			got := tt.d.Statements(tt.sql)
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("Statements(%q) = %#v, want %#v", tt.sql, got, tt.want)
+				t.Errorf("%v.Statements(%q) = %#v, want %#v", tt.d, tt.sql, got, tt.want)
 			}
 		})
 	}
 }
 
 func TestIsMultiStatement(t *testing.T) {
-	if IsMultiStatement("SELECT 1;") {
+	if Postgres.IsMultiStatement("SELECT 1;") {
 		t.Error("single statement with trailing ; should not be multi")
 	}
-	if !IsMultiStatement("BEGIN; SELECT 1; COMMIT") {
+	if !Postgres.IsMultiStatement("BEGIN; SELECT 1; COMMIT") {
 		t.Error("expected multi-statement")
 	}
-	if IsMultiStatement("SELECT ';;;'") {
+	if Postgres.IsMultiStatement("SELECT ';;;'") {
 		t.Error("semicolons inside a literal must not count")
 	}
 }
@@ -79,7 +98,7 @@ func TestRedact(t *testing.T) {
 		{"SELECT col FROM information_schema.tables", "", "information_schema.tables"},
 	}
 	for _, tt := range tests {
-		r := Redact(tt.sql)
+		r := Postgres.Redact(tt.sql)
 		if len(r) != len(tt.sql) {
 			t.Errorf("Redact changed length: %d != %d", len(r), len(tt.sql))
 		}
@@ -104,7 +123,7 @@ func TestSplitTopLevelCommas(t *testing.T) {
 		{"coalesce(a, b, c)", []string{"coalesce(a, b, c)"}},
 	}
 	for _, tt := range tests {
-		got := SplitTopLevelCommas(tt.sql)
+		got := Postgres.SplitTopLevelCommas(tt.sql)
 		if !reflect.DeepEqual(got, tt.want) {
 			t.Errorf("SplitTopLevelCommas(%q) = %#v, want %#v", tt.sql, got, tt.want)
 		}
@@ -139,7 +158,7 @@ func TestReplaceOutsideStrings(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := ReplaceOutsideStrings(tt.sql, tt.old, ""); got != tt.want {
+			if got := MySQL.ReplaceOutsideStrings(tt.sql, tt.old, ""); got != tt.want {
 				t.Errorf("ReplaceOutsideStrings(%q, %q) = %q, want %q", tt.sql, tt.old, got, tt.want)
 			}
 		})

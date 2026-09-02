@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/lhpalacio/redash-wire/internal/config"
@@ -58,7 +59,7 @@ func cmdConfig(args []string) int {
 		var err error
 		sum, err = config.LoadAll(res.Path)
 		if err != nil {
-			return reportError(fail(codeInvalidConfig, err), *asJSON)
+			return reportError(classifyLoadError(err), *asJSON)
 		}
 	}
 
@@ -71,7 +72,7 @@ func cmdConfig(args []string) int {
 		return exitOK
 	}
 
-	printConfig(payload)
+	printConfig(os.Stdout, payload)
 	return exitOK
 }
 
@@ -113,29 +114,38 @@ func buildConfigPayload(res config.ResolveResult, source string, sum *config.Sum
 	return payload
 }
 
-func printConfig(p configPayload) {
-	fmt.Printf("config: %s (%s)\n", shortenHome(p.ConfigPath), p.Source)
+func printConfig(w io.Writer, p configPayload) {
+	fmt.Fprintf(w, "config: %s (%s)\n", shortenHome(p.ConfigPath), p.Source)
 	if !p.Exists {
-		fmt.Println("status: not configured — run `redash-wire` to set up, or `redash-wire init -url <url>`")
+		fmt.Fprintln(w, "status: not configured — run `redash-wire` to set up, or `redash-wire init -url <url>`")
 		return
 	}
-	fmt.Printf("default profile: %s\n", p.DefaultProfile)
+	fmt.Fprintf(w, "default profile: %s\n", p.DefaultProfile)
 	for _, prof := range p.Profiles {
-		fmt.Printf("\n[%s]\n", prof.Name)
-		fmt.Printf("  redash url:  %s\n", prof.RedashURL)
-		fmt.Printf("  api key:     %s\n", boolLabel(prof.APIKeySet, "set", "missing"))
-		fmt.Printf("  postgres:    %s\n", addrLabel(prof.PostgresListenAddr))
-		fmt.Printf("  mysql:       %s\n", addrLabel(prof.MySQLListenAddr))
-		fmt.Printf("  username:    %s\n", prof.Username)
-		fmt.Printf("  password:    %s\n", prof.Password)
+		fmt.Fprintf(w, "\n[%s]\n", prof.Name)
+		fmt.Fprintf(w, "  redash url:  %s\n", prof.RedashURL)
+		fmt.Fprintf(w, "  api key:     %s\n", apiKeyLabel(prof))
+		fmt.Fprintf(w, "  postgres:    %s\n", addrLabel(prof.PostgresListenAddr))
+		fmt.Fprintf(w, "  mysql:       %s\n", addrLabel(prof.MySQLListenAddr))
+		fmt.Fprintf(w, "  username:    %s\n", prof.Username)
+		fmt.Fprintf(w, "  password:    %s\n", prof.Password)
 		if prof.DefaultCredentials {
-			fmt.Printf("               (built-in defaults)\n")
+			fmt.Fprintf(w, "               (built-in defaults)\n")
 		}
-		fmt.Printf("  poll:        every %s, timeout %s\n", prof.PollInterval, prof.PollTimeout)
+		fmt.Fprintf(w, "  poll:        every %s, timeout %s\n", prof.PollInterval, prof.PollTimeout)
 		if !prof.Valid {
-			fmt.Fprintf(os.Stderr, "  invalid:     %s\n", prof.Error)
+			// Part of the report, so it goes where the report goes.
+			fmt.Fprintf(w, "  invalid:     %s\n", prof.Error)
 		}
 	}
+}
+
+// The key itself under -show-secrets, otherwise only whether one is set.
+func apiKeyLabel(p profilePayload) string {
+	if p.APIKey != nil && *p.APIKey != "" {
+		return *p.APIKey
+	}
+	return boolLabel(p.APIKeySet, "set", "missing")
 }
 
 func addrLabel(addr string) string {

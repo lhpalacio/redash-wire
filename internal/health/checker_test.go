@@ -154,7 +154,11 @@ func TestRejectedIsDistinguishedFromUnreachable(t *testing.T) {
 
 	gate := health.NewGate()
 	logger, log := newCapture()
-	checker := health.NewChecker(redash.NewClient(server.URL, "bad-key"), redash.NewSwappableRegistry(nil), gate, logger)
+	// WithRejectedThreshold(1) confirms the rejected verdict on the first probe;
+	// the confirmation window itself is covered by
+	// TestRejectedNeedsConfirmationBeforeTheLongBackoff.
+	checker := health.NewChecker(redash.NewClient(server.URL, "bad-key"), redash.NewSwappableRegistry(nil), gate, logger,
+		health.WithRejectedThreshold(1))
 
 	checker.Probe(context.Background())
 	checker.Probe(context.Background())
@@ -187,8 +191,11 @@ func TestKindChangeIsReAnnouncedWhileStillDown(t *testing.T) {
 	down.Probe(context.Background())
 
 	// ...then let it start answering 401. The gate never came back up, but the fix
-	// the user needs just changed, so the app has to hear about it.
-	rejected := health.NewChecker(redash.NewClient(unauthorized.URL, "bad-key"), redash.NewSwappableRegistry(nil), gate, logger)
+	// the user needs just changed, so the app has to hear about it. This checker
+	// confirms the rejected verdict on the first probe so the test stays about the
+	// re-announcement, not the confirmation window.
+	rejected := health.NewChecker(redash.NewClient(unauthorized.URL, "bad-key"), redash.NewSwappableRegistry(nil), gate, logger,
+		health.WithRejectedThreshold(1))
 	rejected.Probe(context.Background())
 	rejected.Probe(context.Background())
 
@@ -415,13 +422,65 @@ func TestARejectedKeyCountsDownToTheLongBackoff(t *testing.T) {
 	gate := health.NewGate()
 	logger, log := newCapture()
 	checker := health.NewChecker(redash.NewClient(server.URL, "bad-key"), redash.NewSwappableRegistry(nil), gate, logger,
-		health.WithRejectedInterval(5*time.Minute))
+		health.WithRejectedInterval(5*time.Minute), health.WithRejectedThreshold(1))
 
 	checker.Probe(context.Background())
 
 	down := log.events(health.EventRedashDown)
 	if len(down) != 1 || down[0]["retry_in_seconds"] != float64(300) {
 		t.Errorf("redash_down events = %v, want one carrying retry_in_seconds=300: a rejected key backs off", down)
+	}
+}
+
+func TestRejectedNeedsConfirmationBeforeTheLongBackoff(t *testing.T) {
+	// A captive portal or a half-connected VPN serves 403 for a stretch before it
+	// lets real traffic through. A single such response must not park every
+	// session on the key message and back off for five minutes; the rejected
+	// verdict has to persist across the confirmation window first. Until then the
+	// outage reads as plain unreachable and keeps probing at the normal interval.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	gate := health.NewGate()
+	logger, log := newCapture()
+	checker := health.NewChecker(redash.NewClient(server.URL, "bad-key"), redash.NewSwappableRegistry(nil), gate, logger,
+		health.WithInterval(10*time.Second), health.WithRejectedInterval(5*time.Minute),
+		health.WithRejectedThreshold(3))
+
+	// First probe: the gate closes (the startup probe is authoritative), but a
+	// single 403 is not yet the key being wrong, so it reads as unreachable and
+	// the countdown is the normal interval, not the long backoff.
+	checker.Probe(context.Background())
+	if got := gate.Status().Kind; got != health.KindUnreachable {
+		t.Fatalf("after one 403, Kind = %q, want %q: the rejected verdict is not yet confirmed", got, health.KindUnreachable)
+	}
+	down := log.events(health.EventRedashDown)
+	if len(down) != 1 || down[0]["kind"] != string(health.KindUnreachable) || down[0]["retry_in_seconds"] != float64(10) {
+		t.Fatalf("first redash_down = %v, want one unreachable event retrying in 10s", down)
+	}
+
+	// Second probe stays inside the window: still unreachable, still the normal
+	// interval.
+	checker.Probe(context.Background())
+	if got := gate.Status().Kind; got != health.KindUnreachable {
+		t.Fatalf("after two 403s, Kind = %q, want %q: still confirming", got, health.KindUnreachable)
+	}
+
+	// Third probe crosses the threshold: now it is the key, and the countdown
+	// becomes the five-minute backoff.
+	checker.Probe(context.Background())
+	if got := gate.Status().Kind; got != health.KindRejected {
+		t.Fatalf("after three 403s, Kind = %q, want %q: the verdict is confirmed", got, health.KindRejected)
+	}
+	if !strings.Contains(gate.ClientMessage(), "api_key") {
+		t.Errorf("ClientMessage() = %q, want it to point at the key once confirmed", gate.ClientMessage())
+	}
+	down = log.events(health.EventRedashDown)
+	last := down[len(down)-1]
+	if last["kind"] != string(health.KindRejected) || last["retry_in_seconds"] != float64(300) {
+		t.Errorf("final redash_down = %v, want a rejected event backing off for 300s", last)
 	}
 }
 

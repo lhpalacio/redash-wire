@@ -491,7 +491,9 @@ func shortenHome(path string) string {
 	if err != nil {
 		return path
 	}
-	if rel, ok := strings.CutPrefix(path, home); ok {
+	// The prefix has to end at a path boundary: /Users/x/homebrew is not under
+	// /Users/x.
+	if rel, ok := strings.CutPrefix(path, home); ok && (rel == "" || rel[0] == os.PathSeparator) {
 		return "~" + rel
 	}
 	return path

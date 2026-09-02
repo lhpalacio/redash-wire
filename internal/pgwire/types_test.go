@@ -12,7 +12,7 @@ func TestRedashTypeToPgOID(t *testing.T) {
 		{name: "integer", redashType: "integer", want: OidInt8},
 		{name: "float", redashType: "float", want: OidFloat8},
 		{name: "boolean", redashType: "boolean", want: OidBool},
-		{name: "datetime", redashType: "datetime", want: OidTimestampTZ},
+		{name: "datetime is naive until the values say otherwise", redashType: "datetime", want: OidTimestamp},
 		{name: "date", redashType: "date", want: OidDate},
 		{name: "json", redashType: "json", want: OidJSONB},
 		{name: "jsonb", redashType: "jsonb", want: OidJSONB},

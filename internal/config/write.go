@@ -1,12 +1,17 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"gopkg.in/yaml.v3"
 )
+
+// ErrExists reports that WriteConfig found a file already at the path and left
+// it alone. Callers test for it with errors.Is.
+var ErrExists = errors.New("config file already exists")
 
 func NewFileConfig(profileName, redashURL, apiKey, username, password string, enablePostgres, enableMySQL bool) *FileConfig {
 	// A written config must always pass the at-least-one-listener validation in
@@ -36,10 +41,13 @@ func NewFileConfig(profileName, redashURL, apiKey, username, password string, en
 	return fc
 }
 
-// WriteConfig writes the config atomically with owner-only permissions, since it
-// holds the Redash API key and proxy password in cleartext. It writes to a temp
-// file in the same directory and renames into place so a crash or disk-full mid
-// write can never leave a truncated config behind.
+// WriteConfig creates the config atomically with owner-only permissions, since
+// it holds the Redash API key and proxy password in cleartext. It writes to a
+// temp file in the same directory and links it into place so a crash or
+// disk-full mid write can never leave a truncated config behind. It never
+// replaces an existing file: the link fails with ErrExists instead, and because
+// that check is the create itself, two setups racing for the same path cannot
+// both succeed.
 func WriteConfig(path string, fc *FileConfig) error {
 	var root yaml.Node
 	if err := root.Encode(fc); err != nil {
@@ -62,7 +70,7 @@ func WriteConfig(path string, fc *FileConfig) error {
 		return fmt.Errorf("creating temp config: %w", err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op once the rename succeeds
+	defer os.Remove(tmpName) // after a successful link this only drops the temp name
 
 	if err := tmp.Chmod(0o600); err != nil {
 		tmp.Close()
@@ -76,7 +84,11 @@ func WriteConfig(path string, fc *FileConfig) error {
 		return fmt.Errorf("closing config: %w", err)
 	}
 
-	if err := os.Rename(tmpName, path); err != nil {
+	// A hard link, unlike a rename, refuses an existing target.
+	if err := os.Link(tmpName, path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("%w at %s", ErrExists, path)
+		}
 		return fmt.Errorf("finalizing config file: %w", err)
 	}
 

@@ -59,6 +59,47 @@ struct Profile: Decodable, Identifiable, Equatable {
     }
 }
 
+/// How the profile a proxy was launched from relates to the config on disk now.
+/// The daemon reads its profile once, at launch, so an edit or a rename leaves
+/// it serving a copy the config no longer contains. The menu has to describe
+/// that copy, not the one on disk, and Reload Configuration has to know what to
+/// bring the proxy back up on.
+enum ProfileDrift: Equatable {
+    case unchanged
+    /// Still there under the same name, with something different in it.
+    case edited(Profile)
+    /// Renamed or deleted.
+    case removed
+
+    init(running: Profile, onDisk: [Profile]) {
+        guard let current = onDisk.first(where: { $0.name == running.name }) else {
+            self = .removed
+            return
+        }
+        self = current == running ? .unchanged : .edited(current)
+    }
+
+    enum ReloadAction: Equatable {
+        case keep
+        case restart(Profile)
+        case stop
+    }
+
+    /// What a reload does to the running proxy. `fallback` is the on-disk
+    /// selection, which is what the proxy comes back up on when its own profile
+    /// is gone; with nothing to fall back on, it stops.
+    func reloadAction(fallback: Profile?) -> ReloadAction {
+        switch self {
+        case .unchanged:
+            return .keep
+        case .edited(let profile):
+            return .restart(profile)
+        case .removed:
+            return fallback.map { .restart($0) } ?? .stop
+        }
+    }
+}
+
 struct DataSource: Decodable, Identifiable, Equatable {
     let id: Int
     let name: String
@@ -268,6 +309,27 @@ struct LogEvent: Identifiable, Equatable {
     let event: String?
     let message: String
     let fields: [String: String]
+    /// True for a line that was not JSON: the Go runtime's crash output, or
+    /// what the daemon prints before its logger exists. It belongs in the log,
+    /// since it is usually the whole explanation of an exit, but it is not the
+    /// daemon reporting on itself and the tracker weighs it differently.
+    let isRaw: Bool
+
+    init(time: Date, level: Level, event: String?, message: String, fields: [String: String], isRaw: Bool = false) {
+        self.time = time
+        self.level = level
+        self.event = event
+        self.message = message
+        self.fields = fields
+        self.isRaw = isRaw
+    }
+
+    /// A line that was not JSON. Error level, because the only things that write
+    /// plain text to the daemon's stderr are the Go runtime, on a panic, and the
+    /// daemon itself, on an error before its logger is set up.
+    static func raw(line: String, now: Date) -> LogEvent {
+        LogEvent(time: now, level: .error, event: nil, message: line, fields: [:], isRaw: true)
+    }
 
     /// `sources` carries the entire data source list, which the menu renders and
     /// a one-line log column has no room for.
@@ -280,9 +342,8 @@ struct LogEvent: Identifiable, Equatable {
             .joined(separator: " ")
     }
 
-    /// One line of the daemon's `-log-format json` stream. Anything that is not
-    /// a JSON object is dropped: the stream is the contract, and a stray line
-    /// is not part of it.
+    /// One line of the daemon's `-log-format json` stream. Nil for anything that
+    /// is not a JSON object, which the supervisor then keeps as `raw`.
     static func parse(line: Data) -> LogEvent? {
         guard
             let object = try? JSONSerialization.jsonObject(with: line),

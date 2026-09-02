@@ -45,7 +45,7 @@ func RunWizard(initialProfile string) (*Result, error) {
 				Description("The base URL of your Redash instance").
 				Placeholder("https://redash.example.com").
 				Value(&redashURL).
-				Validate(validateURL),
+				Validate(ValidateURL),
 
 			huh.NewInput().
 				Title("API Key").
@@ -139,7 +139,9 @@ func runConnectionTest(redashURL, apiKey string) (hasPostgres, hasMySQL bool, er
 	return hasPostgres, hasMySQL, nil
 }
 
-func validateURL(s string) error {
+// ValidateURL accepts an absolute http or https URL. init applies it too, so a
+// bare host is a usage mistake there rather than a failed connection.
+func ValidateURL(s string) error {
 	if s == "" {
 		return fmt.Errorf("Redash URL is required")
 	}

@@ -3,7 +3,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/lhpalacio/redash-wire/main/install.sh | sh
 #
 # Options (environment variables):
-#   VERSION  release tag to install, e.g. v1.2.0 (default: latest)
+#   VERSION  release tag to install, e.g. v1.2.0 or 1.2.0 (default: latest)
 #   BIN_DIR  install directory (default: /usr/local/bin)
 set -eu
 
@@ -48,6 +48,12 @@ if [ -z "$tag" ]; then
 	[ -n "$tag" ] || err "could not determine the latest release tag"
 fi
 
+# Release tags carry a leading v; accept VERSION given with or without it.
+case "$tag" in
+v*) ;;
+*) tag="v$tag" ;;
+esac
+
 version="${tag#v}"
 archive="redash-wire_${version}_${os}_${arch}.tar.gz"
 base_url="https://github.com/$REPO/releases/download/$tag"
@@ -59,15 +65,24 @@ echo "Downloading redash-wire $tag ($os/$arch)..."
 fetch "$base_url/$archive" >"$tmp/$archive"
 fetch "$base_url/checksums.txt" >"$tmp/checksums.txt"
 
+# The verifier's exit status alone is not enough: some sha256sum builds exit 0
+# on empty input, so a checksums.txt without this archive would pass. Require
+# the line first, then require the verifier to say OK for this file.
 (
 	cd "$tmp"
+	expected=$(grep " $archive\$" checksums.txt || true)
+	[ -n "$expected" ] || err "checksums.txt has no entry for $archive"
 	if have sha256sum; then
-		grep " $archive\$" checksums.txt | sha256sum -c - >/dev/null
+		result=$(printf '%s\n' "$expected" | sha256sum -c - 2>&1) || true
 	elif have shasum; then
-		grep " $archive\$" checksums.txt | shasum -a 256 -c - >/dev/null
+		result=$(printf '%s\n' "$expected" | shasum -a 256 -c - 2>&1) || true
 	else
 		err "sha256sum or shasum is required to verify the download"
 	fi
+	case "$result" in
+	*"$archive: OK"*) ;;
+	*) err "checksum verification failed for $archive: $result" ;;
+	esac
 )
 echo "Checksum verified."
 

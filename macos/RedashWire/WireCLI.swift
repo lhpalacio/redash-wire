@@ -83,10 +83,20 @@ struct WireCLI {
         }
 
         // Close so a command reading stdin sees EOF instead of blocking.
+        let writer = inPipe.fileHandleForWriting
+        var writeFailure: Error?
         if let stdin {
-            try? inPipe.fileHandleForWriting.write(contentsOf: stdin)
+            // A child that died before reading makes this EPIPE rather than a
+            // SIGPIPE. The app ignores SIGPIPE too; this covers the descriptor
+            // on its own, and `write(contentsOf:)` throws on EPIPE.
+            _ = fcntl(writer.fileDescriptor, F_SETNOSIGPIPE, 1)
+            do {
+                try writer.write(contentsOf: stdin)
+            } catch {
+                writeFailure = error
+            }
         }
-        try? inPipe.fileHandleForWriting.close()
+        try? writer.close()
 
         // Concurrently: waiting on one while the other fills its 64KB buffer deadlocks.
         async let out = Self.readToEnd(outPipe.fileHandleForReading)
@@ -94,7 +104,17 @@ struct WireCLI {
         let (stdoutData, stderrData) = await (out, err)
 
         process.waitUntilExit()
-        return ProcessResult(stdout: stdoutData, stderr: stderrData, status: process.terminationStatus)
+        let result = ProcessResult(stdout: stdoutData, stderr: stderrData, status: process.terminationStatus)
+
+        // A child that stopped reading has usually exited, and its own error
+        // says more than a broken pipe does; that goes through the status.
+        if let writeFailure, result.status == 0 {
+            throw WireError(
+                code: .ioError,
+                message: "could not send input to \(binaryURL.lastPathComponent): \(writeFailure.localizedDescription)"
+            )
+        }
+        return result
     }
 
     private static func readToEnd(_ handle: FileHandle) async -> Data {
