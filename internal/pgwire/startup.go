@@ -32,6 +32,11 @@ type CancelFunc func(processID uint32, secretKey []byte)
 // rather than in the client's credentials or its SQL.
 const SQLStateConnectionFailure = "08006"
 
+// SQLStateReadOnly (25006, read_only_sql_transaction) is what PostgreSQL itself
+// raises for a write under default_transaction_read_only, so a client that knows
+// the code treats the proxy's refusal the same way.
+const SQLStateReadOnly = "25006"
+
 // Admit runs after the client authenticates and before the server declares itself
 // ready. Returning an error refuses the connection, and that error's message is
 // what the client is shown.
@@ -52,7 +57,9 @@ const MaxClientMessageBytes = 64 << 20
 // upgrades, authenticates the client against the configured credentials, and sends
 // the post-auth parameter bundle through ReadyForQuery. It returns the client's
 // startup parameters (user, database, application_name, ...) for the session to use.
-func HandleStartup(backend *pgproto3.Backend, conn net.Conn, username, password string, admit Admit, key pgproto3.BackendKeyData, onCancel CancelFunc) (map[string]string, error) {
+// readOnly is reported to the client as default_transaction_read_only, the way
+// PostgreSQL 14 does, so a client that checks before writing gets the truth.
+func HandleStartup(backend *pgproto3.Backend, conn net.Conn, username, password string, admit Admit, key pgproto3.BackendKeyData, onCancel CancelFunc, readOnly bool) (map[string]string, error) {
 	for {
 		startupMsg, err := backend.ReceiveStartupMessage()
 		if err != nil {
@@ -102,7 +109,7 @@ func HandleStartup(backend *pgproto3.Backend, conn net.Conn, username, password 
 				return nil, err
 			}
 
-			for _, ps := range parameterStatuses() {
+			for _, ps := range parameterStatuses(readOnly) {
 				buf, err = encode(ps.Encode(buf))
 				if err != nil {
 					return nil, err
@@ -176,7 +183,7 @@ func authenticate(backend *pgproto3.Backend, conn net.Conn, clientUser, expected
 	return nil
 }
 
-func parameterStatuses() []pgproto3.ParameterStatus {
+func parameterStatuses(readOnly bool) []pgproto3.ParameterStatus {
 	return []pgproto3.ParameterStatus{
 		{Name: "server_version", Value: "14.0"},
 		{Name: "server_encoding", Value: "UTF8"},
@@ -185,7 +192,17 @@ func parameterStatuses() []pgproto3.ParameterStatus {
 		{Name: "TimeZone", Value: "UTC"},
 		{Name: "standard_conforming_strings", Value: "on"},
 		{Name: "integer_datetimes", Value: "on"},
+		// Reported since PostgreSQL 14; DBeaver and DataGrip read it to show a
+		// read-only badge and disable their edit UI.
+		{Name: "default_transaction_read_only", Value: onOff(readOnly)},
 	}
+}
+
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
 }
 
 func encode(buf []byte, err error) ([]byte, error) {

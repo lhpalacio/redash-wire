@@ -434,3 +434,55 @@ profiles:
 		t.Errorf("unexpected summary: %+v", sum.Profiles)
 	}
 }
+
+// read_only layers like every other key, but as a tri-state: a profile's
+// explicit false has to win over a top-level true, which a plain bool with
+// omitempty could not express.
+func TestLoad_ReadOnlyLayering(t *testing.T) {
+	const yaml = `
+postgres_listen_addr: 127.0.0.1:15432
+read_only: true
+default_profile: locked
+profiles:
+  locked:
+    redash_url: https://redash.example.com
+    api_key: k
+  open:
+    redash_url: https://redash.example.com
+    api_key: k
+    read_only: false
+  explicit:
+    redash_url: https://redash.example.com
+    api_key: k
+    read_only: true
+`
+	path := writeYAML(t, yaml)
+	for profile, want := range map[string]bool{"locked": true, "open": false, "explicit": true} {
+		cfg, err := Load(path, profile)
+		if err != nil {
+			t.Fatalf("Load(%s): %v", profile, err)
+		}
+		if got := cfg.IsReadOnly(); got != want {
+			t.Errorf("profile %s: IsReadOnly() = %v, want %v", profile, got, want)
+		}
+	}
+
+	unset := writeYAML(t, `
+postgres_listen_addr: 127.0.0.1:15432
+default_profile: dev
+profiles:
+  dev:
+    redash_url: https://redash.example.com
+    api_key: k
+`)
+	cfg, err := Load(unset, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.IsReadOnly() {
+		t.Error("read_only must default to off")
+	}
+	if cfg.ReadOnly != nil {
+		t.Error("an unset read_only must stay nil so the config report can tell it apart")
+	}
+}

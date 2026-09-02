@@ -7,7 +7,7 @@ final class ConnectionStringsTests: XCTestCase {
             name: "prod", redashURL: "https://redash.example.com", apiKeySet: true,
             postgresListenAddr: postgres, mysqlListenAddr: mysql,
             username: "redash-wire", password: "secret", defaultCredentials: true,
-            pollInterval: "500ms", pollTimeout: "120s", valid: true, error: ""
+            pollInterval: "500ms", pollTimeout: "120s", readOnly: false, valid: true, error: ""
         )
     }
 

@@ -13,11 +13,12 @@ struct WireCLI {
     }
 
     /// The key goes over stdin, never argv, which `ps` exposes.
-    func initialize(redashURL: String, profile: String, apiKey: String) async throws -> InitResult {
-        try await runJSON(
-            ["init", "-json", "-config", configPath, "-url", redashURL, "-profile", profile],
-            stdin: Data(apiKey.utf8)
-        )
+    func initialize(redashURL: String, profile: String, apiKey: String, readOnly: Bool) async throws -> InitResult {
+        var arguments = ["init", "-json", "-config", configPath, "-url", redashURL, "-profile", profile]
+        if readOnly {
+            arguments.append("-read-only")
+        }
+        return try await runJSON(arguments, stdin: Data(apiKey.utf8))
     }
 
     /// `-exit-on-stdin-eof` stops a force-quit from leaving an orphan on the ports.
@@ -26,14 +27,22 @@ struct WireCLI {
     /// `-wait-for-redash` makes an unreachable Redash a state to show rather than
     /// a reason to exit, so launching at login before the VPN is up leaves a proxy
     /// that recovers by itself. The bare CLI still fails fast without it.
-    func serveArguments(profile: String) -> [String] {
-        [
+    ///
+    /// `-read-only` is the menu's lock. The daemon ORs it with the profile's own
+    /// `read_only`, so passing it for a profile the config already locks is
+    /// harmless, and leaving it off never unlocks one.
+    func serveArguments(profile: String, readOnly: Bool) -> [String] {
+        var arguments = [
             "-config", configPath,
             "-profile", profile,
             "-log-format=json",
             "-exit-on-stdin-eof",
             "-wait-for-redash",
         ]
+        if readOnly {
+            arguments.append("-read-only")
+        }
+        return arguments
     }
 
 

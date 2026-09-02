@@ -24,6 +24,7 @@ type initPayload struct {
 	RedashURL       string `json:"redash_url"`
 	PostgresEnabled bool   `json:"postgres_enabled"`
 	MySQLEnabled    bool   `json:"mysql_enabled"`
+	ReadOnly        bool   `json:"read_only"`
 	DataSources     int    `json:"data_sources"`
 	UserName        string `json:"user_name"`
 	UserEmail       string `json:"user_email"`
@@ -38,6 +39,7 @@ func cmdInit(args []string) int {
 	redashURL := fs.String("url", "", "Redash base URL (required)")
 	username := fs.String("username", config.DefaultUsername, "proxy login username")
 	password := fs.String("password", config.DefaultPassword, "proxy login password")
+	readOnly := fs.Bool("read-only", false, "write read_only: true, so the proxy refuses writes on this profile")
 	asJSON := fs.Bool("json", false, "emit machine-readable JSON on stdout")
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
@@ -77,7 +79,7 @@ func cmdInit(args []string) int {
 		hasPostgres, hasMySQL = true, true
 	}
 
-	fc := config.NewFileConfig(*profile, url, apiKey, *username, *password, hasPostgres, hasMySQL)
+	fc := config.NewFileConfig(*profile, url, apiKey, *username, *password, hasPostgres, hasMySQL, *readOnly)
 	if err := config.WriteConfig(path, fc); err != nil {
 		// A file that appeared since initTarget looked, e.g. a second setup
 		// racing this one.
@@ -87,7 +89,7 @@ func cmdInit(args []string) int {
 		return reportError(fail(codeIOError, err), *asJSON)
 	}
 
-	payload := buildInitPayload(path, *profile, url, session, sources, hasPostgres, hasMySQL)
+	payload := buildInitPayload(path, *profile, url, session, sources, hasPostgres, hasMySQL, *readOnly)
 
 	if *asJSON {
 		if cerr := emitJSON(payload); cerr != nil {
@@ -146,13 +148,14 @@ func configExistsError(path string) *cliError {
 		shortenHome(path))
 }
 
-func buildInitPayload(path, profile, url string, session *redash.SessionInfo, sources []redash.DataSource, hasPostgres, hasMySQL bool) initPayload {
+func buildInitPayload(path, profile, url string, session *redash.SessionInfo, sources []redash.DataSource, hasPostgres, hasMySQL, readOnly bool) initPayload {
 	payload := initPayload{
 		ConfigPath:      path,
 		Profile:         profile,
 		RedashURL:       url,
 		PostgresEnabled: hasPostgres,
 		MySQLEnabled:    hasMySQL,
+		ReadOnly:        readOnly,
 		DataSources:     len(sources),
 	}
 	if session != nil {
@@ -195,6 +198,9 @@ func printInit(p initPayload) {
 	}
 	fmt.Printf("data sources: %d\n", p.DataSources)
 	fmt.Printf("listeners:    %s\n", strings.Join(enabledListeners(p), ", "))
+	if p.ReadOnly {
+		fmt.Printf("mode:         read-only\n")
+	}
 }
 
 func enabledListeners(p initPayload) []string {

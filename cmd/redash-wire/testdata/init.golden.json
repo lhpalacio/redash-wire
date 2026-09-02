@@ -4,6 +4,7 @@
   "redash_url": "https://redash.example.com",
   "postgres_enabled": true,
   "mysql_enabled": false,
+  "read_only": true,
   "data_sources": 3,
   "user_name": "Ada Lovelace",
   "user_email": "ada@example.com",

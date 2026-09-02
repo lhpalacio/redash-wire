@@ -65,6 +65,7 @@ profiles:
     postgres_listen_addr: "127.0.0.1:25432"
     username: "prod-user"
     password: "prod-password"
+    read_only: true
   broken:
     redash_url: "https://redash.broken.example.com"
 `
@@ -221,14 +222,14 @@ func TestInitPayloadGolden(t *testing.T) {
 	session.ClientConfig.Version = "10.1.0"
 
 	got := buildInitPayload("/testdata/config.yaml", "prod", "https://redash.example.com",
-		session, testutil.SampleDataSources(), true, false)
+		session, testutil.SampleDataSources(), true, false, true)
 	assertGolden(t, "init.golden.json", got)
 }
 
 // A session that could not be fetched must not produce a partial payload with a
 // nil dereference; the fields simply stay empty.
 func TestInitPayloadWithoutSession(t *testing.T) {
-	got := buildInitPayload("/testdata/config.yaml", "prod", "https://redash.example.com", nil, nil, true, true)
+	got := buildInitPayload("/testdata/config.yaml", "prod", "https://redash.example.com", nil, nil, true, true, false)
 	if got.UserName != "" || got.RedashVersion != "" {
 		t.Errorf("expected empty session fields, got %+v", got)
 	}

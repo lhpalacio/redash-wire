@@ -30,6 +30,8 @@ final class ProxySupervisor: ObservableObject {
     /// the running proxy's ports and credentials can be read from. The config
     /// on disk may have been edited or renamed since.
     var activeProfile: Profile? { snapshot.activeProfile }
+    /// Whether the running process was launched read-only.
+    var activeReadOnly: Bool { snapshot.activeReadOnly }
     /// Reported by the running proxy on every health probe, and emptied whenever
     /// that proxy goes away. It belongs to the process: it comes from the same
     /// registry that resolves the database name you connect with, so a list left
@@ -86,8 +88,8 @@ final class ProxySupervisor: ObservableObject {
     }
 
 
-    func start(profile: Profile) async {
-        await enqueue { self.startNow(profile) }
+    func start(profile: Profile, readOnly: Bool = false) async {
+        await enqueue { self.startNow(profile, readOnly: readOnly) }
     }
 
     /// Returns once the exit has been observed, so a start that follows always
@@ -101,17 +103,21 @@ final class ProxySupervisor: ObservableObject {
     /// Pass `profile` to come back up on an edited copy. Restarting on the stale
     /// `activeProfile` keeps the old `enabledListenerCount`, so enabling a second
     /// listener would mark the proxy ready as soon as the first one binds.
-    func restart(profile: Profile? = nil) async {
+    ///
+    /// `readOnly` defaults to what the process was launched with, so a reload
+    /// that only re-reads the config keeps the menu's lock.
+    func restart(profile: Profile? = nil, readOnly: Bool? = nil) async {
         guard let target = profile ?? activeProfile else { return }
+        let lock = readOnly ?? activeReadOnly
         await enqueue {
             await self.stopNow()
-            self.startNow(target)
+            self.startNow(target, readOnly: lock)
         }
     }
 
     /// One profile at a time. Two would usually collide on the same ports.
-    func switchTo(profile: Profile) async {
-        await restart(profile: profile)
+    func switchTo(profile: Profile, readOnly: Bool = false) async {
+        await restart(profile: profile, readOnly: readOnly)
     }
 
     private func enqueue(_ command: @escaping @MainActor () async -> Void) async {
@@ -124,10 +130,10 @@ final class ProxySupervisor: ObservableObject {
         await task.value
     }
 
-    private func startNow(_ profile: Profile) {
+    private func startNow(_ profile: Profile, readOnly: Bool) {
         guard process == nil else { return }
-        tracker.start(profile)
-        spawn(profile)
+        tracker.start(profile, readOnly: readOnly)
+        spawn(profile, readOnly: readOnly)
     }
 
     private func stopNow() async {
@@ -178,7 +184,7 @@ final class ProxySupervisor: ObservableObject {
     }
 
 
-    private func spawn(_ profile: Profile) {
+    private func spawn(_ profile: Profile, readOnly: Bool) {
         stopRequested = false
         lineBuffer.removeAll()
         exitStatus = nil
@@ -189,7 +195,7 @@ final class ProxySupervisor: ObservableObject {
 
         let process = Process()
         process.executableURL = cli.binaryURL
-        process.arguments = cli.serveArguments(profile: profile.name)
+        process.arguments = cli.serveArguments(profile: profile.name, readOnly: readOnly)
 
         let stdin = Pipe()
         let stderr = Pipe()
@@ -287,12 +293,12 @@ final class ProxySupervisor: ObservableObject {
             waiter.resume()
         }
 
-        guard case .restart(let profile, let delay) = outcome else { return }
+        guard case .restart(let profile, let readOnly, let delay) = outcome else { return }
         restartTask = Task { [weak self] in
             try? await Task.sleep(for: delay)
             guard !Task.isCancelled, let self else { return }
-            self.tracker.launch(profile)
-            self.spawn(profile)
+            self.tracker.launch(profile, readOnly: readOnly)
+            self.spawn(profile, readOnly: readOnly)
         }
     }
 

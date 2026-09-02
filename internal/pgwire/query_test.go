@@ -294,7 +294,7 @@ func TestHandleLocalQuery(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf bytes.Buffer
 
-			if err := HandleLocalQuery(&buf, tt.sql, startupParams, sources, listenAddr); err != nil {
+			if err := HandleLocalQuery(&buf, tt.sql, LocalSession{StartupParams: startupParams, Sources: sources, ListenAddr: listenAddr}); err != nil {
 				t.Fatalf("HandleLocalQuery(%q): %v", tt.sql, err)
 			}
 
@@ -504,7 +504,7 @@ func TestHandleLocalQuery_ShowStripsTerminator(t *testing.T) {
 				t.Fatalf("IsLocalQuery(%q) = false", sql)
 			}
 			var buf bytes.Buffer
-			if err := HandleLocalQuery(&buf, sql, nil, nil, "127.0.0.1:15432"); err != nil {
+			if err := HandleLocalQuery(&buf, sql, LocalSession{StartupParams: nil, Sources: nil, ListenAddr: "127.0.0.1:15432"}); err != nil {
 				t.Fatal(err)
 			}
 			cols, rows := collectResult(t, &buf)
@@ -524,7 +524,7 @@ func TestHandleLocalQuery_SetWithNewline(t *testing.T) {
 		t.Fatalf("IsLocalQuery(%q) = false", sql)
 	}
 	var buf bytes.Buffer
-	if err := HandleLocalQuery(&buf, sql, nil, nil, "127.0.0.1:15432"); err != nil {
+	if err := HandleLocalQuery(&buf, sql, LocalSession{StartupParams: nil, Sources: nil, ListenAddr: "127.0.0.1:15432"}); err != nil {
 		t.Fatal(err)
 	}
 	msgs := receiveAll(t, newFrontend(&buf))
@@ -547,7 +547,7 @@ func TestHandleLocalQuery_PgDatabaseBeforeScalarShortcuts(t *testing.T) {
 	}
 	sql := "SELECT d.datname FROM pg_catalog.pg_database d WHERE has_database_privilege(current_user, d.datname, 'CONNECT') ORDER BY 1"
 	var buf bytes.Buffer
-	if err := HandleLocalQuery(&buf, sql, map[string]string{"user": "alice"}, sources, "127.0.0.1:15432"); err != nil {
+	if err := HandleLocalQuery(&buf, sql, LocalSession{StartupParams: map[string]string{"user": "alice"}, Sources: sources, ListenAddr: "127.0.0.1:15432"}); err != nil {
 		t.Fatal(err)
 	}
 	cols, rows := collectResult(t, &buf)
@@ -560,10 +560,41 @@ func TestHandleLocalQuery_PgDatabaseBeforeScalarShortcuts(t *testing.T) {
 
 	// The scalar shortcut still answers a bare function call.
 	buf.Reset()
-	if err := HandleLocalQuery(&buf, "SELECT current_user", map[string]string{"user": "alice"}, sources, "127.0.0.1:15432"); err != nil {
+	if err := HandleLocalQuery(&buf, "SELECT current_user", LocalSession{StartupParams: map[string]string{"user": "alice"}, Sources: sources, ListenAddr: "127.0.0.1:15432"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, rows := collectResult(t, &buf); len(rows) != 1 || rows[0][0] != "alice" {
 		t.Errorf("SELECT current_user rows = %v, want [[alice]]", rows)
+	}
+}
+
+// A read-only proxy must not answer SET with a silent OK when the SET asks for
+// the one thing it cannot grant; but it must keep answering every other SET,
+// and the plain read-only forms, so a client's usual session setup still works.
+func TestAsksForReadWrite(t *testing.T) {
+	tests := []struct {
+		sql  string
+		want bool
+	}{
+		{"SET transaction_read_only = off", true},
+		{"SET transaction_read_only TO off", true},
+		{"set session transaction_read_only = false", true},
+		{"SET default_transaction_read_only = 0", true},
+		{"SET default_transaction_read_only TO 'off'", true},
+		{"SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE", true},
+		{"BEGIN READ WRITE", true},
+		{"START TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE", true},
+		{"BEGIN", false},
+		{"BEGIN READ ONLY", false},
+		{"SET transaction_read_only = on", false},
+		{"SET default_transaction_read_only TO on", false},
+		{"SET search_path TO public", false},
+		{"SET application_name = 'read write'", false},
+		{"SELECT 1", false},
+	}
+	for _, tt := range tests {
+		if got := asksForReadWrite(normalize(tt.sql), tt.sql); got != tt.want {
+			t.Errorf("asksForReadWrite(%q) = %v, want %v", tt.sql, got, tt.want)
+		}
 	}
 }

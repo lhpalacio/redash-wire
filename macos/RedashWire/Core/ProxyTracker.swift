@@ -44,6 +44,10 @@ struct ProxyTracker: Equatable {
     struct Snapshot: Equatable {
         var state: State = .stopped
         var activeProfile: Profile?
+        /// Whether the process was launched read-only: the profile's own
+        /// setting or the menu's, whichever locked it. Kept with the profile
+        /// so a crash restart comes back up the same way.
+        var activeReadOnly = false
         var dataSources: [DataSource] = []
         var pendingRestart: PendingRestart?
     }
@@ -52,7 +56,7 @@ struct ProxyTracker: Equatable {
     enum Exit: Equatable {
         case stopped
         case failed
-        case restart(Profile, after: Duration)
+        case restart(Profile, readOnly: Bool, after: Duration)
     }
 
     /// Its length is also the attempt limit.
@@ -96,21 +100,23 @@ struct ProxyTracker: Equatable {
 
     var state: State { snapshot.state }
     var activeProfile: Profile? { snapshot.activeProfile }
+    var activeReadOnly: Bool { snapshot.activeReadOnly }
     var dataSources: [DataSource] { snapshot.dataSources }
     var pendingRestart: PendingRestart? { snapshot.pendingRestart }
 
 
     /// A manual start clears the budget, so a retry after three crashes is not
     /// born exhausted.
-    mutating func start(_ profile: Profile) {
+    mutating func start(_ profile: Profile, readOnly: Bool = false) {
         restartAttempts = 0
-        launch(profile)
+        launch(profile, readOnly: readOnly)
     }
 
     /// The process is being spawned for `profile`, whether by a start or by a
     /// scheduled restart.
-    mutating func launch(_ profile: Profile) {
+    mutating func launch(_ profile: Profile, readOnly: Bool = false) {
         snapshot.activeProfile = profile
+        snapshot.activeReadOnly = readOnly
         expectedListeners = profile.enabledListenerCount
         seenListeners = 0
         reachedReady = false
@@ -223,7 +229,7 @@ struct ProxyTracker: Equatable {
             attempt: restartAttempts,
             limit: Self.backoffDelays.count
         )
-        return .restart(profile, after: delay)
+        return .restart(profile, readOnly: snapshot.activeReadOnly, after: delay)
     }
 
     /// A requested stop has completed, or there was nothing running to stop.

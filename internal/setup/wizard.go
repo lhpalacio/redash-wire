@@ -20,6 +20,7 @@ type Result struct {
 	Password    string
 	HasPostgres bool
 	HasMySQL    bool
+	ReadOnly    bool
 }
 
 // RunWizard collects connection details interactively. initialProfile pre-fills
@@ -30,6 +31,7 @@ func RunWizard(initialProfile string) (*Result, error) {
 		profileName = initialProfile
 		redashURL   string
 		apiKey      string
+		readOnly    bool
 	)
 
 	form := huh.NewForm(
@@ -53,6 +55,13 @@ func RunWizard(initialProfile string) (*Result, error) {
 				EchoMode(huh.EchoModePassword).
 				Value(&apiKey).
 				Validate(validateNotEmpty("API Key")),
+
+			huh.NewConfirm().
+				Title("Read-only mode").
+				Description("Refuse INSERT, UPDATE, DELETE and schema changes, so only reads reach Redash. Good for a profile an AI agent will use.").
+				Affirmative("Yes").
+				Negative("No").
+				Value(&readOnly),
 		),
 	)
 
@@ -85,6 +94,7 @@ func RunWizard(initialProfile string) (*Result, error) {
 		Password:    config.DefaultPassword,
 		HasPostgres: hasPg,
 		HasMySQL:    hasMySQL,
+		ReadOnly:    readOnly,
 	}, nil
 }
 

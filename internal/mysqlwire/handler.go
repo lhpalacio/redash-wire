@@ -23,6 +23,7 @@ type handler struct {
 	registry     redash.SourceRegistry
 	gate         *health.Gate
 	conns        *connTable
+	readOnly     bool
 	dataSourceID int
 	dbName       string
 	logger       *slog.Logger
@@ -45,17 +46,23 @@ type handler struct {
 
 var _ server.Handler = (*handler)(nil)
 
-func newHandler(ctx context.Context, logger *slog.Logger, redashClient redash.RedashAPI, registry redash.SourceRegistry, gate *health.Gate, conns *connTable) *handler {
+func newHandler(ctx context.Context, logger *slog.Logger, redashClient redash.RedashAPI, registry redash.SourceRegistry, gate *health.Gate, conns *connTable, readOnly bool) *handler {
 	return &handler{
 		ctx:          ctx,
 		redashClient: redashClient,
 		registry:     registry,
 		gate:         gate,
 		conns:        conns,
+		readOnly:     readOnly,
 		logger:       logger,
 		schemaCache:  redash.NewSchemaCache(),
 	}
 }
+
+// readOnlyMessage is MySQL's own wording for error 1290 under --read-only, with
+// the proxy's reason appended so a client (or an agent driving one) learns the
+// mode is the proxy's and not something the session can switch off.
+const readOnlyMessage = "The MySQL server is running with the --read-only option so it cannot execute this statement (redash-wire is in read-only mode for this profile; only reads reach Redash. Set read_only: false in the config to allow writes.)"
 
 // login is the post-authentication half of the handshake; go-mysql runs it
 // after the password check and before the OK packet, and sends its error to
@@ -155,10 +162,11 @@ func (h *handler) HandleQuery(query string) (*mysql.Result, error) {
 
 	if isLocalQuery(query) {
 		return handleLocalQuery(query, localSession{
-			dbName:  h.dbName,
-			connID:  h.connID,
-			sources: redash.FilterByType(h.registry.All(), redash.IsMySQLCompatible),
-			schema:  h.getSchema(),
+			dbName:   h.dbName,
+			connID:   h.connID,
+			sources:  redash.FilterByType(h.registry.All(), redash.IsMySQLCompatible),
+			schema:   h.getSchema(),
+			readOnly: h.readOnly,
 		})
 	}
 
@@ -167,6 +175,16 @@ func (h *handler) HandleQuery(query string) (*mysql.Result, error) {
 			mysql.ER_NO_DB_ERROR,
 			"No database selected; use USE <database> (SHOW DATABASES to list available data sources)",
 		)
+	}
+
+	// Last before the call to Redash, so the local answers above are untouched
+	// and nothing that would write ever leaves the proxy. The refusal is the one
+	// a MySQL server started with --read-only gives, code included.
+	if h.readOnly {
+		if verb := sqltext.MySQL.WriteVerb(query); verb != "" {
+			h.logger.Info("refused write in read-only mode", "verb", verb, "data_source_id", h.dataSourceID)
+			return nil, mysql.NewError(mysql.ER_OPTION_PREVENTS_STATEMENT, readOnlyMessage)
+		}
 	}
 
 	query = h.stripDBQualifier(query)

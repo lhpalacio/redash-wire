@@ -295,3 +295,160 @@ func ContainsToken(s, tok string) bool {
 		from = idx + 1
 	}
 }
+
+// readLeads are the statement keywords that only read. EXPLAIN is handled
+// separately because what it explains decides.
+var readLeads = map[string]bool{
+	"select": true, "with": true, "values": true, "table": true,
+	"show": true, "describe": true, "desc": true,
+}
+
+// writeTokens are the keywords a read statement may legally carry deeper inside
+// and still write: a data-modifying CTE (WITH d AS (DELETE ... RETURNING *)
+// SELECT ...), a SELECT ... INTO that creates a table or a file, or a SELECT ...
+// FOR UPDATE that takes row locks, which a read-only PostgreSQL transaction
+// refuses too. DDL cannot nest inside a read, so it is caught by the lead keyword
+// alone; it is not in this list, so a column called "lock" or "copy" stays legal.
+var writeTokens = [...]string{"insert", "update", "delete", "merge", "into"}
+
+// explainOptions are the words that may sit between EXPLAIN and the statement it
+// explains, in either dialect, plus the values FORMAT takes.
+var explainOptions = map[string]bool{
+	"analyze": true, "analyse": true, "verbose": true, "costs": true, "settings": true,
+	"buffers": true, "wal": true, "timing": true, "summary": true, "generic_plan": true,
+	"format": true, "extended": true, "partitions": true,
+	"json": true, "xml": true, "yaml": true, "text": true, "tree": true, "traditional": true,
+	"on": true, "off": true, "true": true, "false": true,
+}
+
+// WriteVerb reports the keyword that makes sql something other than a read,
+// upper-cased for an error message, or "" when the statement only reads. It is
+// an allowlist: the statement must open with SELECT, WITH, VALUES, TABLE, SHOW,
+// DESCRIBE or EXPLAIN (whose own statement is then checked), and its code, with
+// literals and comments blanked out, must not carry INSERT, UPDATE, DELETE, MERGE
+// or INTO as a statement keyword. A keyword followed by "(" is a function call
+// such as REPLACE(...) or INSERT(...), not a statement, and is left alone.
+//
+// Side effects hidden in function calls (setval, pg_terminate_backend, ...) are
+// beyond text matching and are not attempted.
+func (d Dialect) WriteVerb(sql string) string {
+	body := strings.ToLower(strings.TrimSpace(d.Redact(sql)))
+	body = strings.TrimRight(body, "; \t\r\n")
+
+	explained := false
+	for {
+		lead, rest := leadWord(body)
+		if lead != "explain" {
+			break
+		}
+		explained = true
+		body = d.stripExplainOptions(rest)
+	}
+
+	lead, _ := leadWord(body)
+	switch {
+	case lead == "":
+		return ""
+	case readLeads[lead]:
+	case explained && d == MySQL && !isStatementKeyword(lead):
+		// EXPLAIN <table> is DESCRIBE on MySQL, and EXPLAIN FOR CONNECTION <id>
+		// reads another session's plan. Neither writes.
+		return ""
+	default:
+		return strings.ToUpper(lead)
+	}
+
+	for _, tok := range writeTokens {
+		if hasStatementToken(body, tok) {
+			return strings.ToUpper(tok)
+		}
+	}
+	return ""
+}
+
+// leadWord returns the first keyword of s, skipping whitespace and opening
+// parentheses so "(SELECT 1) UNION (SELECT 2)" leads with SELECT, and the text
+// after it.
+func leadWord(s string) (lead, rest string) {
+	i := 0
+	for i < len(s) && (s[i] == '(' || s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n') {
+		i++
+	}
+	start := i
+	for i < len(s) && isIdentByte(s[i]) {
+		i++
+	}
+	return s[start:i], s[i:]
+}
+
+// stripExplainOptions drops the option words, a parenthesised option list, and
+// FORMAT=value from the front of what follows EXPLAIN, leaving the statement.
+func (d Dialect) stripExplainOptions(rest string) string {
+	for {
+		rest = strings.TrimLeft(rest, " \t\r\n")
+		if strings.HasPrefix(rest, "(") {
+			if end := strings.IndexByte(rest, ')'); end >= 0 {
+				rest = rest[end+1:]
+				continue
+			}
+			return rest
+		}
+		if strings.HasPrefix(rest, "=") {
+			rest = rest[1:]
+			continue
+		}
+		word, after := leadWord(rest)
+		if word == "" || !explainOptions[word] {
+			return rest
+		}
+		rest = after
+	}
+}
+
+// isStatementKeyword reports whether w opens a statement in either dialect, so
+// an unknown word after EXPLAIN on MySQL can be taken for a table name.
+func isStatementKeyword(w string) bool {
+	switch w {
+	case "select", "with", "values", "table", "show", "describe", "desc", "explain",
+		"insert", "update", "delete", "merge", "replace", "create", "drop", "alter",
+		"truncate", "grant", "revoke", "call", "do", "copy", "lock", "unlock", "vacuum",
+		"analyze", "analyse", "refresh", "reindex", "load", "rename", "set", "begin",
+		"start", "commit", "rollback", "savepoint", "release", "prepare", "execute",
+		"deallocate", "declare", "fetch", "close", "handler", "import", "install",
+		"flush", "reset", "purge", "kill", "use", "checksum", "check", "optimize",
+		"repair", "cluster", "comment", "security", "listen", "notify", "unlisten",
+		"discard", "move", "checkpoint", "abort", "end":
+		return true
+	}
+	return false
+}
+
+// hasStatementToken reports whether tok appears in s as a whole word that is not
+// immediately followed by "(", which would make it a function call rather than a
+// statement keyword. s is expected lowercased and redacted.
+func hasStatementToken(s, tok string) bool {
+	from := 0
+	for {
+		idx := strings.Index(s[from:], tok)
+		if idx < 0 {
+			return false
+		}
+		idx += from
+		end := idx + len(tok)
+		from = idx + 1
+		if idx > 0 && isIdentByte(s[idx-1]) {
+			continue
+		}
+		if end < len(s) && isIdentByte(s[end]) {
+			continue
+		}
+		next := end
+		for next < len(s) && (s[next] == ' ' || s[next] == '\t' || s[next] == '\r' || s[next] == '\n') {
+			next++
+		}
+		if next < len(s) && s[next] == '(' {
+			continue
+		}
+		return true
+	}
+}

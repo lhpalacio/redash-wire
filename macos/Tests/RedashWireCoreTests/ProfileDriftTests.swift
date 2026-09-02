@@ -10,7 +10,7 @@ final class ProfileDriftTests: XCTestCase {
             name: name, redashURL: "https://redash.example.com", apiKeySet: true,
             postgresListenAddr: postgres, mysqlListenAddr: "",
             username: "redash-wire", password: password, defaultCredentials: false,
-            pollInterval: "500ms", pollTimeout: "120s", valid: true, error: ""
+            pollInterval: "500ms", pollTimeout: "120s", readOnly: false, valid: true, error: ""
         )
     }
 

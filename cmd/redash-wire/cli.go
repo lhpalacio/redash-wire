@@ -116,6 +116,7 @@ Serve flags:
   -profile <name>   profile to load
   -debug            enable debug logging
   -wait-for-redash  bind and wait when Redash is unreachable, instead of exiting
+  -read-only        refuse writes for this run, whatever the profile says
   -version          print version and exit
 
 Run "redash-wire <command> -h" for a command's flags.

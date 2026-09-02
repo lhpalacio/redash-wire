@@ -34,6 +34,8 @@ type profilePayload struct {
 	DefaultCredentials bool   `json:"default_credentials"`
 	PollInterval       string `json:"poll_interval"`
 	PollTimeout        string `json:"poll_timeout"`
+	// The resolved value: top-level read_only unless the profile overrides it.
+	ReadOnly bool `json:"read_only"`
 	// An invalid profile is still listed with its values, so a caller can show
 	// what is wrong.
 	Valid bool   `json:"valid"`
@@ -103,6 +105,7 @@ func buildConfigPayload(res config.ResolveResult, source string, sum *config.Sum
 			entry.DefaultCredentials = p.Config.UsesDefaultCredentials()
 			entry.PollInterval = p.Config.PollInterval
 			entry.PollTimeout = p.Config.PollTimeout
+			entry.ReadOnly = p.Config.IsReadOnly()
 			if showSecrets {
 				key := p.Config.APIKey
 				entry.APIKey = &key
@@ -133,6 +136,7 @@ func printConfig(w io.Writer, p configPayload) {
 			fmt.Fprintf(w, "               (built-in defaults)\n")
 		}
 		fmt.Fprintf(w, "  poll:        every %s, timeout %s\n", prof.PollInterval, prof.PollTimeout)
+		fmt.Fprintf(w, "  read only:   %s\n", boolLabel(prof.ReadOnly, "yes", "no"))
 		if !prof.Valid {
 			// Part of the report, so it goes where the report goes.
 			fmt.Fprintf(w, "  invalid:     %s\n", prof.Error)

@@ -33,6 +33,7 @@ type Server struct {
 	password     string
 	mysqlServer  *server.Server
 	gate         *health.Gate
+	readOnly     bool
 	conns        *connTable
 	connSeq      atomic.Int64
 }
@@ -45,6 +46,12 @@ type ServerOption func(*Server)
 // tests want.
 func WithGate(g *health.Gate) ServerOption {
 	return func(s *Server) { s.gate = g }
+}
+
+// WithReadOnly makes every session refuse statements that are not reads before
+// they reach Redash, and report read_only as on to clients that ask.
+func WithReadOnly(on bool) ServerOption {
+	return func(s *Server) { s.readOnly = on }
 }
 
 func NewServer(listenAddr string, logger *slog.Logger, redashClient redash.RedashAPI, registry redash.SourceRegistry, username, password string, opts ...ServerOption) *Server {
@@ -150,7 +157,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	logger := s.logger.With("remote_addr", conn.RemoteAddr().String(), "session_id", s.connSeq.Add(1))
 
 	// Use the per-connection context so server shutdown cancels in-flight Redash polling.
-	h := newHandler(connCtx, logger, s.redashClient, s.registry, s.gate, s.conns)
+	h := newHandler(connCtx, logger, s.redashClient, s.registry, s.gate, s.conns, s.readOnly)
 
 	// The gate and the database named in the handshake are only checked once the
 	// password has been verified (see handler.login), so an unauthenticated
