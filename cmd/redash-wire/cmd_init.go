@@ -1,10 +1,13 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/lhpalacio/redash-wire/internal/config"
@@ -43,6 +46,10 @@ func cmdInit(args []string) int {
 	if *redashURL == "" {
 		return reportError(failf(codeUsage, "-url is required"), *asJSON)
 	}
+	url, cerr := initURL(*redashURL)
+	if cerr != nil {
+		return reportError(cerr, *asJSON)
+	}
 	if *profile == "" {
 		*profile = "default"
 	}
@@ -52,18 +59,11 @@ func cmdInit(args []string) int {
 		return reportError(cerr, *asJSON)
 	}
 
-	res, _, cerr := resolveConfigPath(*configPath)
+	path, cerr := initTarget(*configPath)
 	if cerr != nil {
 		return reportError(cerr, *asJSON)
 	}
-	// Never overwrite: the existing file holds credentials.
-	if res.Found {
-		return reportError(failf(codeConfigExists,
-			"config already exists at %s; edit it directly, or pass -config to write elsewhere",
-			shortenHome(res.Path)), *asJSON)
-	}
 
-	url := strings.TrimRight(*redashURL, "/")
 	session, sources, err := setup.ValidateConnection(url, apiKey)
 	if err != nil {
 		return reportError(classifyAPIError(err), *asJSON)
@@ -78,11 +78,16 @@ func cmdInit(args []string) int {
 	}
 
 	fc := config.NewFileConfig(*profile, url, apiKey, *username, *password, hasPostgres, hasMySQL)
-	if err := config.WriteConfig(res.Path, fc); err != nil {
+	if err := config.WriteConfig(path, fc); err != nil {
+		// A file that appeared since initTarget looked, e.g. a second setup
+		// racing this one.
+		if errors.Is(err, config.ErrExists) {
+			return reportError(configExistsError(path), *asJSON)
+		}
 		return reportError(fail(codeIOError, err), *asJSON)
 	}
 
-	payload := buildInitPayload(res.Path, *profile, url, session, sources, hasPostgres, hasMySQL)
+	payload := buildInitPayload(path, *profile, url, session, sources, hasPostgres, hasMySQL)
 
 	if *asJSON {
 		if cerr := emitJSON(payload); cerr != nil {
@@ -93,6 +98,52 @@ func cmdInit(args []string) int {
 
 	printInit(payload)
 	return exitOK
+}
+
+// initURL normalizes -url the way the wizard does and rejects what the wizard
+// would, so a bare host is a usage mistake rather than a failed connection.
+func initURL(raw string) (string, *cliError) {
+	url := strings.TrimRight(raw, "/")
+	if err := setup.ValidateURL(url); err != nil {
+		return "", failf(codeUsage, "invalid -url %q: %w", raw, err)
+	}
+	return url, nil
+}
+
+// initTarget picks the file to write. Without -config that is the documented
+// default, never ./config.yaml: an unrelated file in the working directory must
+// not block a first setup. The path has to be free, since an existing file
+// holds credentials.
+func initTarget(flagPath string) (string, *cliError) {
+	path := flagPath
+	if path == "" {
+		var err error
+		if path, err = config.DefaultConfigPath(); err != nil {
+			return "", fail(codeIOError, err)
+		}
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fail(codeIOError, err)
+	}
+
+	info, err := os.Stat(abs)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return abs, nil
+	case err != nil:
+		return "", fail(codeIOError, err)
+	case info.IsDir():
+		return "", failf(codeIOError, "%s is a directory, not a config file", shortenHome(abs))
+	default:
+		return "", configExistsError(abs)
+	}
+}
+
+func configExistsError(path string) *cliError {
+	return failf(codeConfigExists,
+		"config already exists at %s; edit it directly, or pass -config to write elsewhere",
+		shortenHome(path))
 }
 
 func buildInitPayload(path, profile, url string, session *redash.SessionInfo, sources []redash.DataSource, hasPostgres, hasMySQL bool) initPayload {

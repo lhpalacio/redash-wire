@@ -1,9 +1,12 @@
 package config
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -22,6 +25,94 @@ func TestWriteConfig_CreatesDirectoriesAndFile(t *testing.T) {
 	}
 	if len(data) == 0 {
 		t.Error("config file is empty")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("config file mode = %o, want 0600", perm)
+	}
+}
+
+// The file holds credentials, so a second setup must leave an existing one
+// untouched and nothing behind from the attempt.
+func TestWriteConfig_RefusesExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("keep: me\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := WriteConfig(path, NewFileConfig("p", "http://redash.example.com", "new-key", "u", "pw", true, false))
+	if !errors.Is(err, ErrExists) {
+		t.Fatalf("WriteConfig over an existing file: got %v, want ErrExists", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "keep: me\n" {
+		t.Errorf("existing config was replaced:\n%s", data)
+	}
+	assertOnlyConfig(t, dir)
+}
+
+// Two setups racing for the same path, each having seen it free: exactly one
+// may win, and the file must hold that one's key.
+func TestWriteConfig_ConcurrentWritersOnlyOneWins(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	const writers = 8
+	errs := make([]error, writers)
+	var wg sync.WaitGroup
+	for i := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fc := NewFileConfig("p", "http://redash.example.com", fmt.Sprintf("key-%d", i), "u", "pw", true, false)
+			errs[i] = WriteConfig(path, fc)
+		}()
+	}
+	wg.Wait()
+
+	winner := -1
+	for i, err := range errs {
+		switch {
+		case err == nil && winner == -1:
+			winner = i
+		case err == nil:
+			t.Errorf("writers %d and %d both succeeded", winner, i)
+		case !errors.Is(err, ErrExists):
+			t.Errorf("writer %d: got %v, want ErrExists", i, err)
+		}
+	}
+	if winner == -1 {
+		t.Fatal("no writer succeeded")
+	}
+
+	cfg, err := Load(path, "p")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := fmt.Sprintf("key-%d", winner); cfg.APIKey != want {
+		t.Errorf("APIKey = %q, want the winner's %q", cfg.APIKey, want)
+	}
+	assertOnlyConfig(t, dir)
+}
+
+func assertOnlyConfig(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "config.yaml" {
+			t.Errorf("left behind: %s", e.Name())
+		}
 	}
 }
 

@@ -146,3 +146,22 @@ func TestReadAPIKeyFromReadError(t *testing.T) {
 		t.Errorf("code = %q, want %q", cerr.Code, codeIOError)
 	}
 }
+
+// Only a path inside the home directory gets the ~: a sibling that merely
+// shares the prefix, like /Users/x/homebrew next to a home of /Users/x/home,
+// does not.
+func TestShortenHome(t *testing.T) {
+	t.Setenv("HOME", "/Users/x/home")
+	tests := map[string]string{
+		"/Users/x/home/.redash-wire/config.yaml": "~/.redash-wire/config.yaml",
+		"/Users/x/home":                          "~",
+		"/Users/x/homebrew/config.yaml":          "/Users/x/homebrew/config.yaml",
+		"/Users/x/config.yaml":                   "/Users/x/config.yaml",
+		"/opt/config.yaml":                       "/opt/config.yaml",
+	}
+	for path, want := range tests {
+		if got := shortenHome(path); got != want {
+			t.Errorf("shortenHome(%q) = %q, want %q", path, got, want)
+		}
+	}
+}

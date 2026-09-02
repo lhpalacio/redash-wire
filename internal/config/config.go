@@ -119,6 +119,14 @@ func LoadAll(path string) (*Summary, error) {
 	if len(fc.Profiles) == 0 {
 		return nil, fmt.Errorf("no profiles defined in config file")
 	}
+	// Load fails on this file without -profile, so a report that called every
+	// profile valid would hide the reason.
+	if fc.DefaultProfile != "" {
+		if _, ok := fc.Profiles[fc.DefaultProfile]; !ok {
+			return nil, fmt.Errorf("default_profile %q not found (available: %s)",
+				fc.DefaultProfile, strings.Join(profileNames(fc.Profiles), ", "))
+		}
+	}
 
 	sum := &Summary{DefaultProfile: fc.DefaultProfile}
 	for _, name := range profileNames(fc.Profiles) {

@@ -104,16 +104,18 @@ redash-wire help
   `wire`. An empty `wire` means the proxy won't serve that source.
 - `init` is the setup wizard driven by flags. It reads the API key from stdin
   (`pbpaste | redash-wire init -url https://redash.example.com`), so the key
-  stays out of `ps` and shell history. It won't overwrite an existing config.
+  stays out of `ps` and shell history. It writes `~/.redash-wire/config.yaml`
+  unless `-config` says otherwise, and won't overwrite an existing file.
 
 Results go to stdout and logs to stderr. Exit 0 on success, 2 for a usage
 mistake, 1 for everything else. With `-json` an error prints as
 `{"error":{"code":"...","message":"..."}}`. The codes are stable, so branch on
 the code, not the message:
 
-- `usage`: a required flag is missing, or the API key wasn't piped in.
+- `usage`: a required flag is missing or malformed, or the API key wasn't piped in.
 - `not_configured`: no config file at any of the lookup paths.
-- `invalid_config`: bad YAML, an unknown key, or a profile that fails validation.
+- `invalid_config`: bad YAML, an unknown key, a `default_profile` that doesn't
+  exist, or a profile that fails validation.
 - `profile_not_found`: `-profile` names a profile the config doesn't have.
 - `connection_failed`: Redash didn't answer, or answered with an unrelated
   error such as a 500.
