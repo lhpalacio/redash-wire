@@ -8,6 +8,7 @@ const (
 	OidJSON        uint32 = 114
 	OidFloat8      uint32 = 701
 	OidDate        uint32 = 1082
+	OidTimestamp   uint32 = 1114
 	OidTimestampTZ uint32 = 1184
 	OidJSONB       uint32 = 3802
 )
@@ -23,7 +24,9 @@ func RedashTypeToPgOID(redashType string) uint32 {
 	case "boolean":
 		return OidBool
 	case "datetime":
-		return OidTimestampTZ
+		// Naive until the values prove otherwise: BuildRowDescription promotes a
+		// column whose values all carry a zone to timestamptz.
+		return OidTimestamp
 	case "date":
 		return OidDate
 	case "json", "jsonb":

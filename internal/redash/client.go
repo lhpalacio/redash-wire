@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -121,12 +122,21 @@ func (r *schemaTableRaw) toSchemaTable() SchemaTable {
 }
 
 type Client struct {
-	httpClient     *http.Client
-	baseURL        string
-	apiKey         string
-	pollInterval   time.Duration
-	pollTimeout    time.Duration
-	maxResultBytes int64
+	httpClient *http.Client
+	// resultHTTPClient downloads query-result bodies. It deliberately has no
+	// whole-request Timeout: a large result can take longer to stream than the
+	// 30s that bounds submission and polling, and failing the download after the
+	// job already succeeded both wastes the work and (because the error looks like
+	// an infrastructure failure) triggers a self-inflicted health probe. Connect
+	// and response-header phases are still bounded, by the transport below; the
+	// body read is bounded by pollTimeout (via the request context) and by
+	// maxResultBytes.
+	resultHTTPClient *http.Client
+	baseURL          string
+	apiKey           string
+	pollInterval     time.Duration
+	pollTimeout      time.Duration
+	maxResultBytes   int64
 }
 
 type ClientOption func(*Client)
@@ -149,7 +159,22 @@ func WithHTTPClient(hc *http.Client) ClientOption {
 
 func NewClient(baseURL, apiKey string, opts ...ClientOption) *Client {
 	c := &Client{
-		httpClient:     &http.Client{Timeout: 30 * time.Second},
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+		resultHTTPClient: &http.Client{
+			// No whole-request Timeout; the body read is bounded per-request by
+			// pollTimeout instead. These transport timeouts still keep a stalled
+			// connect or a server that never sends headers from hanging forever.
+			Transport: &http.Transport{
+				Proxy:                 http.ProxyFromEnvironment,
+				DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          100,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+				ExpectContinueTimeout: time.Second,
+			},
+		},
 		baseURL:        baseURL,
 		apiKey:         apiKey,
 		pollInterval:   500 * time.Millisecond,
@@ -240,11 +265,26 @@ func (c *Client) GetSchema(ctx context.Context, dataSourceID int) ([]SchemaTable
 		return nil, fmt.Errorf("schema request failed (status %d)", resp.StatusCode)
 	}
 
+	// Redash reports a schema-fetch failure (a dead data source, a permissions
+	// problem) as HTTP 200 carrying an "error" key and no "schema". Decoding only
+	// "schema" turned that into an empty-but-successful schema, which the cache
+	// then remembered as ready for the whole session. Treat a response that
+	// carries an error, or that omits "schema" entirely, as a failure so the
+	// caller's retry policy applies and nothing empty is cached.
 	var envelope struct {
 		Schema []schemaTableRaw `json:"schema"`
+		Error  json.RawMessage  `json:"error"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
 		return nil, fmt.Errorf("decoding schema: %w", err)
+	}
+	if len(envelope.Error) > 0 && string(envelope.Error) != "null" {
+		return nil, fmt.Errorf("schema request failed: %s", strings.TrimSpace(string(envelope.Error)))
+	}
+	// A present-but-empty schema ("schema": []) is a valid answer for a source
+	// with no tables; an absent key (nil) is not.
+	if envelope.Schema == nil {
+		return nil, fmt.Errorf("schema response contained no schema")
 	}
 
 	tables := make([]SchemaTable, len(envelope.Schema))
@@ -371,6 +411,10 @@ func (c *Client) pollJob(ctx context.Context, jobID string) (*QueryResult, error
 				}
 				consecutiveErrors++
 				if consecutiveErrors >= maxConsecutivePollErrors {
+					// Giving up on our side does not stop the job on Redash's, so
+					// cancel it best-effort rather than leaving the warehouse query
+					// running unattended.
+					c.cancelJob(jobID)
 					return nil, fmt.Errorf("job polling failed %d times in a row: %w", consecutiveErrors, err)
 				}
 				continue
@@ -445,13 +489,19 @@ func (c *Client) getJob(ctx context.Context, jobID string) (*jobInfo, error) {
 }
 
 func (c *Client) getQueryResult(ctx context.Context, resultID int) (*QueryResult, error) {
+	// Bound the whole download by pollTimeout rather than the client-wide 30s: the
+	// job has already succeeded, so a slow but progressing transfer of a large
+	// result should be given the poll budget instead of being cut off at 30s.
+	ctx, cancel := context.WithTimeout(ctx, c.pollTimeout)
+	defer cancel()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/api/query_results/%d", c.baseURL, resultID), nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating result request: %w", err)
 	}
 	req.Header.Set("Authorization", "Key "+c.apiKey)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.resultHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("getting query result: %w", err)
 	}

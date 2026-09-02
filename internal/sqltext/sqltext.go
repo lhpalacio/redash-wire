@@ -8,6 +8,23 @@ package sqltext
 
 import "strings"
 
+// Dialect selects the lexical rules for string literals, quoted identifiers, and
+// comments. The two differ in ways that move where a statement ends:
+//
+//   - Postgres: a backslash is an ordinary byte inside '...' (the proxy advertises
+//     standard_conforming_strings=on) except in an E'...' string, block comments
+//     nest, $tag$...$tag$ is a string, and "..." quotes an identifier. There are
+//     no # comments and no backtick identifiers.
+//   - MySQL: a backslash escapes the next byte inside '...' and "..." (the default
+//     sql_mode, without NO_BACKSLASH_ESCAPES), # starts a line comment, block
+//     comments do not nest, `...` quotes an identifier, and $ is an identifier byte.
+type Dialect int
+
+const (
+	Postgres Dialect = iota
+	MySQL
+)
+
 func isIdentByte(b byte) bool {
 	return b == '_' ||
 		(b >= 'a' && b <= 'z') ||
@@ -18,49 +35,55 @@ func isIdentByte(b byte) bool {
 // codeMask returns a slice the same length as sql where mask[i] is true only when
 // byte i is "code": outside any string literal, quoted identifier, dollar-quoted
 // string, or comment. Used for classification and statement splitting.
-func codeMask(sql string) []bool {
-	return scanMask(sql, true)
+func (d Dialect) codeMask(sql string) []bool {
+	return d.scanMask(sql, true)
 }
 
-// scanMask builds the code mask. When protectIdentifierQuotes is true, double-quote
-// and backtick identifier regions are treated as non-code (suitable for keyword
-// classification and statement splitting). When false, only single-quoted strings,
-// dollar-quoted strings, and comments are non-code, so identifier qualifiers, which
-// live inside `...`/"...", remain replaceable.
-func scanMask(sql string, protectIdentifierQuotes bool) []bool {
+// scanMask builds the code mask. When protectIdentifierQuotes is true, quoted
+// identifier regions ("..." and, on MySQL, `...`) are treated as non-code
+// (suitable for keyword classification and statement splitting). When false,
+// only string literals, dollar-quoted strings, and comments are non-code, so
+// identifier qualifiers, which live inside `...`/"...", remain replaceable.
+func (d Dialect) scanMask(sql string, protectIdentifierQuotes bool) []bool {
 	n := len(sql)
 	mask := make([]bool, n)
 	i := 0
 	for i < n {
 		c := sql[i]
 
-		if c == '-' && i+1 < n && sql[i+1] == '-' {
+		// Line comment: -- to end of line; MySQL also has #.
+		if (c == '-' && i+1 < n && sql[i+1] == '-') || (d == MySQL && c == '#') {
 			for i < n && sql[i] != '\n' {
 				i++
 			}
 			continue
 		}
 
-		// Block comment: /* ... */ (not nested, matching SQL standard)
+		// Block comment. Postgres nests them; MySQL ends at the first */.
 		if c == '/' && i+1 < n && sql[i+1] == '*' {
 			i += 2
-			for i < n {
-				if sql[i] == '*' && i+1 < n && sql[i+1] == '/' {
+			depth := 1
+			for i < n && depth > 0 {
+				switch {
+				case sql[i] == '*' && i+1 < n && sql[i+1] == '/':
+					depth--
 					i += 2
-					break
+				case d == Postgres && sql[i] == '/' && i+1 < n && sql[i+1] == '*':
+					depth++
+					i += 2
+				default:
+					i++
 				}
-				i++
 			}
 			continue
 		}
 
-		if c == '\'' || (protectIdentifierQuotes && (c == '"' || c == '`')) {
+		if c == '\'' || (protectIdentifierQuotes && (c == '"' || (d == MySQL && c == '`'))) {
 			quote := c
+			backslashEscapes := d.backslashEscapes(sql, i)
 			i++
 			for i < n {
-				// MySQL (default, non-ANSI_QUOTES sql_mode) processes backslash escapes
-				// inside both '...' and "..." string literals; backtick identifiers do not.
-				if (quote == '\'' || quote == '"') && sql[i] == '\\' && i+1 < n {
+				if backslashEscapes && sql[i] == '\\' && i+1 < n {
 					i += 2
 					continue
 				}
@@ -78,7 +101,7 @@ func scanMask(sql string, protectIdentifierQuotes bool) []bool {
 		}
 
 		// Dollar-quoted string (PostgreSQL): $tag$ ... $tag$
-		if c == '$' {
+		if d == Postgres && c == '$' {
 			j := i + 1
 			for j < n && isIdentByte(sql[j]) {
 				j++
@@ -106,12 +129,31 @@ func scanMask(sql string, protectIdentifierQuotes bool) []bool {
 	return mask
 }
 
+// backslashEscapes reports whether a backslash escapes the next byte inside the
+// quoted region opening at sql[at]. MySQL: in '...' and "..." but not `...`.
+// Postgres: only in an E'...' escape string, where the E must not be the tail of
+// a longer identifier (so "table'..." or "e2'..." is not one).
+func (d Dialect) backslashEscapes(sql string, at int) bool {
+	quote := sql[at]
+	if d == MySQL {
+		return quote != '`'
+	}
+	if quote != '\'' || at == 0 {
+		return false
+	}
+	prev := sql[at-1]
+	if prev != 'E' && prev != 'e' {
+		return false
+	}
+	return at < 2 || !isIdentByte(sql[at-2])
+}
+
 // Statements splits sql into individual statements on top-level semicolons,
 // ignoring semicolons inside quotes, dollar-quoting, and comments. Segments that
 // carry no actual code (only whitespace and/or comments) are dropped, so a
 // trailing ';' or a trailing comment does not count as another statement.
-func Statements(sql string) []string {
-	mask := codeMask(sql)
+func (d Dialect) Statements(sql string) []string {
+	mask := d.codeMask(sql)
 	var stmts []string
 	start := 0
 	flush := func(end int) {
@@ -143,16 +185,16 @@ func segmentHasCode(sql string, mask []bool, start, end int) bool {
 }
 
 // IsMultiStatement reports whether sql contains more than one non-empty statement.
-func IsMultiStatement(sql string) bool {
-	return len(Statements(sql)) > 1
+func (d Dialect) IsMultiStatement(sql string) bool {
+	return len(d.Statements(sql)) > 1
 }
 
 // Redact replaces the contents of string literals, quoted identifiers,
 // dollar-quoted strings, and comments with spaces, leaving code bytes intact.
 // Length and line structure are preserved. Use it before keyword/identifier
 // matching so a match cannot fire inside a literal or comment.
-func Redact(sql string) string {
-	mask := codeMask(sql)
+func (d Dialect) Redact(sql string) string {
+	mask := d.codeMask(sql)
 	b := make([]byte, len(sql))
 	for i := 0; i < len(sql); i++ {
 		if mask[i] {
@@ -167,16 +209,15 @@ func Redact(sql string) string {
 }
 
 // ReplaceOutsideStrings replaces every occurrence of old with replacement, but only
-// where the match lies entirely outside single-quoted string literals, dollar-quoted
-// strings, and comments. Backtick/double-quoted identifier regions ARE eligible,
-// which is where a database qualifier like `db`. or "db". appears, so callers can
-// strip such a qualifier without mutating text inside an actual string value.
-// old must be non-empty.
-func ReplaceOutsideStrings(sql, old, replacement string) string {
+// where the match lies entirely outside string literals, dollar-quoted strings,
+// and comments. Quoted identifier regions ARE eligible, which is where a database
+// qualifier like `db`. or "db". appears, so callers can strip such a qualifier
+// without mutating text inside an actual string value. old must be non-empty.
+func (d Dialect) ReplaceOutsideStrings(sql, old, replacement string) string {
 	if old == "" {
 		return sql
 	}
-	mask := scanMask(sql, false)
+	mask := d.scanMask(sql, false)
 	var b strings.Builder
 	i := 0
 	for i < len(sql) {
@@ -204,8 +245,8 @@ func allTrue(bs []bool) bool {
 // identifiers, dollar-quoting, and comments, and at parenthesis depth zero, so a
 // comma inside a function call (e.g. format_type(a, b)) or a literal does not split
 // the item. Used to parse a SELECT list into individual select items.
-func SplitTopLevelCommas(s string) []string {
-	mask := codeMask(s)
+func (d Dialect) SplitTopLevelCommas(s string) []string {
+	mask := d.codeMask(s)
 	var parts []string
 	depth := 0
 	start := 0

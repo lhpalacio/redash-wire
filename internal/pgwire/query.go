@@ -18,7 +18,7 @@ import (
 // contents, so classification keyword/identifier matching can never fire inside
 // a literal or comment.
 func normalize(sql string) string {
-	return strings.ToLower(strings.TrimSpace(sqltext.Redact(sql)))
+	return strings.ToLower(strings.TrimSpace(sqltext.Postgres.Redact(sql)))
 }
 
 func BuildRowDescription(columns []redash.Column, rows []map[string]any) *pgproto3.RowDescription {
@@ -26,6 +26,18 @@ func BuildRowDescription(columns []redash.Column, rows []map[string]any) *pgprot
 	for i, col := range columns {
 		oid := RedashTypeToPgOID(col.Type)
 		size := RedashTypeToPgSize(col.Type)
+
+		// Redash's "datetime" says nothing about zones; the values do. A column
+		// whose values all carry an offset is timestamptz, one whose values are
+		// all naive is timestamp, and one the proxy cannot classify stays text.
+		if col.Type == "datetime" {
+			switch datetimeColumnKind(rows, col.Name) {
+			case datetimeAware:
+				oid = OidTimestampTZ
+			case datetimeText:
+				oid, size = OidText, -1
+			}
+		}
 
 		// Promote a column to JSONB when EVERY non-null value is a JSON object/array,
 		// so the advertised OID matches the JSON text BuildDataRows emits for those
@@ -50,6 +62,15 @@ func BuildRowDescription(columns []redash.Column, rows []map[string]any) *pgprot
 }
 
 func BuildDataRows(columns []redash.Column, rows []map[string]any) []pgproto3.DataRow {
+	// Decided once per column so every value is rendered in the form the
+	// advertised OID promises (see BuildRowDescription).
+	kinds := make([]datetimeKind, len(columns))
+	for j, col := range columns {
+		if col.Type == "datetime" {
+			kinds[j] = datetimeColumnKind(rows, col.Name)
+		}
+	}
+
 	dataRows := make([]pgproto3.DataRow, len(rows))
 	for i, row := range rows {
 		values := make([][]byte, len(columns))
@@ -57,6 +78,10 @@ func BuildDataRows(columns []redash.Column, rows []map[string]any) []pgproto3.Da
 			val, ok := row[col.Name]
 			if !ok || val == nil {
 				values[j] = nil
+				continue
+			}
+			if col.Type == "datetime" {
+				values[j] = []byte(formatDatetime(val, kinds[j]))
 				continue
 			}
 			values[j] = []byte(formatValue(val, col.Type))
@@ -129,14 +154,6 @@ func formatValue(val any, redashType string) string {
 			return fmt.Sprintf("%v", val)
 		}
 
-	case "datetime":
-		s := fmt.Sprintf("%v", val)
-		s = strings.Replace(s, "T", " ", 1)
-		if strings.HasSuffix(s, "Z") {
-			s = s[:len(s)-1] + "+00"
-		}
-		return s
-
 	case "date":
 		// A date OID (1082) must carry only the calendar date; strip any time or
 		// timezone suffix Redash may include (e.g. "2024-01-15T00:00:00Z").
@@ -149,6 +166,82 @@ func formatValue(val any, redashType string) string {
 	default:
 		return fmt.Sprintf("%v", val)
 	}
+}
+
+// datetimeKind is how a Redash "datetime" column is presented. Redash's type
+// says nothing about zones, but its values do: Python serializes a naive
+// timestamp as 2024-01-15T10:30:00 and an aware one with an offset or Z.
+type datetimeKind int
+
+const (
+	datetimeText  datetimeKind = iota // unparseable or mixed values: verbatim, as text
+	datetimeNaive                     // no value carries a zone: timestamp (1114)
+	datetimeAware                     // every value carries a zone: timestamptz (1184)
+)
+
+var (
+	naiveLayouts = []string{"2006-01-02T15:04:05", "2006-01-02 15:04:05", "2006-01-02"}
+	awareLayouts = []string{
+		"2006-01-02T15:04:05Z07:00", "2006-01-02 15:04:05Z07:00",
+		"2006-01-02T15:04:05Z0700", "2006-01-02 15:04:05Z0700",
+		"2006-01-02T15:04:05Z07", "2006-01-02 15:04:05Z07",
+	}
+)
+
+// parseDatetime classifies one value. Every layout also accepts fractional
+// seconds after the seconds field.
+func parseDatetime(val any) (time.Time, datetimeKind) {
+	s, ok := val.(string)
+	if !ok {
+		return time.Time{}, datetimeText
+	}
+	for _, layout := range naiveLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, datetimeNaive
+		}
+	}
+	for _, layout := range awareLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, datetimeAware
+		}
+	}
+	return time.Time{}, datetimeText
+}
+
+// datetimeColumnKind classifies a column by all of its non-null values. A
+// column that mixes naive and aware values, or holds something that is not a
+// timestamp, cannot be typed honestly and is sent as text. With no values to
+// judge by it is a plain timestamp.
+func datetimeColumnKind(rows []map[string]any, name string) datetimeKind {
+	kind := datetimeNaive
+	seen := false
+	for _, row := range rows {
+		v, ok := row[name]
+		if !ok || v == nil {
+			continue
+		}
+		_, k := parseDatetime(v)
+		if k == datetimeText || (seen && k != kind) {
+			return datetimeText
+		}
+		kind, seen = k, true
+	}
+	return kind
+}
+
+// formatDatetime renders a value the way the server would under the TimeZone
+// the proxy advertises (UTC): a timestamp as "2006-01-02 15:04:05[.ffffff]", a
+// timestamptz normalized to UTC with the "+00" suffix. A text column passes
+// its values through untouched.
+func formatDatetime(val any, kind datetimeKind) string {
+	t, k := parseDatetime(val)
+	if kind == datetimeText || k == datetimeText {
+		return formatValue(val, "")
+	}
+	if kind == datetimeAware {
+		return t.UTC().Format("2006-01-02 15:04:05.999999") + "+00"
+	}
+	return t.Format("2006-01-02 15:04:05.999999")
 }
 
 func SendQueryResult(conn io.Writer, sql string, result *redash.QueryResult) error {
@@ -370,10 +463,7 @@ func SendEmptyResult(conn io.Writer, columns []string) error {
 func IsLocalQuery(sql string) bool {
 	lower := normalize(sql)
 
-	if strings.HasPrefix(lower, "set ") {
-		return true
-	}
-	if strings.HasPrefix(lower, "show ") {
+	if hasKeyword(lower, "set") || hasKeyword(lower, "show") {
 		return true
 	}
 	if strings.HasPrefix(lower, "begin") || strings.HasPrefix(lower, "commit") || strings.HasPrefix(lower, "rollback") {
@@ -415,11 +505,18 @@ func IsCatalogQuery(sql string) bool {
 	return containsPgCatalogRef(normalize(sql))
 }
 
+// isSimpleSelect reports a SELECT with no FROM anywhere: the shape of a scalar
+// function call such as SELECT version(). Keywords are matched on any
+// whitespace, so a newline after SELECT or before FROM is not special.
 func isSimpleSelect(lower string) bool {
-	if !strings.HasPrefix(lower, "select ") {
-		return false
-	}
-	return !strings.Contains(lower, " from ")
+	return hasKeyword(lower, "select") && !sqltext.ContainsToken(lower, "from")
+}
+
+// hasKeyword reports whether lower opens with kw as a whole word followed by
+// whitespace, so "set\nsearch_path" matches like "set search_path" and
+// "settings" does not.
+func hasKeyword(lower, kw string) bool {
+	return strings.HasPrefix(lower, kw) && len(lower) > len(kw) && isSpace(lower[len(kw)])
 }
 
 func containsPgCatalogRef(lower string) bool {
@@ -453,7 +550,7 @@ func containsPgCatalogRef(lower string) bool {
 func HandleLocalQuery(conn io.Writer, sql string, startupParams map[string]string, sources []redash.DataSource, listenAddr string) error {
 	lower := normalize(sql)
 
-	if strings.HasPrefix(lower, "set ") {
+	if hasKeyword(lower, "set") {
 		return SendCommandComplete(conn, "SET")
 	}
 	if strings.HasPrefix(lower, "begin") {
@@ -474,9 +571,26 @@ func HandleLocalQuery(conn io.Writer, sql string, startupParams map[string]strin
 	if strings.HasPrefix(lower, "discard") {
 		return SendCommandComplete(conn, "DISCARD ALL")
 	}
-	if strings.HasPrefix(lower, "show ") {
-		param := strings.TrimSpace(lower[5:])
+	if hasKeyword(lower, "show") {
+		// The statement arrives verbatim, so "SHOW x;" still carries its
+		// terminator; it is not part of the parameter name.
+		param := strings.TrimSpace(strings.TrimRight(lower[len("show"):], "; \t\r\n"))
 		return handleShowCommand(conn, param)
+	}
+
+	// Catalog tables come before the scalar-function shortcuts: a pg_database
+	// listing may mention current_user in its WHERE clause (has_database_privilege
+	// does) and must still return the data sources, not the user. The token
+	// match is the one IsLocalQuery uses, so any query it routed here (e.g.
+	// "FROM\npg_database") is dispatched consistently rather than dropped.
+	if sqltext.ContainsToken(lower, "pg_database") {
+		return handlePgDatabaseQuery(conn, sources)
+	}
+
+	// The shortcuts answer a bare function call; a query that reads from a
+	// relation is not one, whatever functions it applies.
+	if !isSimpleSelect(lower) {
+		return SendEmptyResult(conn, []string{"result"})
 	}
 
 	if strings.Contains(lower, "version()") {
@@ -532,12 +646,6 @@ func HandleLocalQuery(conn io.Writer, sql string, startupParams map[string]strin
 	}
 	if strings.Contains(lower, "pg_postmaster_start_time") {
 		return SendSingleRowResult(conn, "pg_postmaster_start_time", time.Now().UTC().Format("2006-01-02 15:04:05+00"))
-	}
-
-	// Use the same token match as IsLocalQuery so any query it routed here as local
-	// (e.g. "FROM\npg_database") is dispatched consistently rather than dropped.
-	if sqltext.ContainsToken(lower, "pg_database") {
-		return handlePgDatabaseQuery(conn, sources)
 	}
 
 	return SendEmptyResult(conn, []string{"result"})

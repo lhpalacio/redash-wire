@@ -1,29 +1,64 @@
 package redash
 
 import (
+	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
 type DataSourceRegistry struct {
-	byName map[string]DataSource
-	all    []DataSource
+	// byExact resolves a name that matches a data source's name character for
+	// character; byLower is the case-insensitive fallback. Redash returns names
+	// in no particular order, so a case-insensitive map alone was last-wins and
+	// resolved "Prod" vs "prod" nondeterministically from one refresh to the next.
+	byExact map[string]DataSource
+	byLower map[string]DataSource
+	all     []DataSource
 }
+
+// loggedCollisions remembers which case-insensitive collisions have already been
+// warned about, so a persistent misconfiguration is reported once rather than on
+// every ten-second registry refresh.
+var loggedCollisions sync.Map
 
 func NewDataSourceRegistry(sources []DataSource) *DataSourceRegistry {
 	r := &DataSourceRegistry{
-		byName: make(map[string]DataSource, len(sources)),
-		all:    sources,
+		byExact: make(map[string]DataSource, len(sources)),
+		byLower: make(map[string]DataSource, len(sources)),
+		all:     sources,
 	}
 	for _, ds := range sources {
-		r.byName[strings.ToLower(ds.Name)] = ds
+		r.byExact[ds.Name] = ds
+
+		lower := strings.ToLower(ds.Name)
+		existing, clash := r.byLower[lower]
+		if !clash {
+			r.byLower[lower] = ds
+			continue
+		}
+		// Two names differ only in case. Pick deterministically (lowest id) so the
+		// case-insensitive fallback is stable across refreshes, and warn once.
+		if ds.ID < existing.ID {
+			r.byLower[lower] = ds
+		}
+		if _, seen := loggedCollisions.LoadOrStore(lower, struct{}{}); !seen {
+			slog.Warn("data source names collide case-insensitively; resolving the ambiguous name to the lowest id",
+				"name", lower, "ids", []int{existing.ID, ds.ID})
+		}
 	}
 	return r
 }
 
+// Lookup prefers an exact-case match, so a data source named exactly as the
+// client asked always wins; only when there is no exact match does it fall back
+// to the case-insensitive entry.
 func (r *DataSourceRegistry) Lookup(name string) (DataSource, bool) {
-	ds, ok := r.byName[strings.ToLower(name)]
+	if ds, ok := r.byExact[name]; ok {
+		return ds, true
+	}
+	ds, ok := r.byLower[strings.ToLower(name)]
 	return ds, ok
 }
 

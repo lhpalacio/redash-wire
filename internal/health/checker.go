@@ -52,6 +52,19 @@ const (
 	// live session. Two also absorbs the 403-serving captive portals and proxies
 	// that a half-connected VPN puts in the way, which look fatal but are not.
 	DefaultFailureThreshold = 2
+
+	// A single 401/403/404 is not enough to conclude the key is rejected: a
+	// captive portal or a half-connected VPN serves those for a stretch before it
+	// lets real traffic through, and treating the first one as fatal parks every
+	// session on "check your api_key" and backs off for five minutes. Require the
+	// rejected classification to persist across this many consecutive probes
+	// before entering the long backoff; until then the outage is reported as plain
+	// "unreachable" and retried at the normal interval. At the default interval
+	// this is roughly twenty to thirty seconds of confirmation. The startup
+	// probe's authority (a first failure closes the gate) is unchanged — this only
+	// governs whether that closure is labelled rejected and backs off, or stays
+	// unreachable and keeps probing.
+	DefaultRejectedThreshold = 3
 )
 
 // Checker is the only thing in the process that asks Redash whether it is alive.
@@ -63,14 +76,16 @@ type Checker struct {
 	gate     *Gate
 	logger   *slog.Logger
 
-	interval         time.Duration
-	confirmDelay     time.Duration
-	rejectedInterval time.Duration
-	timeout          time.Duration
-	startupTimeout   time.Duration
-	threshold        int
+	interval          time.Duration
+	confirmDelay      time.Duration
+	rejectedInterval  time.Duration
+	timeout           time.Duration
+	startupTimeout    time.Duration
+	threshold         int
+	rejectedThreshold int
 
 	failures    int
+	rejections  int
 	probed      bool
 	everUp      bool
 	lastKind    Kind
@@ -85,22 +100,24 @@ func WithFailureThreshold(n int) Option   { return func(c *Checker) { c.threshol
 func WithRejectedInterval(d time.Duration) Option {
 	return func(c *Checker) { c.rejectedInterval = d }
 }
+func WithRejectedThreshold(n int) Option        { return func(c *Checker) { c.rejectedThreshold = n } }
 func WithConfirmDelay(d time.Duration) Option   { return func(c *Checker) { c.confirmDelay = d } }
 func WithStartupTimeout(d time.Duration) Option { return func(c *Checker) { c.startupTimeout = d } }
 
 func NewChecker(lister redash.DataSourceLister, registry *redash.SwappableRegistry, gate *Gate, logger *slog.Logger, opts ...Option) *Checker {
 	c := &Checker{
-		lister:           lister,
-		registry:         registry,
-		gate:             gate,
-		logger:           logger,
-		interval:         DefaultInterval,
-		confirmDelay:     DefaultConfirmDelay,
-		rejectedInterval: DefaultRejectedInterval,
-		timeout:          DefaultTimeout,
-		startupTimeout:   DefaultStartupTimeout,
-		threshold:        DefaultFailureThreshold,
-		lastKind:         KindOK,
+		lister:            lister,
+		registry:          registry,
+		gate:              gate,
+		logger:            logger,
+		interval:          DefaultInterval,
+		confirmDelay:      DefaultConfirmDelay,
+		rejectedInterval:  DefaultRejectedInterval,
+		timeout:           DefaultTimeout,
+		startupTimeout:    DefaultStartupTimeout,
+		threshold:         DefaultFailureThreshold,
+		rejectedThreshold: DefaultRejectedThreshold,
+		lastKind:          KindOK,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -166,6 +183,7 @@ func (c *Checker) Probe(ctx context.Context) error {
 
 func (c *Checker) recordSuccess(sources []redash.DataSource) {
 	c.failures = 0
+	c.rejections = 0
 	c.everUp = true
 	c.lastKind = KindOK
 
@@ -181,7 +199,7 @@ func (c *Checker) recordSuccess(sources []redash.DataSource) {
 
 func (c *Checker) recordFailure(err error) {
 	c.failures++
-	kind := classify(err)
+	kind := c.confirmedKind(err)
 
 	// Below the threshold and still serving: record the blip where someone can
 	// find it, but do not move the menu bar over a single dropped packet.
@@ -244,6 +262,25 @@ func (c *Checker) nextInterval() time.Duration {
 		return c.confirmDelay
 	}
 	return c.interval
+}
+
+// confirmedKind is classify with hysteresis on the rejected verdict. A rejected
+// classification only sticks once it has repeated across rejectedThreshold
+// consecutive probes; before that it is reported as plain unreachable, so a
+// captive portal or half-connected VPN that serves 403 for a stretch is retried
+// at the normal interval instead of parking every session on the key message and
+// backing off for five minutes. Any non-rejected result resets the run.
+func (c *Checker) confirmedKind(err error) Kind {
+	kind := classify(err)
+	if kind != KindRejected {
+		c.rejections = 0
+		return kind
+	}
+	c.rejections++
+	if c.rejections < c.rejectedThreshold {
+		return KindUnreachable
+	}
+	return KindRejected
 }
 
 // classify draws the same line redash.isFatalStatus does: a response that says

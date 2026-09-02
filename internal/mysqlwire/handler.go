@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
@@ -20,30 +22,77 @@ type handler struct {
 	redashClient redash.RedashAPI
 	registry     redash.SourceRegistry
 	gate         *health.Gate
+	conns        *connTable
 	dataSourceID int
 	dbName       string
 	logger       *slog.Logger
 
+	// authenticated flips in login, once go-mysql has verified the password.
+	// Until then UseDB only records pendingDB, so nothing about data sources or
+	// the gate reaches a client that has not proved who it is.
+	authenticated bool
+	pendingDB     string
+	connID        uint32
+
 	schemaCache *redash.SchemaCache
+
+	// cancelQuery aborts the Redash query in flight on this session, if any. It
+	// is set for the duration of ExecuteQuery and called by KILL QUERY from
+	// another session, so it needs the mutex.
+	mu          sync.Mutex
+	cancelQuery context.CancelFunc
 }
 
 var _ server.Handler = (*handler)(nil)
 
-func newHandler(ctx context.Context, logger *slog.Logger, redashClient redash.RedashAPI, registry redash.SourceRegistry, gate *health.Gate) *handler {
+func newHandler(ctx context.Context, logger *slog.Logger, redashClient redash.RedashAPI, registry redash.SourceRegistry, gate *health.Gate, conns *connTable) *handler {
 	return &handler{
 		ctx:          ctx,
 		redashClient: redashClient,
 		registry:     registry,
 		gate:         gate,
+		conns:        conns,
 		logger:       logger,
 		schemaCache:  redash.NewSchemaCache(),
 	}
 }
 
+// login is the post-authentication half of the handshake; go-mysql runs it
+// after the password check and before the OK packet, and sends its error to
+// the client instead of the OK. This is where the connect-time refusals live:
+// the gate, so a client that connects without -D is turned away while Redash
+// is down rather than learning it on its first query; and the database named
+// in the handshake, which go-mysql handed to UseDB before it had verified the
+// password and which is validated only now, giving `mysql -D nonexistent` the
+// same 1049 the real server sends once authentication has succeeded.
+func (h *handler) login(connID uint32) error {
+	h.authenticated = true
+	h.connID = connID
+
+	if !h.gate.Up() {
+		h.logger.Info("refusing login", "reason", "redash unavailable", "kind", h.gate.Status().Kind)
+		return mysql.NewError(mysql.ER_UNKNOWN_ERROR, h.gate.ClientMessage())
+	}
+
+	if h.pendingDB == "" {
+		return nil
+	}
+	dbName := h.pendingDB
+	h.pendingDB = ""
+	return h.UseDB(dbName)
+}
+
 func (h *handler) UseDB(dbName string) error {
-	// This is also the connect-time refusal for `mysql -D <db>`: go-mysql calls
-	// UseDB during the handshake when the client names a database, so the error
-	// reaches the client before it ever gets a prompt.
+	// go-mysql calls UseDB while reading the handshake, before it has verified
+	// the password. Answering then would let anyone enumerate data source names
+	// and learn whether Redash is down; real MySQL says nothing but "Access
+	// denied" until authentication succeeds. Record the name and let login
+	// validate it.
+	if !h.authenticated {
+		h.pendingDB = dbName
+		return nil
+	}
+
 	if !h.gate.Up() {
 		h.logger.Info("refusing database selection", "reason", "redash unavailable", "kind", h.gate.Status().Kind)
 		return mysql.NewError(mysql.ER_UNKNOWN_ERROR, h.gate.ClientMessage())
@@ -71,11 +120,22 @@ func (h *handler) HandleQuery(query string) (*mysql.Result, error) {
 
 	// We can only faithfully execute one statement per Redash call, so reject
 	// batches explicitly instead of silently dropping all but the first.
-	if sqltext.IsMultiStatement(query) {
+	if sqltext.MySQL.IsMultiStatement(query) {
 		return nil, mysql.NewError(mysql.ER_UNKNOWN_ERROR, "multi-statement queries are not supported; send one statement per request")
 	}
 
 	h.logger.Debug("query received", "sql", query)
+
+	// KILL names one of this proxy's own connections and never goes to Redash,
+	// where the id would pick out an unrelated thread on the real server. It is
+	// answered even while the gate is closed: the query it aborts may be the one
+	// stuck on the outage.
+	if id, queryOnly, ok, err := parseKill(query); ok {
+		if err != nil {
+			return nil, err
+		}
+		return nil, h.handleKill(id, queryOnly)
+	}
 
 	// Ahead of everything else, including the no-database-selected reply and the
 	// catalog answers served from the cached registry. All of those are true and
@@ -94,8 +154,12 @@ func (h *handler) HandleQuery(query string) (*mysql.Result, error) {
 	}
 
 	if isLocalQuery(query) {
-		sources := redash.FilterByType(h.registry.All(), redash.IsMySQLCompatible)
-		return handleLocalQuery(query, h.dbName, sources, h.getSchema())
+		return handleLocalQuery(query, localSession{
+			dbName:  h.dbName,
+			connID:  h.connID,
+			sources: redash.FilterByType(h.registry.All(), redash.IsMySQLCompatible),
+			schema:  h.getSchema(),
+		})
 	}
 
 	if h.dataSourceID == 0 {
@@ -108,8 +172,12 @@ func (h *handler) HandleQuery(query string) (*mysql.Result, error) {
 	query = h.stripDBQualifier(query)
 
 	start := time.Now()
-	result, err := h.redashClient.ExecuteQuery(h.ctx, query, h.dataSourceID)
+	result, err := h.executeRemote(query)
 	if err != nil {
+		if errors.Is(err, errInterrupted) {
+			h.logger.Info("query interrupted", "data_source_id", h.dataSourceID, "duration_ms", time.Since(start).Milliseconds())
+			return nil, mysql.NewDefaultError(mysql.ER_QUERY_INTERRUPTED)
+		}
 		// SQL text is Debug-only (logged above); keep it out of the Error line.
 		h.logger.Error("query execution failed", "error", err, "data_source_id", h.dataSourceID, "duration_ms", time.Since(start).Milliseconds())
 		// A query that died on infrastructure is better evidence than the health
@@ -129,6 +197,85 @@ func (h *handler) HandleQuery(query string) (*mysql.Result, error) {
 
 	h.logger.Info("query executed", "data_source_id", h.dataSourceID, "rows", len(result.Rows), "duration_ms", time.Since(start).Milliseconds())
 	return buildResult(query, result)
+}
+
+// errInterrupted is how executeRemote reports that KILL QUERY, not the client
+// going away or the proxy shutting down, ended the query.
+var errInterrupted = errors.New("query interrupted")
+
+// executeRemote runs the query on Redash under a context that KILL QUERY from
+// another session can cancel. The Redash client cancels the job on its side
+// when the context ends, so the interrupted query stops costing anything.
+func (h *handler) executeRemote(query string) (*redash.QueryResult, error) {
+	qctx, cancel := context.WithCancel(h.ctx)
+	defer cancel()
+
+	h.mu.Lock()
+	h.cancelQuery = cancel
+	h.mu.Unlock()
+	defer func() {
+		h.mu.Lock()
+		h.cancelQuery = nil
+		h.mu.Unlock()
+	}()
+
+	result, err := h.redashClient.ExecuteQuery(qctx, query, h.dataSourceID)
+	if err != nil && qctx.Err() != nil && h.ctx.Err() == nil {
+		return nil, errInterrupted
+	}
+	return result, err
+}
+
+// interrupt cancels the Redash query this session is waiting on, if there is
+// one, and reports whether there was. KILL QUERY from another session lands here.
+func (h *handler) interrupt() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cancelQuery == nil {
+		return false
+	}
+	h.cancelQuery()
+	return true
+}
+
+// parseKill recognises KILL [CONNECTION | QUERY] <id>. ok is false when the
+// statement is not a KILL at all; err reports a KILL that does not parse.
+func parseKill(query string) (id uint32, queryOnly bool, ok bool, err error) {
+	fields := strings.Fields(strings.TrimSuffix(normalize(query), ";"))
+	if len(fields) == 0 || fields[0] != "kill" {
+		return 0, false, false, nil
+	}
+	args := fields[1:]
+	if len(args) > 0 && (args[0] == "query" || args[0] == "connection") {
+		queryOnly = args[0] == "query"
+		args = args[1:]
+	}
+	if len(args) != 1 {
+		return 0, false, true, mysql.NewError(mysql.ER_PARSE_ERROR, "You have an error in your SQL syntax; expected KILL [CONNECTION | QUERY] <id>")
+	}
+	n, perr := strconv.ParseUint(args[0], 10, 32)
+	if perr != nil {
+		return 0, false, true, mysql.NewError(mysql.ER_PARSE_ERROR, fmt.Sprintf("You have an error in your SQL syntax; KILL expects a connection id, got '%s'", args[0]))
+	}
+	return uint32(n), queryOnly, true, nil
+}
+
+// handleKill is what the mysql CLI's Ctrl-C reaches: it opens a fresh
+// connection and sends KILL QUERY <its own id>. The id is one go-mysql
+// assigned, so it is looked up among this proxy's sessions.
+func (h *handler) handleKill(id uint32, queryOnly bool) error {
+	target, ok := h.conns.lookup(id)
+	if !ok {
+		return mysql.NewDefaultError(mysql.ER_NO_SUCH_THREAD, id)
+	}
+	interrupted := target.h.interrupt()
+	if queryOnly {
+		h.logger.Info("kill query", "target_connection_id", id, "interrupted", interrupted)
+		return nil
+	}
+	target.disconnect()
+	h.logger.Info("kill connection", "target_connection_id", id, "interrupted", interrupted)
+	return nil
 }
 
 func (h *handler) getSchema() []redash.SchemaTable {
@@ -151,16 +298,100 @@ func (h *handler) getSchema() []redash.SchemaTable {
 	return schema
 }
 
+// stripDBQualifier removes the current database's qualifier from table
+// references, so `SELECT * FROM orders.users` reaches Redash as `SELECT * FROM
+// users`: the data source name is not a schema the real server knows.
+//
+// Without a parser, only the positions that unambiguously introduce a table
+// reference are rewritten: the identifier (quoted or not) right after FROM,
+// JOIN, INTO, and a leading UPDATE, which covers SELECT ... FROM, every JOIN
+// form, INSERT/REPLACE INTO, UPDATE and DELETE FROM. A qualifier anywhere else
+// is left alone, in particular `x.col` column references: with a data source
+// named orders, `orders`.id in a select list or ON clause is the table orders,
+// and stripping it would change the query's meaning. Known limitations: the
+// second and later tables of a comma-separated FROM list keep their qualifier,
+// as does a three-part db.table.col column reference; and a qualifier right
+// after the FROM inside EXTRACT/SUBSTRING/TRIM is stripped like a table's.
 func (h *handler) stripDBQualifier(query string) string {
 	if h.dbName == "" {
 		return query
 	}
-	// The qualifier is itself a quoted identifier (`db`. or "db".), so identifier
-	// quotes must be eligible for replacement; only single-quoted string values
-	// are protected.
-	query = sqltext.ReplaceOutsideStrings(query, "`"+h.dbName+"`.", "")
-	query = sqltext.ReplaceOutsideStrings(query, "\""+h.dbName+"\".", "")
-	return query
+	// Keywords are located in the redacted text so one inside a literal or
+	// comment is never acted on; the identifier itself is read from the original,
+	// where a quoted one is still visible. Both share positions.
+	red := strings.ToLower(sqltext.MySQL.Redact(query))
+	first := len(red) - len(strings.TrimLeft(red, " \t\r\n"))
+
+	var out strings.Builder
+	copied := 0
+	for i := 0; i < len(red); {
+		n := tableRefKeywordAt(red, i, first)
+		if n == 0 {
+			i++
+			continue
+		}
+		i += n
+		start := i
+		for start < len(query) && strings.IndexByte(" \t\r\n", query[start]) >= 0 {
+			start++
+		}
+		name, end := identifierAt(query, start)
+		if end < len(query) && query[end] == '.' && strings.EqualFold(name, h.dbName) {
+			out.WriteString(query[copied:start])
+			copied = end + 1
+			i = end + 1
+		}
+	}
+	out.WriteString(query[copied:])
+	return out.String()
+}
+
+// tableRefKeywordAt returns the length of the table-introducing keyword that
+// starts at red[i], or 0. UPDATE only counts at the start of the statement
+// (first), so the column after ON DUPLICATE KEY UPDATE is not mistaken for a
+// table.
+func tableRefKeywordAt(red string, i, first int) int {
+	for _, kw := range [...]string{"from", "join", "into", "update"} {
+		if !strings.HasPrefix(red[i:], kw) {
+			continue
+		}
+		end := i + len(kw)
+		if (i > 0 && isIdentByte(red[i-1])) || (end < len(red) && isIdentByte(red[end])) {
+			continue
+		}
+		if kw == "update" && i != first {
+			continue
+		}
+		return len(kw)
+	}
+	return 0
+}
+
+// identifierAt reads the identifier at s[i]: a `quoted` or "quoted" one, or a
+// run of identifier bytes. It returns the unquoted name and the index just past
+// it; an empty name means there was no identifier there.
+func identifierAt(s string, i int) (string, int) {
+	if i >= len(s) {
+		return "", i
+	}
+	if q := s[i]; q == '`' || q == '"' {
+		if close := strings.IndexByte(s[i+1:], q); close >= 0 {
+			return s[i+1 : i+1+close], i + 1 + close + 1
+		}
+		return "", i
+	}
+	end := i
+	for end < len(s) && isIdentByte(s[end]) {
+		end++
+	}
+	return s[i:end], end
+}
+
+func isIdentByte(b byte) bool {
+	return b == '_' || b == '$' ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9')
 }
 
 func (h *handler) HandleFieldList(table string, fieldWildcard string) ([]*mysql.Field, error) {

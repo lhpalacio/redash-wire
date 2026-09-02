@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/lhpalacio/redash-wire/internal/redash"
 )
 
@@ -26,9 +28,6 @@ func TestFormatValue(t *testing.T) {
 		{name: "float64 int", val: float64(42), redashType: "integer", want: "42"},
 
 		{name: "json.Number float", val: json.Number("3.14"), redashType: "float", want: "3.14"},
-
-		{name: "ISO 8601 datetime", val: "2024-01-15T10:30:00Z", redashType: "datetime", want: "2024-01-15 10:30:00+00"},
-		{name: "already spaced datetime", val: "2024-01-15 10:30:00+00", redashType: "datetime", want: "2024-01-15 10:30:00+00"},
 
 		// Complex values (map/slice) are always JSON regardless of redashType.
 		{name: "map value", val: map[string]any{"key": "val"}, redashType: "string", want: `{"key":"val"}`},
@@ -80,7 +79,11 @@ func TestIsLocalQuery(t *testing.T) {
 		want bool
 	}{
 		{name: "SET", sql: "SET search_path TO public", want: true},
+		{name: "SET with newline after keyword", sql: "SET\nsearch_path TO public", want: true},
 		{name: "SHOW", sql: "SHOW server_version", want: true},
+		{name: "SHOW with tab after keyword", sql: "SHOW\tserver_version;", want: true},
+		{name: "SELECT with newline before function", sql: "SELECT\nversion()", want: true},
+		{name: "pg_database with function in WHERE", sql: "SELECT d.datname FROM pg_catalog.pg_database d WHERE has_database_privilege(current_user, d.datname, 'CONNECT')", want: true},
 		{name: "BEGIN", sql: "BEGIN", want: true},
 		{name: "COMMIT", sql: "COMMIT", want: true},
 		{name: "ROLLBACK", sql: "ROLLBACK", want: true},
@@ -136,7 +139,10 @@ func TestIsSimpleSelect(t *testing.T) {
 	}{
 		{name: "function call", lower: "select version()", want: true},
 		{name: "has FROM", lower: "select * from users", want: false},
+		{name: "has FROM after newline", lower: "select version()\nfrom dual", want: false},
+		{name: "newline after select", lower: "select\nversion()", want: true},
 		{name: "not select", lower: "show something", want: false},
+		{name: "selected is not select", lower: "selected version()", want: false},
 	}
 
 	for _, tt := range tests {
@@ -343,5 +349,221 @@ func msgTypeName(msg pgproto3.BackendMessage) string {
 		return "EmptyQueryResponse"
 	default:
 		return "Unknown"
+	}
+}
+
+func TestFormatDatetime(t *testing.T) {
+	tests := []struct {
+		name string
+		val  any
+		kind datetimeKind
+		want string
+	}{
+		{name: "Z becomes +00", val: "2024-01-15T10:30:00Z", kind: datetimeAware, want: "2024-01-15 10:30:00+00"},
+		{name: "already server form", val: "2024-01-15 10:30:00+00", kind: datetimeAware, want: "2024-01-15 10:30:00+00"},
+		{name: "offset normalized to UTC", val: "2024-01-15T13:30:00.250+03:00", kind: datetimeAware, want: "2024-01-15 10:30:00.25+00"},
+		{name: "naive isoformat", val: "2024-01-15T10:30:00", kind: datetimeNaive, want: "2024-01-15 10:30:00"},
+		{name: "naive with microseconds", val: "2024-01-15T10:30:00.123456", kind: datetimeNaive, want: "2024-01-15 10:30:00.123456"},
+		{name: "date only", val: "2024-01-15", kind: datetimeNaive, want: "2024-01-15 00:00:00"},
+		{name: "text column passes through", val: "2024-01-15T10:30:00Z", kind: datetimeText, want: "2024-01-15T10:30:00Z"},
+		{name: "unparseable passes through", val: json.Number("1700000000"), kind: datetimeNaive, want: "1700000000"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatDatetime(tt.val, tt.kind); got != tt.want {
+				t.Errorf("formatDatetime(%v, %d) = %q, want %q", tt.val, tt.kind, got, tt.want)
+			}
+		})
+	}
+}
+
+// collectTyped decodes a result into its field descriptions and raw values
+// (nil for SQL NULL). Values are copied as each message arrives, because the
+// frontend reuses its buffer for the next one.
+func collectTyped(t *testing.T, buf *bytes.Buffer) ([]pgproto3.FieldDescription, [][][]byte) {
+	t.Helper()
+	var fields []pgproto3.FieldDescription
+	var rows [][][]byte
+	fe := newFrontend(buf)
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			break
+		}
+		switch m := msg.(type) {
+		case *pgproto3.RowDescription:
+			fields = append(fields, m.Fields...)
+		case *pgproto3.DataRow:
+			row := make([][]byte, len(m.Values))
+			for i, v := range m.Values {
+				if v != nil {
+					row[i] = append([]byte(nil), v...)
+				}
+			}
+			rows = append(rows, row)
+		}
+	}
+	return fields, rows
+}
+
+// TestSendQueryResult_DatetimeColumns: a Redash datetime column is advertised
+// as timestamp or timestamptz according to its values, in a text form pgx's
+// codec for that OID scans back to the same instant; anything else is text.
+func TestSendQueryResult_DatetimeColumns(t *testing.T) {
+	utc := func(h, m, s, ns int) time.Time { return time.Date(2024, 1, 15, h, m, s, ns, time.UTC) }
+
+	tests := []struct {
+		name    string
+		values  []any
+		wantOID uint32
+		wantRaw []string
+		wantAt  []time.Time // per value; zero when the value is NULL
+	}{
+		{
+			name:    "naive values are timestamp",
+			values:  []any{"2024-01-15T10:30:00", "2024-01-15 10:30:00.123456"},
+			wantOID: OidTimestamp,
+			wantRaw: []string{"2024-01-15 10:30:00", "2024-01-15 10:30:00.123456"},
+			wantAt:  []time.Time{utc(10, 30, 0, 0), utc(10, 30, 0, 123456000)},
+		},
+		{
+			name:    "aware values are timestamptz rendered in UTC",
+			values:  []any{"2024-01-15T10:30:00Z", "2024-01-15T13:30:00.5+03:00", "2024-01-15 10:30:00+00"},
+			wantOID: OidTimestampTZ,
+			wantRaw: []string{"2024-01-15 10:30:00+00", "2024-01-15 10:30:00.5+00", "2024-01-15 10:30:00+00"},
+			wantAt:  []time.Time{utc(10, 30, 0, 0), utc(10, 30, 0, 500000000), utc(10, 30, 0, 0)},
+		},
+		{
+			name:    "nulls do not decide the kind",
+			values:  []any{nil, "2024-01-15T10:30:00Z"},
+			wantOID: OidTimestampTZ,
+			wantRaw: []string{"", "2024-01-15 10:30:00+00"},
+			wantAt:  []time.Time{{}, utc(10, 30, 0, 0)},
+		},
+		{
+			name:    "mixed naive and aware values fall back to text verbatim",
+			values:  []any{"2024-01-15T10:30:00", "2024-01-15T10:30:00Z"},
+			wantOID: OidText,
+			wantRaw: []string{"2024-01-15T10:30:00", "2024-01-15T10:30:00Z"},
+		},
+		{
+			name:    "unparseable value keeps the column text",
+			values:  []any{"2024-01-15T10:30:00", "yesterday"},
+			wantOID: OidText,
+			wantRaw: []string{"2024-01-15T10:30:00", "yesterday"},
+		},
+		{
+			name:    "no rows defaults to timestamp",
+			wantOID: OidTimestamp,
+		},
+	}
+
+	m := pgtype.NewMap()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := &redash.QueryResult{Columns: []redash.Column{{Name: "ts", Type: "datetime"}}}
+			for _, v := range tt.values {
+				result.Rows = append(result.Rows, map[string]any{"ts": v})
+			}
+			var buf bytes.Buffer
+			if err := SendQueryResult(&buf, "SELECT ts FROM t", result); err != nil {
+				t.Fatal(err)
+			}
+			fields, rows := collectTyped(t, &buf)
+			if len(fields) != 1 || fields[0].DataTypeOID != tt.wantOID {
+				t.Fatalf("fields = %+v, want one column with OID %d", fields, tt.wantOID)
+			}
+			if len(rows) != len(tt.values) {
+				t.Fatalf("got %d rows, want %d", len(rows), len(tt.values))
+			}
+			for i, row := range rows {
+				if got := string(row[0]); got != tt.wantRaw[i] {
+					t.Errorf("row %d = %q, want %q", i, got, tt.wantRaw[i])
+				}
+				if tt.wantAt == nil || row[0] == nil {
+					continue
+				}
+				var got time.Time
+				if err := m.Scan(tt.wantOID, pgtype.TextFormatCode, row[0], &got); err != nil {
+					t.Fatalf("row %d: pgtype cannot scan %q as OID %d: %v", i, row[0], tt.wantOID, err)
+				}
+				if !got.Equal(tt.wantAt[i]) {
+					t.Errorf("row %d scanned to %v, want %v", i, got, tt.wantAt[i])
+				}
+			}
+		})
+	}
+}
+
+// TestHandleLocalQuery_ShowStripsTerminator: psql sends "SHOW x;" verbatim; the
+// terminator is not part of the parameter name.
+func TestHandleLocalQuery_ShowStripsTerminator(t *testing.T) {
+	for _, sql := range []string{"SHOW server_version;", "SHOW server_version ;", "SHOW\nserver_version"} {
+		t.Run(sql, func(t *testing.T) {
+			if !IsLocalQuery(sql) {
+				t.Fatalf("IsLocalQuery(%q) = false", sql)
+			}
+			var buf bytes.Buffer
+			if err := HandleLocalQuery(&buf, sql, nil, nil, "127.0.0.1:15432"); err != nil {
+				t.Fatal(err)
+			}
+			cols, rows := collectResult(t, &buf)
+			if len(cols) != 1 || cols[0] != "server_version" {
+				t.Errorf("columns = %v, want [server_version]", cols)
+			}
+			if len(rows) != 1 || rows[0][0] != "14.0" {
+				t.Errorf("rows = %v, want [[14.0]]", rows)
+			}
+		})
+	}
+}
+
+func TestHandleLocalQuery_SetWithNewline(t *testing.T) {
+	sql := "SET\nsearch_path TO public"
+	if !IsLocalQuery(sql) {
+		t.Fatalf("IsLocalQuery(%q) = false", sql)
+	}
+	var buf bytes.Buffer
+	if err := HandleLocalQuery(&buf, sql, nil, nil, "127.0.0.1:15432"); err != nil {
+		t.Fatal(err)
+	}
+	msgs := receiveAll(t, newFrontend(&buf))
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want CommandComplete + ReadyForQuery", len(msgs))
+	}
+	cc, ok := msgs[0].(*pgproto3.CommandComplete)
+	if !ok || string(cc.CommandTag) != "SET" {
+		t.Errorf("msgs[0] = %#v, want CommandComplete SET", msgs[0])
+	}
+}
+
+// TestHandleLocalQuery_PgDatabaseBeforeScalarShortcuts: a pg_database listing
+// whose WHERE clause mentions current_user (DBeaver and pgAdmin filter on
+// has_database_privilege) must return the data sources, not the user name.
+func TestHandleLocalQuery_PgDatabaseBeforeScalarShortcuts(t *testing.T) {
+	sources := []redash.DataSource{
+		{ID: 1, Name: "a", Type: "pg"},
+		{ID: 2, Name: "b", Type: "pg"},
+	}
+	sql := "SELECT d.datname FROM pg_catalog.pg_database d WHERE has_database_privilege(current_user, d.datname, 'CONNECT') ORDER BY 1"
+	var buf bytes.Buffer
+	if err := HandleLocalQuery(&buf, sql, map[string]string{"user": "alice"}, sources, "127.0.0.1:15432"); err != nil {
+		t.Fatal(err)
+	}
+	cols, rows := collectResult(t, &buf)
+	if len(cols) == 0 || cols[0] != "datname" {
+		t.Fatalf("columns = %v, want datname first", cols)
+	}
+	if len(rows) != 2 || rows[0][0] != "a" || rows[1][0] != "b" {
+		t.Errorf("rows = %v, want the two data sources", rows)
+	}
+
+	// The scalar shortcut still answers a bare function call.
+	buf.Reset()
+	if err := HandleLocalQuery(&buf, "SELECT current_user", map[string]string{"user": "alice"}, sources, "127.0.0.1:15432"); err != nil {
+		t.Fatal(err)
+	}
+	if _, rows := collectResult(t, &buf); len(rows) != 1 || rows[0][0] != "alice" {
+		t.Errorf("SELECT current_user rows = %v, want [[alice]]", rows)
 	}
 }

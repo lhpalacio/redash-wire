@@ -66,6 +66,33 @@ func TestRewriteTimestampComparisons(t *testing.T) {
 			expected: `UPDATE "t" SET "x" = 1`,
 		},
 		{
+			// The proxy renders a timestamptz as "...+00"; a GUI that round-trips the
+			// value it displayed must still get the rewrite.
+			name:     "timestamptz with +HH zone as the proxy renders it",
+			input:    `UPDATE "t" SET "x" = 1 WHERE "created_at" = '2026-03-27 19:56:34.792+00'`,
+			expected: `UPDATE "t" SET "x" = 1 WHERE date_trunc('milliseconds', "created_at") = '2026-03-27 19:56:34.792+00'`,
+		},
+		{
+			name:     "timestamptz with +HH:MM zone",
+			input:    `DELETE FROM "t" WHERE "created_at" = '2026-03-27 19:56:34.792+00:00'`,
+			expected: `DELETE FROM "t" WHERE date_trunc('milliseconds', "created_at") = '2026-03-27 19:56:34.792+00:00'`,
+		},
+		{
+			name:     "timestamptz with negative zone",
+			input:    `DELETE FROM "t" WHERE "created_at" = '2026-03-27 16:56:34.7-03:00'`,
+			expected: `DELETE FROM "t" WHERE date_trunc('milliseconds', "created_at") = '2026-03-27 16:56:34.7-03:00'`,
+		},
+		{
+			name:     "timestamptz with Z",
+			input:    `DELETE FROM "t" WHERE "created_at" = '2026-03-27 19:56:34.792Z'`,
+			expected: `DELETE FROM "t" WHERE date_trunc('milliseconds', "created_at") = '2026-03-27 19:56:34.792Z'`,
+		},
+		{
+			name:     "whole-second timestamptz is left unchanged",
+			input:    `DELETE FROM "t" WHERE "created_at" = '2026-03-27 19:56:34+00'`,
+			expected: `DELETE FROM "t" WHERE "created_at" = '2026-03-27 19:56:34+00'`,
+		},
+		{
 			name:     "mixed timestamp and non-timestamp in WHERE",
 			input:    `UPDATE "public"."customers" SET "name" = 'test' WHERE "id" = 1 AND "name" = 'old' AND "created_at" = '2026-03-27 19:56:34.792'`,
 			expected: `UPDATE "public"."customers" SET "name" = 'test' WHERE "id" = 1 AND "name" = 'old' AND date_trunc('milliseconds', "created_at") = '2026-03-27 19:56:34.792'`,

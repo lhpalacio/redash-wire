@@ -1,12 +1,10 @@
 package pgwire
 
 import (
-	"crypto/rand"
 	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net"
-	"os"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -16,6 +14,19 @@ var ErrAuthFailed = fmt.Errorf("authentication failed")
 // ErrRefused reports that a valid login was turned away by the admission check.
 // The client has already been told why, over the wire.
 var ErrRefused = errors.New("connection refused")
+
+// ErrCancelRequest reports that the connection carried a PostgreSQL
+// CancelRequest rather than a normal startup. It is not a fault: PostgreSQL
+// cancellation arrives on a throwaway connection that names the session to cancel
+// (by the ProcessID/SecretKey pair from its BackendKeyData) and is then closed.
+// The handler has already asked for the cancellation, so the caller should simply
+// close this connection.
+var ErrCancelRequest = errors.New("cancel request")
+
+// CancelFunc cancels the in-flight query of the session identified by a
+// CancelRequest. The proxy looks the session up by the ProcessID/SecretKey pair
+// it handed out in BackendKeyData.
+type CancelFunc func(processID uint32, secretKey []byte)
 
 // SQLStateConnectionFailure (08006) says the fault is upstream of the proxy,
 // rather than in the client's credentials or its SQL.
@@ -41,7 +52,7 @@ const MaxClientMessageBytes = 64 << 20
 // upgrades, authenticates the client against the configured credentials, and sends
 // the post-auth parameter bundle through ReadyForQuery. It returns the client's
 // startup parameters (user, database, application_name, ...) for the session to use.
-func HandleStartup(backend *pgproto3.Backend, conn net.Conn, username, password string, admit Admit) (map[string]string, error) {
+func HandleStartup(backend *pgproto3.Backend, conn net.Conn, username, password string, admit Admit, key pgproto3.BackendKeyData, onCancel CancelFunc) (map[string]string, error) {
 	for {
 		startupMsg, err := backend.ReceiveStartupMessage()
 		if err != nil {
@@ -60,6 +71,15 @@ func HandleStartup(backend *pgproto3.Backend, conn net.Conn, username, password 
 				return nil, fmt.Errorf("denying GSSENC: %w", err)
 			}
 			continue
+
+		case *pgproto3.CancelRequest:
+			// A throwaway connection asking us to cancel another session's query.
+			// Ask the server to do so, then report ErrCancelRequest so the caller
+			// closes this connection without treating it as a failed handshake.
+			if onCancel != nil {
+				onCancel(msg.ProcessID, msg.SecretKey)
+			}
+			return nil, ErrCancelRequest
 
 		case *pgproto3.StartupMessage:
 			params := msg.Parameters
@@ -89,13 +109,11 @@ func HandleStartup(backend *pgproto3.Backend, conn net.Conn, username, password 
 				}
 			}
 
-			secret := make([]byte, 4)
-			if _, err := rand.Read(secret); err != nil {
-				return nil, fmt.Errorf("generating secret key: %w", err)
-			}
+			// The ProcessID/SecretKey the server assigned this session. The client
+			// echoes them back on a CancelRequest to name the query to cancel.
 			buf, err = encode((&pgproto3.BackendKeyData{
-				ProcessID: uint32(os.Getpid()),
-				SecretKey: secret,
+				ProcessID: key.ProcessID,
+				SecretKey: key.SecretKey,
 			}).Encode(buf))
 			if err != nil {
 				return nil, err
