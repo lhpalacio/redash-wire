@@ -15,12 +15,20 @@ final class ProxySupervisor: ObservableObject {
     /// mid-shutdown.
     private static let terminationGrace: TimeInterval = 7
 
+    /// How long after the exit to keep waiting for stderr to close. It closes
+    /// when the last writer is gone, which is the child itself unless it left
+    /// something behind holding the pipe.
+    private static let drainGrace: TimeInterval = 1
+
     /// Assigned only when it differs, because the menu is a real NSMenu that
     /// SwiftUI rebuilds on every published change, and a rebuild closes whatever
     /// submenu is open.
     @Published private(set) var snapshot = ProxyTracker.Snapshot()
 
     var state: State { snapshot.state }
+    /// The profile the process was launched from: a copy, and the only thing
+    /// the running proxy's ports and credentials can be read from. The config
+    /// on disk may have been edited or renamed since.
     var activeProfile: Profile? { snapshot.activeProfile }
     /// Reported by the running proxy on every health probe, and emptied whenever
     /// that proxy goes away. It belongs to the process: it comes from the same
@@ -47,6 +55,29 @@ final class ProxySupervisor: ObservableObject {
     private var restartTask: Task<Void, Never>?
     private var pathWatcher: NetworkPathWatcher?
 
+    /// Bumped per spawn and carried by everything a process reports back. stderr
+    /// is drained on its own task, so a line from a process that has exited can
+    /// reach the main actor after its successor was spawned, and would otherwise
+    /// be read as the successor's.
+    private var generation = 0
+
+    /// An exit is handled once the process has terminated *and* its stderr has
+    /// closed, in whichever order they happen. They arrive from different
+    /// queues, and the last lines the process wrote — a panic and its trace —
+    /// used to lose the race and land after the exit had been judged without
+    /// them.
+    private var exitStatus: Int32?
+    private var stderrDrained = false
+
+    /// Resumed by `handleExit`, the one place `process` is let go of.
+    private var exitWaiters: [CheckedContinuation<Void, Never>] = []
+
+    /// Lifecycle commands run one after another. A stop suspends until the exit
+    /// is observed, and two commands in flight at once — a profile switch while
+    /// a reload's restart still waits for the old process — used to have the
+    /// second find `process` still set and quietly do nothing.
+    private var commands: Task<Void, Never>?
+
     init(cli: WireCLI) {
         self.cli = cli
         pathWatcher = NetworkPathWatcher { [weak self] in
@@ -55,33 +86,16 @@ final class ProxySupervisor: ObservableObject {
     }
 
 
-    func start(profile: Profile) {
-        guard process == nil else { return }
-        tracker.start(profile)
-        spawn(profile)
+    func start(profile: Profile) async {
+        await enqueue { self.startNow(profile) }
     }
 
+    /// Returns once the exit has been observed, so a start that follows always
+    /// spawns. It used to return as soon as `isRunning` turned false, which is
+    /// before terminationHandler runs and clears `process`; a restart then found
+    /// it still set and left the proxy stopped.
     func stop() async {
-        restartTask?.cancel()
-        restartTask = nil
-
-        guard let process, process.isRunning else {
-            tracker.stopped()
-            stopRequested = false
-            publish()
-            return
-        }
-
-        stopRequested = true
-        process.terminate()
-
-        let deadline = Date().addingTimeInterval(Self.terminationGrace)
-        while process.isRunning && Date() < deadline {
-            try? await Task.sleep(for: .milliseconds(100))
-        }
-        if process.isRunning {
-            kill(process.processIdentifier, SIGKILL)
-        }
+        await enqueue { await self.stopNow() }
     }
 
     /// Pass `profile` to come back up on an edited copy. Restarting on the stale
@@ -89,13 +103,66 @@ final class ProxySupervisor: ObservableObject {
     /// listener would mark the proxy ready as soon as the first one binds.
     func restart(profile: Profile? = nil) async {
         guard let target = profile ?? activeProfile else { return }
-        await stop()
-        start(profile: target)
+        await enqueue {
+            await self.stopNow()
+            self.startNow(target)
+        }
     }
 
     /// One profile at a time. Two would usually collide on the same ports.
     func switchTo(profile: Profile) async {
         await restart(profile: profile)
+    }
+
+    private func enqueue(_ command: @escaping @MainActor () async -> Void) async {
+        let previous = commands
+        let task = Task { @MainActor in
+            await previous?.value
+            await command()
+        }
+        commands = task
+        await task.value
+    }
+
+    private func startNow(_ profile: Profile) {
+        guard process == nil else { return }
+        tracker.start(profile)
+        spawn(profile)
+    }
+
+    private func stopNow() async {
+        restartTask?.cancel()
+        restartTask = nil
+
+        guard let process else {
+            tracker.stopped()
+            stopRequested = false
+            publish()
+            return
+        }
+
+        // Set before the exit is observed, so a crash that lands in this window
+        // is a stop, not a failure: a proxy that served for an hour and died as
+        // Stop was pressed used to be reported as failing before it listened.
+        stopRequested = true
+        if process.isRunning {
+            process.terminate()
+        }
+
+        // Process reaps a killed child like any other, so terminationHandler
+        // still runs and the exit is observed the same way.
+        let killer = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(Self.terminationGrace))
+            guard !Task.isCancelled, let self, self.process === process else { return }
+            kill(process.processIdentifier, SIGKILL)
+        }
+        await waitForExit()
+        killer.cancel()
+    }
+
+    private func waitForExit() async {
+        guard process != nil else { return }
+        await withCheckedContinuation { exitWaiters.append($0) }
     }
 
     /// The proxy's own timer would notice within an interval. A path change is
@@ -114,6 +181,10 @@ final class ProxySupervisor: ObservableObject {
     private func spawn(_ profile: Profile) {
         stopRequested = false
         lineBuffer.removeAll()
+        exitStatus = nil
+        stderrDrained = false
+        generation += 1
+        let generation = self.generation
         publish()
 
         let process = Process()
@@ -130,17 +201,20 @@ final class ProxySupervisor: ObservableObject {
             let data = handle.availableData
             guard !data.isEmpty else {
                 handle.readabilityHandler = nil
+                Task { @MainActor [weak self] in
+                    self?.stderrClosed(generation: generation)
+                }
                 return
             }
             Task { @MainActor [weak self] in
-                self?.ingest(data)
+                self?.ingest(data, generation: generation)
             }
         }
 
         process.terminationHandler = { [weak self] finished in
             let status = finished.terminationStatus
             Task { @MainActor [weak self] in
-                self?.handleExit(status: status)
+                self?.processTerminated(status: status, generation: generation)
             }
         }
 
@@ -157,38 +231,61 @@ final class ProxySupervisor: ObservableObject {
     }
 
 
-    private func ingest(_ data: Data) {
+    private func ingest(_ data: Data, generation: Int) {
+        guard generation == self.generation, process != nil else { return }
         lineBuffer.append(data)
 
         while let newline = lineBuffer.firstIndex(of: UInt8(ascii: "\n")) {
             let line = lineBuffer[lineBuffer.startIndex..<newline]
             lineBuffer.removeSubrange(lineBuffer.startIndex...newline)
-            guard !line.isEmpty, let event = LogEvent.parse(line: Data(line)) else { continue }
-            record(event)
+            guard !line.isEmpty else { continue }
+            // A Go panic is not JSON, and dropping it left a crash with no
+            // trace anywhere.
+            let event = LogEvent.parse(line: Data(line))
+                ?? LogEvent.raw(line: String(decoding: line, as: UTF8.self), now: Date())
+            log.append(event)
+            tracker.record(event, now: Date())
+            publish()
         }
     }
 
-    private func record(_ event: LogEvent) {
-        log.append(event)
+    private func stderrClosed(generation: Int) {
+        guard generation == self.generation else { return }
+        stderrDrained = true
+        if let status = exitStatus {
+            handleExit(status: status)
+        }
+    }
 
-        // Everything the child wrote belongs in the log, but nothing it wrote may
-        // change state once it has exited. stderr is drained on a different task
-        // from terminationHandler, so the last buffered line can arrive after the
-        // process is gone — and would otherwise report a dead proxy as running, or
-        // refill the data sources handleExit just cleared.
-        guard process != nil else { return }
-
-        tracker.record(event, now: Date())
-        publish()
+    private func processTerminated(status: Int32, generation: Int) {
+        guard generation == self.generation else { return }
+        exitStatus = status
+        if stderrDrained {
+            handleExit(status: status)
+            return
+        }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(Self.drainGrace))
+            guard let self, generation == self.generation else { return }
+            self.handleExit(status: status)
+        }
     }
 
     private func handleExit(status: Int32) {
+        // Both the drain and the grace timer get here; the first one wins.
+        guard process != nil else { return }
         process = nil
         stdinPipe = nil
 
         let outcome = tracker.exit(status: status, stopRequested: stopRequested, now: Date())
         stopRequested = false
         publish()
+
+        let waiters = exitWaiters
+        exitWaiters = []
+        for waiter in waiters {
+            waiter.resume()
+        }
 
         guard case .restart(let profile, let delay) = outcome else { return }
         restartTask = Task { [weak self] in

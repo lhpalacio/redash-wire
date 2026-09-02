@@ -4,6 +4,14 @@ import SwiftUI
 struct RedashWireApp: App {
     @StateObject private var model = AppModel()
 
+    init() {
+        // Writing the API key to a child that has already died — an exec
+        // failure, quarantine, the wrong architecture — raises SIGPIPE, whose
+        // default action is to kill the whole app with no error anywhere.
+        // Ignored, the write fails with EPIPE, which WireCLI reports.
+        signal(SIGPIPE, SIG_IGN)
+    }
+
     var body: some Scene {
         MenuBarExtra {
             MenuRoot(model: model)
@@ -38,7 +46,10 @@ private struct MenuBarLabel: View {
         Image(systemName: symbolName)
             .task {
                 await model.start()
-                if !model.isConfigured {
+                // Only for a missing file. A config that will not parse, or a
+                // binary that will not run, is an error the menu shows; the
+                // wizard would only answer "a config already exists".
+                if model.needsOnboarding {
                     NSApplication.shared.activate(ignoringOtherApps: true)
                     openWindow(id: "onboarding")
                 }

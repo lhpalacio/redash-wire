@@ -72,7 +72,9 @@ struct MenuBarView: View {
                 Text(line)
             }
             showLogsButton
-        } else if supervisor.state.isRunning, let profile = model.selectedProfile {
+        } else if supervisor.state.isRunning, let profile = supervisor.activeProfile {
+            // The process's own copy of the profile: the one on disk may say
+            // something else by now, and these ports are the ones that answer.
             ForEach(listenerLines(for: profile), id: \.self) { line in
                 Text(line)
             }
@@ -80,11 +82,42 @@ struct MenuBarView: View {
             Text("Restarting in \(Self.countdown(to: restart.at)) (attempt \(restart.attempt) of \(restart.limit))")
         }
 
+        if let hint = model.runningProfileDrift.flatMap(driftHint) {
+            Text(hint.fittedToMenu(limit: 80))
+        }
+
+        if supervisor.state == .stopped, let notice = model.reloadNotice {
+            Text(notice.fittedToMenu(limit: 80))
+        }
+
         if let error = model.configError {
             Text(error.message.fittedToMenu())
             if let remedy = error.remedy {
                 Text(remedy)
             }
+            Button {
+                openSettings()
+            } label: {
+                Label("Edit Configuration…", systemImage: "gearshape")
+            }
+        }
+    }
+
+    /// The proxy reads its profile once, at launch. Saving the file changes
+    /// nothing until Reload Configuration, and the menu has to say so, or the
+    /// listener lines above it look wrong against the file.
+    private func driftHint(_ drift: ProfileDrift) -> String? {
+        switch drift {
+        case .unchanged:
+            return nil
+        case .edited:
+            return "Config changed — Reload Configuration to apply"
+        case .removed:
+            let running = supervisor.activeProfile?.name ?? "?"
+            if let next = model.selectedProfileName {
+                return "Profile “\(running)” is gone from the config — reload to switch to “\(next)”"
+            }
+            return "Profile “\(running)” is gone from the config — reload to stop"
         }
     }
 
@@ -98,7 +131,7 @@ struct MenuBarView: View {
     }
 
     private var statusLine: String {
-        let name = (model.selectedProfileName ?? "no profile").fittedToMenu(limit: 24)
+        let name = (model.describedProfileName ?? "no profile").fittedToMenu(limit: 24)
         switch supervisor.state {
         case .stopped:
             return "Stopped — \(name)"
@@ -180,20 +213,22 @@ struct MenuBarView: View {
 
     @ViewBuilder
     private var controlSection: some View {
-        let stopping = supervisor.state.isRunning || supervisor.state.isBusy
+        let stopping = supervisor.state.isActive
 
+        // Stop needs a process, not a profile: a config broken or emptied while
+        // the proxy serves used to leave Quit as the only way to stop it.
         Button {
             Task { await model.toggleProxy() }
         } label: {
             Label(stopping ? "Stop" : "Start", systemImage: stopping ? "stop.fill" : "play.fill")
         }
-        .disabled(model.selectedProfile == nil)
+        .disabled(!stopping && model.selectedProfile == nil)
 
         if case .failed = supervisor.state {
             Button {
                 Task {
                     if let profile = model.selectedProfile {
-                        supervisor.start(profile: profile)
+                        await supervisor.start(profile: profile)
                     }
                 }
             } label: {
@@ -289,7 +324,7 @@ struct MenuBarView: View {
 
     @ViewBuilder
     private func copyActions(for source: DataSource) -> some View {
-        if let profile = model.selectedProfile {
+        if let profile = model.connectionProfile {
             if source.wire == "postgres" {
                 if let uri = ConnectionStrings.postgresURI(profile: profile, database: source.name) {
                     openInClientButton(uri: uri)
@@ -328,7 +363,7 @@ struct MenuBarView: View {
 
     @ViewBuilder
     private var connectSection: some View {
-        if let profile = model.selectedProfile {
+        if let profile = model.connectionProfile {
             Menu {
                 if let command = ConnectionStrings.psql(profile: profile, database: nil) {
                     Button("Copy psql command") { Clipboard.copySecret(command) }
@@ -359,18 +394,25 @@ struct MenuBarView: View {
 
         Toggle(isOn: Binding(
             get: { model.launchesAtLogin },
-            set: { enabled in try? model.setLaunchAtLogin(enabled) }
+            set: { enabled in model.setLaunchAtLogin(enabled) }
         )) {
             Label("Launch at Login", systemImage: "power")
+        }
+
+        // Registered, but macOS holds it until you approve it. It used to read
+        // as plain "off", with the toggle refusing to stay on.
+        if model.launchAtLoginStatus == .requiresApproval {
+            Text("Waiting for approval in System Settings › Login Items")
+            Button("Open Login Items Settings…") { model.openLoginItemsSettings() }
+        }
+        if let error = model.launchAtLoginError {
+            Text("Launch at Login failed: \(error)".fittedToMenu(limit: 80))
         }
 
         // The shortcuts only fire while the menu is open: LSUIElement leaves no app
         // menu to register a key equivalent with.
         Button {
-            // Config deleted out from under us, so there is nothing to edit yet.
-            if !model.openConfigInEditor() {
-                openWindow("onboarding")
-            }
+            openSettings()
         } label: {
             Label("Settings…", systemImage: "gearshape")
         }
@@ -389,6 +431,14 @@ struct MenuBarView: View {
             } label: {
                 Label("Set up redash-wire…", systemImage: "wand.and.stars")
             }
+        }
+    }
+
+
+    /// Config deleted out from under us means there is nothing to edit yet.
+    private func openSettings() {
+        if !model.openConfigInEditor() {
+            openWindow("onboarding")
         }
     }
 

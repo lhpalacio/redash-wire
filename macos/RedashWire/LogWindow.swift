@@ -95,7 +95,10 @@ struct LogWindow: View {
                 }
                 .listStyle(.plain)
                 .font(.system(.body, design: .monospaced))
-                .onChange(of: log.events.count) { _ in
+                // Keyed on the newest event, not the count: once the store is
+                // at its cap the count never moves again, and the window stopped
+                // following the log exactly when it had the most in it.
+                .onChange(of: log.events.last?.id) { _ in
                     guard let last = visibleEvents.last else { return }
                     withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                 }

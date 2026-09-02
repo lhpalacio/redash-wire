@@ -1,15 +1,23 @@
-import AppKit
 import Foundation
 
 /// The proxy takes a Redash data source name as the database name.
 enum ConnectionStrings {
-    /// A wildcard bind is not dialable, so it becomes loopback, matching what the
-    /// proxy prints in its banner.
+    /// Split the way Go's net.SplitHostPort split the address the proxy bound:
+    /// the port follows the last colon, and an IPv6 host is in brackets, which
+    /// are not part of the host. A wildcard bind is not dialable, so it becomes
+    /// loopback, matching what the proxy prints in its banner.
     static func hostAndPort(from listenAddr: String) -> (host: String, port: String)? {
         guard let separator = listenAddr.lastIndex(of: ":") else { return nil }
         var host = String(listenAddr[listenAddr.startIndex..<separator])
         let port = String(listenAddr[listenAddr.index(after: separator)...])
         guard !port.isEmpty else { return nil }
+
+        if host.hasPrefix("[") && host.hasSuffix("]") {
+            host = String(host.dropFirst().dropLast())
+        } else if host.contains(":") {
+            // `::1:15432` could be split anywhere; Go refuses it too.
+            return nil
+        }
 
         if host.isEmpty || host == "0.0.0.0" || host == "::" {
             host = "127.0.0.1"
@@ -48,7 +56,15 @@ enum ConnectionStrings {
         let user = urlEncoded(profile.username)
         let password = urlEncoded(profile.password)
         let path = database.map { "/" + urlEncoded($0) } ?? ""
-        return "\(scheme)://\(user):\(password)@\(host):\(port)\(path)"
+        return "\(scheme)://\(user):\(password)@\(uriHost(host)):\(port)\(path)"
+    }
+
+    /// An IPv6 host goes back in brackets in a URL, where a bare `::1:15432`
+    /// would be read as some other host and port. psql and mysql take it bare;
+    /// psql rejects the brackets. A zone (`fe80::1%en0`) needs its `%` encoded.
+    private static func uriHost(_ host: String) -> String {
+        guard host.contains(":") else { return host }
+        return "[" + host.replacingOccurrences(of: "%", with: "%25") + "]"
     }
 
     /// RFC 3986 unreserved set. Encoding by `.alphanumerics` alone escapes hyphens
@@ -69,70 +85,5 @@ enum ConnectionStrings {
             return value
         }
         return "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
-}
-
-/// The app that opens `postgresql://` or `mysql://` links on this Mac. TablePlus,
-/// Postico and DBeaver all register the schemes, so one click on a data source
-/// opens a connection with the database filled in; nothing here knows which one
-/// is installed.
-enum ClientApp {
-    struct Handler: Equatable {
-        let name: String
-        let url: URL
-    }
-
-    /// Looked up once per scheme. Launch Services is quick, but the menu asks
-    /// once per data source every time it opens, and the answer only changes
-    /// when an app is installed or removed.
-    private static var cache: [String: Handler?] = [:]
-
-    static func handler(for uri: String) -> Handler? {
-        guard let url = URL(string: uri), let scheme = url.scheme else { return nil }
-        if let cached = cache[scheme] { return cached }
-
-        let found = NSWorkspace.shared.urlForApplication(toOpen: url).map { appURL in
-            Handler(name: displayName(of: appURL), url: appURL)
-        }
-        cache[scheme] = found
-        return found
-    }
-
-    static func open(_ uri: String, with handler: Handler) {
-        guard let url = URL(string: uri) else { return }
-        NSWorkspace.shared.open([url], withApplicationAt: handler.url, configuration: NSWorkspace.OpenConfiguration())
-    }
-
-    private static func displayName(of appURL: URL) -> String {
-        let info = Bundle(url: appURL)?.infoDictionary
-        return (info?["CFBundleDisplayName"] as? String)
-            ?? (info?["CFBundleName"] as? String)
-            ?? appURL.deletingPathExtension().lastPathComponent
-    }
-}
-
-enum Clipboard {
-    /// The convention history tools honor to skip logging an item.
-    private static let concealedType = NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
-
-    static func copy(_ value: String) {
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(value, forType: .string)
-    }
-
-    /// Clears the credential later, but only if nothing else was copied since.
-    /// Without the changeCount check this would wipe whatever came next.
-    static func copySecret(_ value: String, clearAfter seconds: TimeInterval = 60) {
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(value, forType: .string)
-        pasteboard.setString(value, forType: concealedType)
-        let stamp = pasteboard.changeCount
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
-            guard NSPasteboard.general.changeCount == stamp else { return }
-            NSPasteboard.general.clearContents()
-        }
     }
 }

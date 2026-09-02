@@ -8,8 +8,10 @@ final class AppModel: ObservableObject {
     @Published private(set) var config: ConfigPayload?
     @Published private(set) var configError: WireError?
     @Published private(set) var selectedProfileName: String?
-
-    @Published var isShowingOnboarding = false
+    /// Why the last Reload Configuration stopped the proxy rather than
+    /// restarting it. Shown while it stays stopped.
+    @Published private(set) var reloadNotice: String?
+    @Published private(set) var launchAtLoginError: String?
 
     let cli: WireCLI
     let supervisor: ProxySupervisor
@@ -29,9 +31,45 @@ final class AppModel: ObservableObject {
 
     var isConfigured: Bool { config?.exists == true && !profiles.isEmpty }
 
+    /// True only when the binary looked and found no config file. A config it
+    /// could not read is a different problem, and the wizard's one answer to
+    /// that — "a config already exists" — helps nobody; the menu shows the
+    /// error and a way to the file instead.
+    var needsOnboarding: Bool { config?.exists == false }
+
+    /// The profile on disk that the next start uses.
     var selectedProfile: Profile? {
         guard let name = selectedProfileName else { return nil }
         return profiles.first { $0.name == name }
+    }
+
+    /// The profile whose ports and credentials the menu offers. While the proxy
+    /// is up, it is the copy the process was launched from: the selection on
+    /// disk may have been edited or renamed since, and its addresses would
+    /// describe a listener nothing has bound. Otherwise it is what the next
+    /// start will use.
+    var connectionProfile: Profile? {
+        supervisor.state.isActive ? supervisor.activeProfile : selectedProfile
+    }
+
+    /// What the status line names. The state belongs to the process, so this is
+    /// the profile that process was launched from, or has just failed on; only
+    /// a stopped proxy is described by the on-disk selection, which is what
+    /// Start would run.
+    var describedProfileName: String? {
+        if supervisor.state == .stopped {
+            return selectedProfileName
+        }
+        return supervisor.activeProfile?.name ?? selectedProfileName
+    }
+
+    /// Set while the proxy runs a profile the config no longer matches. Nil
+    /// when the config could not be read at all: that is shown as an error, and
+    /// the proxy keeps serving what it has.
+    var runningProfileDrift: ProfileDrift? {
+        guard supervisor.state.isActive, let running = supervisor.activeProfile, config != nil else { return nil }
+        let drift = ProfileDrift(running: running, onDisk: profiles)
+        return drift == .unchanged ? nil : drift
     }
 
     /// Only a running proxy has data sources. Asking Redash for them while the
@@ -47,7 +85,7 @@ final class AppModel: ObservableObject {
         let wire: String
         let title: String
         let sources: [DataSource]
-        /// The config key that would turn the listener on, when the selected
+        /// The config key that would turn the listener on, when the running
         /// profile has none for this wire. The proxy can serve these sources,
         /// but not on this profile, and the copy actions would have no port.
         let missingListenerKey: String?
@@ -76,8 +114,8 @@ final class AppModel: ObservableObject {
 
     private func listenerAddress(for wire: String) -> String {
         switch wire {
-        case "postgres": return selectedProfile?.postgresListenAddr ?? ""
-        case "mysql": return selectedProfile?.mysqlListenAddr ?? ""
+        case "postgres": return connectionProfile?.postgresListenAddr ?? ""
+        case "mysql": return connectionProfile?.mysqlListenAddr ?? ""
         default: return ""
         }
     }
@@ -107,7 +145,6 @@ final class AppModel: ObservableObject {
         didStart = true
 
         await reloadConfig()
-        watchConfigFile()
 
         // A menu bar app launched at login exists to have the proxy up. Under
         // -wait-for-redash a missing VPN is a state the menu shows, not a reason
@@ -126,32 +163,37 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Only the menu command restarts the proxy. The config is written with a
-    /// temp-file rename and editors leave swap files in the same directory, so the
-    /// watcher fires several times per save; restarting on that would drop live
-    /// connections.
+    /// Only the menu command restarts the proxy. A save while it serves would
+    /// otherwise drop live connections, so the watcher only refreshes what the
+    /// menu shows, and the menu says when a reload has something to apply.
     func reloadConfig(applyToRunning: Bool = false) async {
-        let running = applyToRunning ? supervisor.activeProfile : nil
+        let running = supervisor.state.isActive ? supervisor.activeProfile : nil
         await readConfig()
+        watchConfigFile()
         guard applyToRunning else { return }
+        reloadNotice = nil
 
         // A failed proxy is the one whose config you were editing to fix, and
         // reloading is the moment to find out whether it worked. A stopped one
         // stays stopped: that was a choice, not a failure.
         if case .failed = supervisor.state, let profile = selectedProfile {
-            supervisor.start(profile: profile)
+            await supervisor.start(profile: profile)
             return
         }
 
-        // An edit to some other profile is not a reason to restart this one.
-        guard
-            let running,
-            supervisor.state.isRunning || supervisor.state.isBusy,
-            let edited = profiles.first(where: { $0.name == running.name }),
-            edited != running
-        else { return }
+        // A config that cannot be read is shown as an error. The proxy that is
+        // up keeps serving the copy it has.
+        guard let running, config != nil else { return }
 
-        await supervisor.restart(profile: edited)
+        switch ProfileDrift(running: running, onDisk: profiles).reloadAction(fallback: selectedProfile) {
+        case .keep:
+            return
+        case .restart(let profile):
+            await supervisor.restart(profile: profile)
+        case .stop:
+            await supervisor.stop()
+            reloadNotice = "Stopped: profile “\(running.name)” is no longer in the config."
+        }
     }
 
     private func readConfig() async {
@@ -160,14 +202,13 @@ final class AppModel: ObservableObject {
             config = payload
             configError = nil
 
-            if !payload.exists || payload.profiles.isEmpty {
-                isShowingOnboarding = true
+            let names = payload.profiles.map(\.name)
+            guard !names.isEmpty else {
                 selectedProfileName = nil
                 return
             }
 
             // Editing the config must not switch profiles underneath you.
-            let names = payload.profiles.map(\.name)
             if let current = selectedProfileName, names.contains(current) {
                 return
             }
@@ -177,20 +218,18 @@ final class AppModel: ObservableObject {
         } catch let error as WireError {
             configError = error
             config = nil
-            if error.code == .notConfigured {
-                isShowingOnboarding = true
-            }
         } catch {
             configError = WireError(code: .unknown, message: error.localizedDescription)
+            config = nil
         }
     }
 
 
     func toggleProxy() async {
-        if supervisor.state.isRunning || supervisor.state.isBusy {
+        if supervisor.state.isActive {
             await supervisor.stop()
         } else if let profile = selectedProfile {
-            supervisor.start(profile: profile)
+            await supervisor.start(profile: profile)
         }
     }
 
@@ -216,17 +255,20 @@ final class AppModel: ObservableObject {
     /// that state. An invalid profile is started too: the binary is the one that
     /// reads the config, so it reports the reason and the menu shows it as failed.
     private func run(_ profile: Profile) async {
-        if supervisor.state.isRunning || supervisor.state.isBusy {
+        if supervisor.state.isActive {
             await supervisor.switchTo(profile: profile)
         } else {
-            supervisor.start(profile: profile)
+            await supervisor.start(profile: profile)
         }
     }
 
 
+    /// Tried on every reload, not once at launch: on a first run the directory
+    /// does not exist yet, so the watcher cannot be made until onboarding has
+    /// created it. A watcher whose directory was deleted is replaced the same way.
     private func watchConfigFile() {
-        let path = cli.configPath
-        watcher = ConfigWatcher(path: path) { [weak self] in
+        guard watcher == nil || watcher?.isStale == true else { return }
+        watcher = ConfigWatcher(path: cli.configPath) { [weak self] in
             Task { @MainActor [weak self] in
                 await self?.reloadConfig()
             }
@@ -253,45 +295,118 @@ final class AppModel: ObservableObject {
     }
 
 
-    var launchesAtLogin: Bool {
-        SMAppService.mainApp.status == .enabled
+    var launchAtLoginStatus: SMAppService.Status {
+        SMAppService.mainApp.status
     }
 
-    /// Throws when the app is not in a signed bundle, which is normal in development.
-    func setLaunchAtLogin(_ enabled: Bool) throws {
-        if enabled {
-            try SMAppService.mainApp.register()
-        } else {
-            try SMAppService.mainApp.unregister()
+    /// Registered, whether or not the system has let it take effect yet. The
+    /// toggle shows what was asked for; `requiresApproval` gets its own line.
+    var launchesAtLogin: Bool {
+        switch launchAtLoginStatus {
+        case .enabled, .requiresApproval: return true
+        default: return false
+        }
+    }
+
+    /// Fails outside a signed bundle, which is normal in development. The
+    /// failure used to be swallowed, and the toggle flipped back with no word why.
+    func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            launchAtLoginError = nil
+        } catch {
+            launchAtLoginError = error.localizedDescription
         }
         objectWillChange.send()
     }
+
+    func openLoginItemsSettings() {
+        SMAppService.openSystemSettingsLoginItems()
+    }
 }
 
-/// Watches the directory, not the file: an atomic rename replaces the inode and
-/// leaves a file-level watch pointed at nothing.
+/// Watches the directory and the file. The directory catches the atomic rename
+/// most editors save with, which replaces the inode and leaves a file-level
+/// watch pointed at nothing; the file catches an in-place write, which the
+/// directory never sees. The file watch is re-armed after every directory
+/// event, since that is when the inode may have changed.
 private final class ConfigWatcher {
-    private let source: DispatchSourceFileSystemObject?
-    private let descriptor: CInt
+    private let path: String
+    private let onChange: () -> Void
+    private var directorySource: DispatchSourceFileSystemObject?
+    private var fileSource: DispatchSourceFileSystemObject?
+    private var pending: DispatchWorkItem?
 
+    /// The directory itself was deleted or moved, so the descriptor points at
+    /// nothing that will change again. `rm -rf ~/.redash-wire` and a second
+    /// run through onboarding is what this looks like.
+    private(set) var isStale = false
+
+    /// One save is several events — a temp file, a rename, an editor's swap
+    /// file coming and going — and each used to be a reload.
+    private static let quietPeriod: TimeInterval = 0.3
+
+    /// Nil when the directory does not exist yet, which is what a first run
+    /// looks like. The caller tries again once onboarding has created it.
     init?(path: String, onChange: @escaping () -> Void) {
+        self.path = path
+        self.onChange = onChange
+
         let directory = (path as NSString).deletingLastPathComponent
-        descriptor = open(directory, O_EVTONLY)
+        guard let source = Self.watch(directory, for: [.write, .rename, .delete], handler: { [weak self] events in
+            guard let self else { return }
+            if !events.isDisjoint(with: [.rename, .delete]) {
+                self.isStale = true
+            }
+            self.rearmFile()
+            self.changed()
+        }) else { return nil }
+        directorySource = source
+        rearmFile()
+    }
+
+    deinit {
+        pending?.cancel()
+        directorySource?.cancel()
+        fileSource?.cancel()
+    }
+
+    private func rearmFile() {
+        fileSource?.cancel()
+        fileSource = Self.watch(path, for: [.write, .extend, .rename, .delete], handler: { [weak self] _ in
+            self?.changed()
+        })
+    }
+
+    private func changed() {
+        pending?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.onChange() }
+        pending = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.quietPeriod, execute: work)
+    }
+
+    private static func watch(
+        _ path: String,
+        for events: DispatchSource.FileSystemEvent,
+        handler: @escaping (DispatchSource.FileSystemEvent) -> Void
+    ) -> DispatchSourceFileSystemObject? {
+        let descriptor = open(path, O_EVTONLY)
         guard descriptor >= 0 else { return nil }
 
         let source = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: descriptor,
-            eventMask: [.write, .rename, .delete],
+            eventMask: events,
             queue: .main
         )
-        source.setEventHandler(handler: onChange)
-        let fd = descriptor
-        source.setCancelHandler { close(fd) }
+        source.setEventHandler { [weak source] in
+            handler(source?.data ?? [])
+        }
+        source.setCancelHandler { close(descriptor) }
         source.resume()
-        self.source = source
-    }
-
-    deinit {
-        source?.cancel()
+        return source
     }
 }
