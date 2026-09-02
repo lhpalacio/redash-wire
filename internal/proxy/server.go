@@ -44,7 +44,7 @@ type Server struct {
 	username     string
 	password     string
 	gate         *health.Gate
-	connSeq      atomic.Int64
+	connSeq      atomic.Uint32
 
 	// cancelers maps each session's ProcessID to the secret it was handed and a
 	// hook that cancels its in-flight query. A PostgreSQL CancelRequest arrives on
@@ -170,7 +170,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 
 	// A per-session ProcessID/SecretKey. The ProcessID doubles as the session id in
 	// the logs; the secret makes a CancelRequest unforgeable by another client.
-	pid := uint32(s.connSeq.Add(1))
+	pid := s.connSeq.Add(1)
 	secret := make([]byte, 4)
 	_, _ = rand.Read(secret)
 

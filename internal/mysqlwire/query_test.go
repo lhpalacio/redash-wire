@@ -680,8 +680,8 @@ func TestHandleLocalSelect(t *testing.T) {
 		if result == nil || result.Resultset == nil {
 			t.Fatalf("handleLocalQuery(%q): no result set", sql)
 		}
-		names := make([]string, len(result.Resultset.Fields))
-		for i, f := range result.Resultset.Fields {
+		names := make([]string, len(result.Fields))
+		for i, f := range result.Fields {
 			names[i] = string(f.Name)
 		}
 		rows := parseTextRows(t, result.Resultset)
