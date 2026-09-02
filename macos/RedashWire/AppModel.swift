@@ -12,6 +12,11 @@ final class AppModel: ObservableObject {
     /// restarting it. Shown while it stays stopped.
     @Published private(set) var reloadNotice: String?
     @Published private(set) var launchAtLoginError: String?
+    /// Profiles the menu has locked to read-only, by name. The config's own
+    /// `read_only` is separate and stronger: it cannot be unlocked from here.
+    @Published private(set) var readOnlyPreferences: [String: Bool]
+
+    private static let readOnlyPreferencesKey = "readOnlyProfiles"
 
     let cli: WireCLI
     let supervisor: ProxySupervisor
@@ -24,6 +29,7 @@ final class AppModel: ObservableObject {
     init(cli: WireCLI = .standard()) {
         self.cli = cli
         self.supervisor = ProxySupervisor(cli: cli)
+        self.readOnlyPreferences = UserDefaults.standard.dictionary(forKey: Self.readOnlyPreferencesKey) as? [String: Bool] ?? [:]
     }
 
 
@@ -61,6 +67,26 @@ final class AppModel: ObservableObject {
             return selectedProfileName
         }
         return supervisor.activeProfile?.name ?? selectedProfileName
+    }
+
+    /// Whether the menu has locked this profile, whatever its config says.
+    func prefersReadOnly(_ profile: Profile) -> Bool {
+        readOnlyPreferences[profile.name] ?? false
+    }
+
+    /// What a start of this profile would run as: locked by the config or by
+    /// the menu.
+    func isReadOnly(_ profile: Profile) -> Bool {
+        profile.readOnly || prefersReadOnly(profile)
+    }
+
+    /// What the status line reports, following `describedProfileName`: the
+    /// running process's own mode, or what the next start would use.
+    var describedReadOnly: Bool {
+        if supervisor.state == .stopped {
+            return selectedProfile.map(isReadOnly) ?? false
+        }
+        return supervisor.activeReadOnly
     }
 
     /// Set while the proxy runs a profile the config no longer matches. Nil
@@ -177,7 +203,7 @@ final class AppModel: ObservableObject {
         // reloading is the moment to find out whether it worked. A stopped one
         // stays stopped: that was a choice, not a failure.
         if case .failed = supervisor.state, let profile = selectedProfile {
-            await supervisor.start(profile: profile)
+            await supervisor.start(profile: profile, readOnly: isReadOnly(profile))
             return
         }
 
@@ -189,7 +215,7 @@ final class AppModel: ObservableObject {
         case .keep:
             return
         case .restart(let profile):
-            await supervisor.restart(profile: profile)
+            await supervisor.restart(profile: profile, readOnly: isReadOnly(profile))
         case .stop:
             await supervisor.stop()
             reloadNotice = "Stopped: profile “\(running.name)” is no longer in the config."
@@ -229,8 +255,26 @@ final class AppModel: ObservableObject {
         if supervisor.state.isActive {
             await supervisor.stop()
         } else if let profile = selectedProfile {
-            await supervisor.start(profile: profile)
+            await supervisor.start(profile: profile, readOnly: isReadOnly(profile))
         }
+    }
+
+    /// A failed proxy is retried on the on-disk selection, as Start would.
+    func retry() async {
+        guard let profile = selectedProfile else { return }
+        await supervisor.start(profile: profile, readOnly: isReadOnly(profile))
+    }
+
+    /// Flipping the lock on the profile that is running restarts the proxy, the
+    /// way switching profiles does, so the menu never describes a mode the
+    /// process is not in. On a stopped proxy it simply applies at the next
+    /// start.
+    func setReadOnly(_ locked: Bool, for profile: Profile) async {
+        readOnlyPreferences[profile.name] = locked
+        UserDefaults.standard.set(readOnlyPreferences, forKey: Self.readOnlyPreferencesKey)
+
+        guard supervisor.state.isActive, let running = supervisor.activeProfile, running.name == profile.name else { return }
+        await supervisor.restart(profile: running, readOnly: running.readOnly || locked)
     }
 
     func select(profile: Profile) async {
@@ -239,8 +283,8 @@ final class AppModel: ObservableObject {
         await run(profile)
     }
 
-    func runOnboarding(redashURL: String, profile: String, apiKey: String) async throws -> InitResult {
-        let result = try await cli.initialize(redashURL: redashURL, profile: profile, apiKey: apiKey)
+    func runOnboarding(redashURL: String, profile: String, apiKey: String, readOnly: Bool) async throws -> InitResult {
+        let result = try await cli.initialize(redashURL: redashURL, profile: profile, apiKey: apiKey, readOnly: readOnly)
         await reloadConfig()
         selectedProfileName = result.profile
         if let profile = selectedProfile {
@@ -256,9 +300,9 @@ final class AppModel: ObservableObject {
     /// reads the config, so it reports the reason and the menu shows it as failed.
     private func run(_ profile: Profile) async {
         if supervisor.state.isActive {
-            await supervisor.switchTo(profile: profile)
+            await supervisor.switchTo(profile: profile, readOnly: isReadOnly(profile))
         } else {
-            await supervisor.start(profile: profile)
+            await supervisor.start(profile: profile, readOnly: isReadOnly(profile))
         }
     }
 

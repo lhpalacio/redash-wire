@@ -13,11 +13,21 @@ import (
 // it alone. Callers test for it with errors.Is.
 var ErrExists = errors.New("config file already exists")
 
-func NewFileConfig(profileName, redashURL, apiKey, username, password string, enablePostgres, enableMySQL bool) *FileConfig {
+// NewFileConfig builds a one-profile config the way the wizard and init write
+// it. readOnly is recorded on the profile, and only when set, so a writable
+// config carries no read_only line to puzzle over.
+func NewFileConfig(profileName, redashURL, apiKey, username, password string, enablePostgres, enableMySQL, readOnly bool) *FileConfig {
 	// A written config must always pass the at-least-one-listener validation in
 	// Load, regardless of caller bugs.
 	if !enablePostgres && !enableMySQL {
 		enablePostgres = true
+	}
+	profile := Config{
+		RedashURL: redashURL,
+		APIKey:    apiKey,
+	}
+	if readOnly {
+		profile.ReadOnly = &readOnly
 	}
 	fc := &FileConfig{
 		Username:       username,
@@ -26,10 +36,7 @@ func NewFileConfig(profileName, redashURL, apiKey, username, password string, en
 		PollTimeout:    "120s",
 		DefaultProfile: profileName,
 		Profiles: map[string]Config{
-			profileName: {
-				RedashURL: redashURL,
-				APIKey:    apiKey,
-			},
+			profileName: profile,
 		},
 	}
 	if enablePostgres {

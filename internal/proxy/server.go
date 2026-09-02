@@ -44,6 +44,7 @@ type Server struct {
 	username     string
 	password     string
 	gate         *health.Gate
+	readOnly     bool
 	connSeq      atomic.Uint32
 
 	// cancelers maps each session's ProcessID to the secret it was handed and a
@@ -66,6 +67,12 @@ type ServerOption func(*Server)
 // about the wire protocol rather than about health want.
 func WithGate(g *health.Gate) ServerOption {
 	return func(s *Server) { s.gate = g }
+}
+
+// WithReadOnly makes every session refuse statements that are not reads before
+// they reach Redash, and report the mode to clients that ask.
+func WithReadOnly(on bool) ServerOption {
+	return func(s *Server) { s.readOnly = on }
 }
 
 func NewServer(listenAddr string, logger *slog.Logger, redashClient redash.RedashAPI, registry redash.SourceRegistry, username, password string, opts ...ServerOption) *Server {
@@ -175,7 +182,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	_, _ = rand.Read(secret)
 
 	logger := s.logger.With("remote_addr", conn.RemoteAddr().String(), "session_id", pid)
-	session := newSession(conn, logger, s.redashClient, s.registry, s.gate, s.resolvedAddr, s.username, s.password)
+	session := newSession(conn, logger, s.redashClient, s.registry, s.gate, s.resolvedAddr, s.username, s.password, s.readOnly)
 	session.backendKey = pgproto3.BackendKeyData{ProcessID: pid, SecretKey: secret}
 	session.onCancel = s.cancelByKey
 

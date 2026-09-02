@@ -75,6 +75,7 @@ func serve() {
 	logFormat := flag.String("log-format", formatText, "log output format: text or json")
 	exitOnStdinEOF := flag.Bool("exit-on-stdin-eof", false, "shut down when stdin reaches EOF, for use under a supervising parent process")
 	waitForRedash := flag.Bool("wait-for-redash", false, "bind and wait instead of exiting when Redash is unreachable, refusing connections until it recovers")
+	readOnlyFlag := flag.Bool("read-only", false, "refuse every statement that is not a read, whatever the profile's read_only says")
 	flag.Parse()
 
 	if *showVersion {
@@ -130,7 +131,7 @@ func serve() {
 			os.Exit(1)
 		}
 
-		fc := config.NewFileConfig(result.ProfileName, result.RedashURL, result.APIKey, result.Username, result.Password, result.HasPostgres, result.HasMySQL)
+		fc := config.NewFileConfig(result.ProfileName, result.RedashURL, result.APIKey, result.Username, result.Password, result.HasPostgres, result.HasMySQL, result.ReadOnly)
 		if err := config.WriteConfig(resolved.Path, fc); err != nil {
 			logger.Error("writing config", "error", err)
 			os.Exit(1)
@@ -153,6 +154,17 @@ func serve() {
 	}
 
 	warnDefaultCredentials(logger, cfg)
+
+	// The flag can only tighten: a profile that says read_only stays read-only
+	// without it, so a launcher cannot loosen the config by leaving it off.
+	readOnly := cfg.IsReadOnly() || *readOnlyFlag
+	if readOnly {
+		source := "config"
+		if !cfg.IsReadOnly() {
+			source = "flag"
+		}
+		logger.Info("read-only mode enabled: statements that are not reads will be refused", "source", source)
+	}
 
 	// Auto-discovered cwd config is a secret-exfiltration risk: an untrusted
 	// directory's config.yaml could point at an attacker URL and ${ENV} expand a
@@ -245,7 +257,7 @@ func serve() {
 	}
 
 	if !machineReadable {
-		printBanner(cfg, resolved.Path, registry.All(), gate.Up(), session)
+		printBanner(cfg, resolved.Path, registry.All(), gate.Up(), session, readOnly)
 	}
 
 	sigCh := make(chan os.Signal, 1)
@@ -276,14 +288,14 @@ func serve() {
 	}
 
 	if cfg.PostgresListenAddr != "" {
-		pgSrv := proxy.NewServer(cfg.PostgresListenAddr, logger, redashClient, registry, cfg.Username, cfg.Password, proxy.WithGate(gate))
+		pgSrv := proxy.NewServer(cfg.PostgresListenAddr, logger, redashClient, registry, cfg.Username, cfg.Password, proxy.WithGate(gate), proxy.WithReadOnly(readOnly))
 		startServer(pgSrv.ListenAndServe)
 	} else {
 		logger.Info("PostgreSQL listener disabled (no postgres_listen_addr configured)")
 	}
 
 	if cfg.MySQLListenAddr != "" {
-		mysqlSrv := mysqlwire.NewServer(cfg.MySQLListenAddr, logger, redashClient, registry, cfg.Username, cfg.Password, mysqlwire.WithGate(gate))
+		mysqlSrv := mysqlwire.NewServer(cfg.MySQLListenAddr, logger, redashClient, registry, cfg.Username, cfg.Password, mysqlwire.WithGate(gate), mysqlwire.WithReadOnly(readOnly))
 		startServer(mysqlSrv.ListenAndServe)
 	}
 
@@ -351,7 +363,7 @@ func warnDefaultCredentials(logger *slog.Logger, cfg *config.Config) {
 	}
 }
 
-func printBanner(cfg *config.Config, configPath string, sources []redash.DataSource, checked bool, session *redash.SessionInfo) {
+func printBanner(cfg *config.Config, configPath string, sources []redash.DataSource, checked bool, session *redash.SessionInfo, readOnly bool) {
 	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render("redash-wire")
 	label := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	value := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
@@ -418,11 +430,17 @@ func printBanner(cfg *config.Config, configPath string, sources []redash.DataSou
 
 	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 
+	mode := ""
+	if readOnly {
+		mode = "  " + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214")).Render("read-only")
+	}
+
 	fmt.Fprintln(os.Stderr)
-	fmt.Fprintf(os.Stderr, "  %s %s  %s %s  %s %s\n", title,
+	fmt.Fprintf(os.Stderr, "  %s %s  %s %s  %s %s%s\n", title,
 		dim.Render(version),
 		dim.Render("profile:"), value.Render(cfg.Profile),
-		dim.Render("config:"), value.Render(shortenHome(configPath)))
+		dim.Render("config:"), value.Render(shortenHome(configPath)),
+		mode)
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, lipgloss.NewStyle().MarginLeft(2).Render(redashBox))
 	fmt.Fprintln(os.Stderr, lipgloss.NewStyle().MarginLeft(2).Render(servers))

@@ -32,6 +32,8 @@ struct Profile: Decodable, Identifiable, Equatable {
     let defaultCredentials: Bool
     let pollInterval: String
     let pollTimeout: String
+    /// Resolved from the config, so the menu can show it but not turn it off.
+    let readOnly: Bool
     let valid: Bool
     let error: String
 
@@ -48,6 +50,7 @@ struct Profile: Decodable, Identifiable, Equatable {
         case defaultCredentials = "default_credentials"
         case pollInterval = "poll_interval"
         case pollTimeout = "poll_timeout"
+        case readOnly = "read_only"
         case valid
         case error
     }
@@ -116,6 +119,7 @@ struct InitResult: Decodable {
     let redashURL: String
     let postgresEnabled: Bool
     let mysqlEnabled: Bool
+    let readOnly: Bool
     let dataSources: Int
     let userName: String
     let userEmail: String
@@ -127,6 +131,7 @@ struct InitResult: Decodable {
         case redashURL = "redash_url"
         case postgresEnabled = "postgres_enabled"
         case mysqlEnabled = "mysql_enabled"
+        case readOnly = "read_only"
         case dataSources = "data_sources"
         case userName = "user_name"
         case userEmail = "user_email"

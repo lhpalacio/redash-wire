@@ -9,6 +9,7 @@ struct OnboardingView: View {
     @State private var redashURL = ""
     @State private var profileName = "default"
     @State private var apiKey = ""
+    @State private var readOnly = false
     @State private var isWorking = false
     @State private var errorMessage: String?
     @State private var remedy: String?
@@ -64,6 +65,11 @@ struct OnboardingView: View {
                 Text("Profile")
                 TextField("default", text: $profileName)
             }
+            GridRow {
+                Text("")
+                Toggle("Read-only: refuse writes and schema changes", isOn: $readOnly)
+                    .toggleStyle(.checkbox)
+            }
         }
         .textFieldStyle(.roundedBorder)
         .disabled(isWorking)
@@ -90,6 +96,10 @@ struct OnboardingView: View {
                 .foregroundStyle(.secondary)
             Text("\(result.dataSources) data source\(result.dataSources == 1 ? "" : "s") available")
                 .foregroundStyle(.secondary)
+            if result.readOnly {
+                Text("Read-only: writes are refused")
+                    .foregroundStyle(.secondary)
+            }
             HStack {
                 Spacer()
                 Button("Done") { dismiss() }
@@ -126,7 +136,8 @@ struct OnboardingView: View {
                 result = try await model.runOnboarding(
                     redashURL: redashURL.trimmingCharacters(in: .whitespacesAndNewlines),
                     profile: profileName.trimmingCharacters(in: .whitespacesAndNewlines),
-                    apiKey: apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                    apiKey: apiKey.trimmingCharacters(in: .whitespacesAndNewlines),
+                    readOnly: readOnly
                 )
                 // It lives in the config now.
                 apiKey = ""

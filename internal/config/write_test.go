@@ -14,7 +14,7 @@ func TestWriteConfig_CreatesDirectoriesAndFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sub", "deep", "config.yaml")
 
-	fc := NewFileConfig("test", "http://redash.example.com", "mykey123", "redash-wire", "pw", true, false)
+	fc := NewFileConfig("test", "http://redash.example.com", "mykey123", "redash-wire", "pw", true, false, false)
 	if err := WriteConfig(path, fc); err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestWriteConfig_RefusesExistingFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := WriteConfig(path, NewFileConfig("p", "http://redash.example.com", "new-key", "u", "pw", true, false))
+	err := WriteConfig(path, NewFileConfig("p", "http://redash.example.com", "new-key", "u", "pw", true, false, false))
 	if !errors.Is(err, ErrExists) {
 		t.Fatalf("WriteConfig over an existing file: got %v, want ErrExists", err)
 	}
@@ -72,7 +72,7 @@ func TestWriteConfig_ConcurrentWritersOnlyOneWins(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			fc := NewFileConfig("p", "http://redash.example.com", fmt.Sprintf("key-%d", i), "u", "pw", true, false)
+			fc := NewFileConfig("p", "http://redash.example.com", fmt.Sprintf("key-%d", i), "u", "pw", true, false, false)
 			errs[i] = WriteConfig(path, fc)
 		}()
 	}
@@ -120,7 +120,7 @@ func TestWriteConfig_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 
-	fc := NewFileConfig("myprofile", "http://redash.test.com", "secret-key", "redash-wire", "pw", true, false)
+	fc := NewFileConfig("myprofile", "http://redash.test.com", "secret-key", "redash-wire", "pw", true, false, false)
 	if err := WriteConfig(path, fc); err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestWriteConfig_RoundTrip_MySQLOnly(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 
-	fc := NewFileConfig("myprofile", "http://redash.test.com", "secret-key", "redash-wire", "pw", false, true)
+	fc := NewFileConfig("myprofile", "http://redash.test.com", "secret-key", "redash-wire", "pw", false, true, false)
 	if err := WriteConfig(path, fc); err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestWriteConfig_PostgresOnly_CommentsOutMySQL(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 
-	fc := NewFileConfig("myprofile", "http://redash.test.com", "secret-key", "redash-wire", "pw", true, false)
+	fc := NewFileConfig("myprofile", "http://redash.test.com", "secret-key", "redash-wire", "pw", true, false, false)
 	if err := WriteConfig(path, fc); err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +214,7 @@ func TestNewFileConfig_NoListenersForcesPostgres(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 
-	fc := NewFileConfig("myprofile", "http://redash.test.com", "secret-key", "redash-wire", "pw", false, false)
+	fc := NewFileConfig("myprofile", "http://redash.test.com", "secret-key", "redash-wire", "pw", false, false, false)
 	if err := WriteConfig(path, fc); err != nil {
 		t.Fatal(err)
 	}
@@ -225,5 +225,35 @@ func TestNewFileConfig_NoListenersForcesPostgres(t *testing.T) {
 	}
 	if cfg.PostgresListenAddr != "127.0.0.1:15432" {
 		t.Errorf("PostgresListenAddr = %q, want forced default", cfg.PostgresListenAddr)
+	}
+}
+
+// A read-only setup lands on the profile, and a writable one writes no
+// read_only line at all.
+func TestWriteConfig_ReadOnlyRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+
+	locked := filepath.Join(dir, "locked.yaml")
+	if err := WriteConfig(locked, NewFileConfig("agent", "http://redash.test.com", "k", "u", "pw", true, false, true)); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(locked, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.IsReadOnly() {
+		t.Error("read_only: true did not survive the round trip")
+	}
+
+	open := filepath.Join(dir, "open.yaml")
+	if err := WriteConfig(open, NewFileConfig("me", "http://redash.test.com", "k", "u", "pw", true, false, false)); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "read_only") {
+		t.Errorf("a writable config must not mention read_only:\n%s", data)
 	}
 }

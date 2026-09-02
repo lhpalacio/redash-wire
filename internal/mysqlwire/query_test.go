@@ -509,7 +509,7 @@ func TestLikeMatcher(t *testing.T) {
 }
 
 func TestHandleShowVariables(t *testing.T) {
-	result, err := handleShowVariables()
+	result, err := handleShowVariables(false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

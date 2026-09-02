@@ -35,7 +35,7 @@ func defaultMockAndRegistry() (*testutil.MockRedashAPI, *testutil.MockSourceRegi
 	return mock, registry
 }
 
-func startPGServer(t *testing.T, mock *testutil.MockRedashAPI, registry *testutil.MockSourceRegistry) string {
+func startPGServer(t *testing.T, mock *testutil.MockRedashAPI, registry *testutil.MockSourceRegistry, opts ...proxy.ServerOption) string {
 	t.Helper()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -43,7 +43,7 @@ func startPGServer(t *testing.T, mock *testutil.MockRedashAPI, registry *testuti
 		t.Fatalf("listen: %v", err)
 	}
 
-	srv := proxy.NewServer(ln.Addr().String(), discardLogger, mock, registry, testUser, testPass)
+	srv := proxy.NewServer(ln.Addr().String(), discardLogger, mock, registry, testUser, testPass, opts...)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -60,7 +60,7 @@ func startPGServer(t *testing.T, mock *testutil.MockRedashAPI, registry *testuti
 	return ln.Addr().String()
 }
 
-func startMySQLServer(t *testing.T, mock *testutil.MockRedashAPI, registry *testutil.MockSourceRegistry) string {
+func startMySQLServer(t *testing.T, mock *testutil.MockRedashAPI, registry *testutil.MockSourceRegistry, opts ...mysqlwire.ServerOption) string {
 	t.Helper()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -68,7 +68,7 @@ func startMySQLServer(t *testing.T, mock *testutil.MockRedashAPI, registry *test
 		t.Fatalf("listen: %v", err)
 	}
 
-	srv := mysqlwire.NewServer(ln.Addr().String(), discardLogger, mock, registry, testUser, testPass)
+	srv := mysqlwire.NewServer(ln.Addr().String(), discardLogger, mock, registry, testUser, testPass, opts...)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

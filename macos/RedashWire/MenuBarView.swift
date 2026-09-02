@@ -131,7 +131,10 @@ struct MenuBarView: View {
     }
 
     private var statusLine: String {
-        let name = (model.describedProfileName ?? "no profile").fittedToMenu(limit: 24)
+        var name = (model.describedProfileName ?? "no profile").fittedToMenu(limit: 24)
+        if model.describedReadOnly {
+            name += " · read-only"
+        }
         switch supervisor.state {
         case .stopped:
             return "Stopped — \(name)"
@@ -226,13 +229,24 @@ struct MenuBarView: View {
 
         if case .failed = supervisor.state {
             Button {
-                Task {
-                    if let profile = model.selectedProfile {
-                        await supervisor.start(profile: profile)
-                    }
-                }
+                Task { await model.retry() }
             } label: {
                 Label("Retry", systemImage: "arrow.clockwise")
+            }
+        }
+
+        // The lock for the selected profile. One the config already locks shows
+        // checked and greyed: the menu can add a lock, never remove the file's.
+        if let profile = model.selectedProfile {
+            Toggle(isOn: Binding(
+                get: { model.isReadOnly(profile) },
+                set: { locked in Task { await model.setReadOnly(locked, for: profile) } }
+            )) {
+                Label("Read-only", systemImage: "lock")
+            }
+            .disabled(profile.readOnly)
+            if profile.readOnly {
+                Text("Set by read_only in the config")
             }
         }
     }
@@ -258,7 +272,11 @@ struct MenuBarView: View {
     }
 
     private func profileLabel(_ profile: Profile) -> String {
-        profile.valid ? profile.name : "\(profile.name) (invalid)"
+        var label = profile.valid ? profile.name : "\(profile.name) (invalid)"
+        if model.isReadOnly(profile) {
+            label += " (read-only)"
+        }
+        return label
     }
 
 

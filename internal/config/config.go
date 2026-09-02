@@ -22,6 +22,9 @@ type Config struct {
 	Password           string `yaml:"password,omitempty"`
 	PollInterval       string `yaml:"poll_interval,omitempty"`
 	PollTimeout        string `yaml:"poll_timeout,omitempty"`
+	// ReadOnly makes the proxy refuse every statement that is not a read. A
+	// pointer so a profile can say "false" over a top-level "true"; nil is unset.
+	ReadOnly *bool `yaml:"read_only,omitempty"`
 }
 
 type FileConfig struct {
@@ -31,6 +34,7 @@ type FileConfig struct {
 	Password           string            `yaml:"password,omitempty"`
 	PollInterval       string            `yaml:"poll_interval,omitempty"`
 	PollTimeout        string            `yaml:"poll_timeout,omitempty"`
+	ReadOnly           *bool             `yaml:"read_only,omitempty"`
 	DefaultProfile     string            `yaml:"default_profile"`
 	Profiles           map[string]Config `yaml:"profiles"`
 }
@@ -55,6 +59,11 @@ func (c *Config) GetPollInterval() time.Duration {
 		return 500 * time.Millisecond
 	}
 	return d
+}
+
+// IsReadOnly reports whether the profile refuses writes. Unset means no.
+func (c *Config) IsReadOnly() bool {
+	return c.ReadOnly != nil && *c.ReadOnly
 }
 
 func (c *Config) GetPollTimeout() time.Duration {
@@ -190,6 +199,7 @@ func resolveProfile(fc *FileConfig, profile string) (*Config, error) {
 	overlay(&cfg.Password, fc.Password)
 	overlay(&cfg.PollInterval, fc.PollInterval)
 	overlay(&cfg.PollTimeout, fc.PollTimeout)
+	overlayBool(&cfg.ReadOnly, fc.ReadOnly)
 
 	overlay(&cfg.PostgresListenAddr, p.PostgresListenAddr)
 	overlay(&cfg.MySQLListenAddr, p.MySQLListenAddr)
@@ -199,6 +209,7 @@ func resolveProfile(fc *FileConfig, profile string) (*Config, error) {
 	overlay(&cfg.Password, p.Password)
 	overlay(&cfg.PollInterval, p.PollInterval)
 	overlay(&cfg.PollTimeout, p.PollTimeout)
+	overlayBool(&cfg.ReadOnly, p.ReadOnly)
 
 	// Only the URL and API key support ${ENV_VAR} expansion (as documented in
 	// config.example.yaml). Username/password are taken literally so a literal
@@ -252,6 +263,16 @@ func (c *Config) UsesDefaultCredentials() bool {
 func overlay(dst *string, src string) {
 	if src != "" {
 		*dst = src
+	}
+}
+
+// overlayBool is overlay for a tri-state flag: only a value that was actually
+// written (non-nil) replaces the layer below, so a profile can turn read_only
+// off over a top-level on.
+func overlayBool(dst **bool, src *bool) {
+	if src != nil {
+		v := *src
+		*dst = &v
 	}
 }
 

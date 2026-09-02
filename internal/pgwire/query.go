@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -326,10 +327,17 @@ func commandTag(sql string, rowCount int) string {
 }
 
 func SendError(conn io.Writer, msg string) error {
+	return SendErrorCode(conn, "XX000", msg, "")
+}
+
+// SendErrorCode writes an ErrorResponse with the given SQLSTATE and an optional
+// hint, then the ReadyForQuery that ends the simple-query cycle.
+func SendErrorCode(conn io.Writer, code, msg, hint string) error {
 	buf, err := encode((&pgproto3.ErrorResponse{
 		Severity: "ERROR",
-		Code:     "XX000",
+		Code:     code,
 		Message:  msg,
+		Hint:     hint,
 	}).Encode(nil))
 	if err != nil {
 		return err
@@ -547,8 +555,31 @@ func containsPgCatalogRef(lower string) bool {
 	return false
 }
 
-func HandleLocalQuery(conn io.Writer, sql string, startupParams map[string]string, sources []redash.DataSource, listenAddr string) error {
+// LocalSession is what a locally answered query can see of the connection.
+type LocalSession struct {
+	StartupParams map[string]string
+	Sources       []redash.DataSource
+	ListenAddr    string
+	// ReadOnly makes SHOW transaction_read_only answer on, and refuses the SET
+	// and BEGIN forms that would ask for a read-write transaction.
+	ReadOnly bool
+}
+
+// ReadOnlyHint is the hint attached to every read-only refusal, so a client (or
+// an agent driving one) learns the mode belongs to the proxy, not the session.
+const ReadOnlyHint = "redash-wire is running in read-only mode for this profile; only reads reach Redash. Set read_only: false in the config to allow writes."
+
+func HandleLocalQuery(conn io.Writer, sql string, sess LocalSession) error {
 	lower := normalize(sql)
+	startupParams, sources, listenAddr := sess.StartupParams, sess.Sources, sess.ListenAddr
+
+	// Real PostgreSQL lets a session switch a read-only default off. The proxy's
+	// mode is the operator's, so the request is refused the way a hot standby
+	// refuses it, rather than swallowed as SET usually is here: a silent OK would
+	// have the next write fail for a reason the client believes it just removed.
+	if sess.ReadOnly && asksForReadWrite(lower, sql) {
+		return SendErrorCode(conn, SQLStateReadOnly, "cannot set transaction read-write mode while redash-wire is in read-only mode", ReadOnlyHint)
+	}
 
 	if hasKeyword(lower, "set") {
 		return SendCommandComplete(conn, "SET")
@@ -575,7 +606,7 @@ func HandleLocalQuery(conn io.Writer, sql string, startupParams map[string]strin
 		// The statement arrives verbatim, so "SHOW x;" still carries its
 		// terminator; it is not part of the parameter name.
 		param := strings.TrimSpace(strings.TrimRight(lower[len("show"):], "; \t\r\n"))
-		return handleShowCommand(conn, param)
+		return handleShowCommand(conn, param, sess.ReadOnly)
 	}
 
 	// Catalog tables come before the scalar-function shortcuts: a pg_database
@@ -693,22 +724,64 @@ func handlePgDatabaseQuery(conn io.Writer, sources []redash.DataSource) error {
 	return err
 }
 
-func handleShowCommand(conn io.Writer, param string) error {
+// asksForReadWrite recognises the statements that would turn a read-only
+// default off for the session: SET [SESSION] transaction_read_only /
+// default_transaction_read_only to off, SET SESSION CHARACTERISTICS AS
+// TRANSACTION READ WRITE, and BEGIN / START TRANSACTION READ WRITE. lower is
+// the redacted, lowercased statement, which settles its shape; the value of a
+// SET is read from raw, since it may be a quoted literal the redaction blanked.
+func asksForReadWrite(lower, raw string) bool {
+	fields := strings.Fields(strings.ReplaceAll(strings.ReplaceAll(lower, "=", " "), ";", " "))
+	if len(fields) == 0 {
+		return false
+	}
+	switch fields[0] {
+	case "set":
+		if m := readOnlySetting.FindStringSubmatch(strings.ToLower(raw)); m != nil {
+			switch m[1] {
+			case "off", "false", "0", "no":
+				return true
+			}
+		}
+		return hasReadWrite(fields)
+	case "begin", "start":
+		return hasReadWrite(fields)
+	}
+	return false
+}
+
+// readOnlySetting matches the value given to transaction_read_only or
+// default_transaction_read_only in a SET, with either "=" or TO and optional
+// quotes: the forms psql, pgx and pgjdbc send.
+var readOnlySetting = regexp.MustCompile(`(?:^|[^a-z0-9_])(?:default_)?transaction_read_only\s*(?:=|\bto\b)\s*'?([a-z0-9]+)'?`)
+
+func hasReadWrite(fields []string) bool {
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] == "read" && fields[i+1] == "write" {
+			return true
+		}
+	}
+	return false
+}
+
+func handleShowCommand(conn io.Writer, param string, readOnly bool) error {
 	values := map[string]string{
-		"server_version":              "14.0",
-		"server_encoding":             "UTF8",
-		"client_encoding":             "UTF8",
-		"lc_collate":                  "en_US.UTF-8",
-		"lc_ctype":                    "en_US.UTF-8",
-		"is_superuser":                "on",
-		"session_authorization":       "redash",
-		"standard_conforming_strings": "on",
-		"timezone":                    "UTC",
-		"datestyle":                   "ISO, MDY",
-		"integer_datetimes":           "on",
-		"max_identifier_length":       "63",
-		"transaction_isolation":       "read committed",
-		"search_path":                 "\"$user\", public",
+		"server_version":                "14.0",
+		"server_encoding":               "UTF8",
+		"client_encoding":               "UTF8",
+		"lc_collate":                    "en_US.UTF-8",
+		"lc_ctype":                      "en_US.UTF-8",
+		"is_superuser":                  "on",
+		"session_authorization":         "redash",
+		"standard_conforming_strings":   "on",
+		"timezone":                      "UTC",
+		"datestyle":                     "ISO, MDY",
+		"integer_datetimes":             "on",
+		"max_identifier_length":         "63",
+		"transaction_isolation":         "read committed",
+		"search_path":                   "\"$user\", public",
+		"transaction_read_only":         onOff(readOnly),
+		"default_transaction_read_only": onOff(readOnly),
 	}
 
 	if val, ok := values[param]; ok {

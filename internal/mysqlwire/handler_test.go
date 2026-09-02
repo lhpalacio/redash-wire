@@ -23,7 +23,7 @@ var testLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
 // sees it while it is still reading the handshake.
 func newRawHandler(t *testing.T, sources []redash.DataSource, mock *testutil.MockRedashAPI, gate *health.Gate, conns *connTable) *handler {
 	t.Helper()
-	return newHandler(context.Background(), testLogger, mock, testutil.NewMockSourceRegistry(sources), gate, conns)
+	return newHandler(context.Background(), testLogger, mock, testutil.NewMockSourceRegistry(sources), gate, conns, false)
 }
 
 // newTestHandler builds a handler past a successful login, with connection id 1.

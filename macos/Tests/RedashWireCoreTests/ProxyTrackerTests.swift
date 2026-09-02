@@ -12,7 +12,7 @@ final class ProxyTrackerTests: XCTestCase {
             name: "prod", redashURL: "https://redash.example.com", apiKeySet: true,
             postgresListenAddr: postgres, mysqlListenAddr: mysql,
             username: "redash-wire", password: "secret", defaultCredentials: true,
-            pollInterval: "500ms", pollTimeout: "120s", valid: true, error: ""
+            pollInterval: "500ms", pollTimeout: "120s", readOnly: false, valid: true, error: ""
         )
     }
 
@@ -125,7 +125,7 @@ final class ProxyTrackerTests: XCTestCase {
 
         for (index, delay) in expected.enumerated() {
             let outcome = tracker.exit(status: 2, stopRequested: false, now: t0)
-            XCTAssertEqual(outcome, .restart(profile(), after: delay), "attempt \(index + 1)")
+            XCTAssertEqual(outcome, .restart(profile(), readOnly: false, after: delay), "attempt \(index + 1)")
             XCTAssertEqual(tracker.state, .starting)
             XCTAssertEqual(tracker.pendingRestart, .init(at: t0.addingTimeInterval(TimeInterval(delay.components.seconds)), attempt: index + 1, limit: 3))
 
@@ -136,6 +136,23 @@ final class ProxyTrackerTests: XCTestCase {
 
         XCTAssertEqual(tracker.exit(status: 2, stopRequested: false, now: t0), .failed)
         XCTAssertEqual(tracker.state, .failed("redash-wire keeps stopping after 3 restarts"))
+    }
+
+    func testTheReadOnlyLockSurvivesACrashRestart() {
+        // The lock belongs to the launch, not the profile: a crash restart that
+        // dropped it would bring the proxy back writable under a menu that
+        // still says read-only.
+        var tracker = ProxyTracker()
+        tracker.start(profile(), readOnly: true)
+        tracker.record(event(WireEvent.listenerReady), now: t0)
+        XCTAssertTrue(tracker.activeReadOnly)
+
+        XCTAssertEqual(tracker.exit(status: 2, stopRequested: false, now: t0), .restart(profile(), readOnly: true, after: .seconds(1)))
+        tracker.launch(profile(), readOnly: true)
+        XCTAssertTrue(tracker.activeReadOnly)
+
+        tracker.start(profile())
+        XCTAssertFalse(tracker.activeReadOnly, "a start without the lock is writable")
     }
 
     func testAManualStartClearsTheRestartBudget() {
@@ -149,7 +166,7 @@ final class ProxyTrackerTests: XCTestCase {
 
         tracker.start(profile())
         tracker.record(event(WireEvent.listenerReady), now: t0)
-        XCTAssertEqual(tracker.exit(status: 2, stopRequested: false, now: t0), .restart(profile(), after: .seconds(1)),
+        XCTAssertEqual(tracker.exit(status: 2, stopRequested: false, now: t0), .restart(profile(), readOnly: false, after: .seconds(1)),
                        "a retry after three crashes must not be born exhausted")
     }
 
@@ -163,13 +180,13 @@ final class ProxyTrackerTests: XCTestCase {
         tracker.record(event(WireEvent.listenerReady), now: t0)
 
         let soon = t0.addingTimeInterval(5)
-        XCTAssertEqual(tracker.exit(status: 2, stopRequested: false, now: soon), .restart(profile(), after: .seconds(2)),
+        XCTAssertEqual(tracker.exit(status: 2, stopRequested: false, now: soon), .restart(profile(), readOnly: false, after: .seconds(2)),
                        "a crash five seconds after binding is still the same streak")
 
         tracker.launch(profile())
         tracker.record(event(WireEvent.listenerReady), now: soon)
         let muchLater = soon.addingTimeInterval(ProxyTracker.stableRun)
-        XCTAssertEqual(tracker.exit(status: 2, stopRequested: false, now: muchLater), .restart(profile(), after: .seconds(1)),
+        XCTAssertEqual(tracker.exit(status: 2, stopRequested: false, now: muchLater), .restart(profile(), readOnly: false, after: .seconds(1)),
                        "a crash after a stable run starts a new streak")
     }
 

@@ -11,6 +11,10 @@ password: "supersecret"
 poll_interval: "500ms"  # how often to poll Redash for query completion
 poll_timeout: "120s"    # give up on a query after this long
 
+# true refuses INSERT, UPDATE, DELETE and schema changes before they reach
+# Redash; only reads go through. Handy for a profile an AI agent connects to.
+read_only: false
+
 # Profile used when the -profile flag is omitted.
 default_profile: integration
 
@@ -22,3 +26,4 @@ profiles:
     redash_url: "https://redash.prod.example.com"
     api_key: "${REDASH_PROD_API_KEY}"
     postgres_listen_addr: "127.0.0.1:25432"  # per-profile override
+    read_only: true                          # a profile can override either way

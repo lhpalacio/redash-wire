@@ -57,6 +57,8 @@ password: "supersecret"
 poll_interval: "500ms"  # how often to poll Redash for query completion
 poll_timeout: "120s"    # give up on a query after this long
 
+read_only: false  # true refuses every statement that is not a read (see below)
+
 # Profile used when the -profile flag is omitted.
 default_profile: integration
 
@@ -68,19 +70,46 @@ profiles:
     redash_url: "https://redash.prod.example.com"
     api_key: "${REDASH_PROD_API_KEY}"
     postgres_listen_addr: "127.0.0.1:25432"  # per-profile override
+    read_only: true                          # lock this one
 ```
 
 Unknown keys fail at startup. Traffic between client and proxy is plaintext,
 and any client that logs in can reach everything the API key can, so keep the
 listeners on localhost unless you trust the network.
 
+### Read-only mode
+
+`read_only: true` makes the proxy refuse every statement that is not a read
+before it reaches Redash. Set it at the top level for every profile, or on one
+profile; a profile can also set `read_only: false` under a top-level `true`.
+It's meant for a profile an AI agent or a script connects through, where a
+stray `UPDATE` would cost more than the query is worth.
+
+What goes through: `SELECT`, `WITH … SELECT`, `VALUES`, `TABLE`, `SHOW`,
+`DESCRIBE`, and `EXPLAIN` of any of those. Everything else is refused, including
+a read that carries a write: a data-modifying CTE, `SELECT … INTO`, `SELECT …
+FOR UPDATE`, `EXPLAIN ANALYZE UPDATE …`. The refusal is the one a read-only
+server sends, so clients already know it: SQLSTATE `25006` on PostgreSQL, error
+`1290` on MySQL, with a hint naming redash-wire. The mode is reported too:
+`SHOW transaction_read_only` and `SELECT @@read_only` say on, and DBeaver and
+DataGrip show their read-only badge. A session can't switch it off; `SET
+transaction_read_only = off` is refused rather than silently accepted.
+
+The check is text matching, not a database permission. A function with side
+effects, like `setval()` or `pg_terminate_backend()`, is not caught. When you
+need a real boundary, give the Redash data source a read-only database user.
+
+`redash-wire -read-only` forces the mode for one run. It can only tighten: a
+profile with `read_only: true` stays read-only without the flag.
+
 ## CLI
 
 `redash-wire` with no arguments starts the proxy. Flags: `-config <path>`,
 `-profile <name>`, `-debug`, `-version`, `-log-format <text|json>`,
-`-exit-on-stdin-eof` (quit when stdin closes, for supervisors), and
+`-exit-on-stdin-eof` (quit when stdin closes, for supervisors),
 `-wait-for-redash` (bind the listeners first, and keep retrying an unreachable
-Redash instead of exiting 1).
+Redash instead of exiting 1), and `-read-only` (refuse writes for this run,
+whatever the profile says).
 
 The proxy checks Redash every 10 seconds, so a data source added while it runs
 shows up without a restart. When Redash stops answering, the proxy refuses new
@@ -92,7 +121,7 @@ Subcommands answer a question and exit, for scripts and supervisors:
 ```bash
 redash-wire config [-json] [-show-secrets] [-config <path>]
 redash-wire datasources [-json] [-config <path>] [-profile <name>]
-redash-wire init -url <url> [-profile <name>] [-username <u>] [-password <p>] [-config <path>] [-json]
+redash-wire init -url <url> [-profile <name>] [-username <u>] [-password <p>] [-read-only] [-config <path>] [-json]
 redash-wire help
 ```
 
@@ -106,6 +135,7 @@ redash-wire help
   (`pbpaste | redash-wire init -url https://redash.example.com`), so the key
   stays out of `ps` and shell history. It writes `~/.redash-wire/config.yaml`
   unless `-config` says otherwise, and won't overwrite an existing file.
+  `-read-only` writes `read_only: true` on the new profile.
 
 Results go to stdout and logs to stderr. Exit 0 on success, 2 for a usage
 mistake, 1 for everything else. With `-json` an error prints as
@@ -128,9 +158,14 @@ the code, not the message:
 
 A menu bar app runs the proxy for you: no terminal, no Dock icon. It needs
 macOS 13 or newer and bundles its own copy of `redash-wire`. The first run asks
-for your Redash URL and API key. From the menu you can:
+for your Redash URL and API key, and whether to start read-only. From the menu
+you can:
 
 - Pick a profile and start or stop the proxy. `default_profile` starts at launch.
+- Lock the selected profile to read-only. The choice is remembered per profile
+  and the proxy restarts with it; a profile whose config says `read_only: true`
+  shows as locked and can't be unlocked from the menu. The status line and the
+  profile list say which profiles are read-only.
 - Browse the proxy's data sources and copy a `psql` or `mysql` command or a
   connection URI for each, or open one in an app that handles `postgresql://`
   links, like TablePlus.
@@ -158,7 +193,8 @@ The proxy runs read queries against any PostgreSQL- or MySQL-compatible Redash
 data source.
 
 - One statement per request. The proxy rejects multi-statement batches outright.
-- Writes go through, but Redash doesn't report rows changed, so neither does
+- Writes go through unless the profile is read-only (see [Read-only
+  mode](#read-only-mode)). Redash doesn't report rows changed, so neither does
   the proxy. Add `RETURNING` when you need a count.
 - Introspection is best-effort. The proxy answers common `pg_catalog`,
   `information_schema`, and MySQL `SHOW` queries from its cached schema, and

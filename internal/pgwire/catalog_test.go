@@ -307,7 +307,7 @@ func TestHandleLocalQuery_PgDatabaseWhitespace(t *testing.T) {
 		{ID: 2, Name: "b", Type: "pg"},
 	}
 	var buf bytes.Buffer
-	if err := HandleLocalQuery(&buf, "SELECT datname FROM\npg_database", map[string]string{}, sources, "127.0.0.1:5432"); err != nil {
+	if err := HandleLocalQuery(&buf, "SELECT datname FROM\npg_database", LocalSession{StartupParams: map[string]string{}, Sources: sources, ListenAddr: "127.0.0.1:5432"}); err != nil {
 		t.Fatal(err)
 	}
 	_, rows := collectResult(t, &buf)

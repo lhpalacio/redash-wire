@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -26,6 +27,7 @@ type Session struct {
 	listenAddr   string
 	username     string
 	password     string
+	readOnly     bool
 	dataSourceID int
 	dsType       string
 	logger       *slog.Logger
@@ -51,7 +53,7 @@ type Session struct {
 	schemaCache *redash.SchemaCache
 }
 
-func newSession(conn net.Conn, logger *slog.Logger, redashClient redash.RedashAPI, registry redash.SourceRegistry, gate *health.Gate, listenAddr, username, password string) *Session {
+func newSession(conn net.Conn, logger *slog.Logger, redashClient redash.RedashAPI, registry redash.SourceRegistry, gate *health.Gate, listenAddr, username, password string, readOnly bool) *Session {
 	pc := newPeekConn(conn)
 	backend := pgproto3.NewBackend(pc, pc)
 	backend.SetMaxBodyLen(pgwire.MaxClientMessageBytes)
@@ -64,13 +66,14 @@ func newSession(conn net.Conn, logger *slog.Logger, redashClient redash.RedashAP
 		listenAddr:   listenAddr,
 		username:     username,
 		password:     password,
+		readOnly:     readOnly,
 		logger:       logger,
 		schemaCache:  redash.NewSchemaCache(),
 	}
 }
 
 func (s *Session) serve(ctx context.Context) {
-	params, err := pgwire.HandleStartup(s.backend, s.conn, s.username, s.password, s.admit, s.backendKey, s.onCancel)
+	params, err := pgwire.HandleStartup(s.backend, s.conn, s.username, s.password, s.admit, s.backendKey, s.onCancel, s.readOnly)
 	if err != nil {
 		switch {
 		case errors.Is(err, pgwire.ErrCancelRequest):
@@ -209,7 +212,8 @@ func (s *Session) handleQuery(ctx context.Context, sql string) {
 
 	if pgwire.IsLocalQuery(sql) {
 		sources := redash.FilterByType(s.registry.All(), redash.IsPostgresCompatible)
-		if err := pgwire.HandleLocalQuery(s.conn, sql, s.params, sources, s.listenAddr); err != nil {
+		local := pgwire.LocalSession{StartupParams: s.params, Sources: sources, ListenAddr: s.listenAddr, ReadOnly: s.readOnly}
+		if err := pgwire.HandleLocalQuery(s.conn, sql, local); err != nil {
 			s.logger.Error("handling local query", "error", err)
 		}
 		return
@@ -229,6 +233,20 @@ func (s *Session) handleQuery(ctx context.Context, sql string) {
 			s.logger.Error("sending error to client", "error", err)
 		}
 		return
+	}
+
+	// Last before the call to Redash, so the local answers above are untouched
+	// and nothing that would write ever leaves the proxy. The refusal is the one
+	// PostgreSQL gives under default_transaction_read_only, code included.
+	if s.readOnly {
+		if verb := sqltext.Postgres.WriteVerb(sql); verb != "" {
+			s.logger.Info("refused write in read-only mode", "verb", verb, "data_source_id", s.dataSourceID)
+			msg := fmt.Sprintf("cannot execute %s in a read-only transaction", verb)
+			if err := pgwire.SendErrorCode(s.conn, pgwire.SQLStateReadOnly, msg, pgwire.ReadOnlyHint); err != nil {
+				s.logger.Error("sending error to client", "error", err)
+			}
+			return
+		}
 	}
 
 	if s.isPostgresBackend() {

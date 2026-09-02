@@ -24,6 +24,9 @@ type localSession struct {
 	connID  uint32
 	sources []redash.DataSource
 	schema  []redash.SchemaTable
+	// readOnly flips read_only, super_read_only, transaction_read_only and
+	// tx_read_only to 1, so a client that checks before writing gets the truth.
+	readOnly bool
 }
 
 // normalize lowercases a statement after redacting string-literal and comment
@@ -110,7 +113,7 @@ func handleLocalQuery(sql string, sess localSession) (*mysql.Result, error) {
 
 	if strings.HasPrefix(lower, "show variables") || strings.HasPrefix(lower, "show session variables") ||
 		strings.HasPrefix(lower, "show global variables") {
-		return handleShowVariables()
+		return handleShowVariables(sess.readOnly)
 	}
 
 	if strings.HasPrefix(lower, "show session status") || strings.HasPrefix(lower, "show status") {
@@ -248,7 +251,7 @@ func evalLocalExpr(expr string, sess localSession) any {
 		t := toks[0]
 		switch t.kind {
 		case tokVar:
-			v, _ := lookupVariable(t.text)
+			v, _ := lookupVariable(t.text, sess.readOnly)
 			return v
 		case tokNumber:
 			if n, err := strconv.ParseInt(t.text, 10, 64); err == nil {
@@ -321,7 +324,9 @@ var sessionVariables = []struct {
 	{"net_read_timeout", 30},
 	{"net_write_timeout", 60},
 	{"performance_schema", 0},
+	{"read_only", 0},
 	{"sql_mode", "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"},
+	{"super_read_only", 0},
 	{"system_time_zone", "UTC"},
 	{"time_zone", "SYSTEM"},
 	{"transaction_isolation", "REPEATABLE-READ"},
@@ -333,10 +338,24 @@ var sessionVariables = []struct {
 	{"wait_timeout", 28800},
 }
 
+// readOnlyVariables are the ones that answer 1 under read-only mode: what a
+// MySQL server started with --read-only (and super_read_only) reports.
+var readOnlyVariables = map[string]bool{
+	"read_only": true, "super_read_only": true, "transaction_read_only": true, "tx_read_only": true,
+}
+
+// variableValue applies the read-only override to a variable's stock value.
+func variableValue(name string, value any, readOnly bool) any {
+	if readOnly && readOnlyVariables[name] {
+		return 1
+	}
+	return value
+}
+
 // lookupVariable resolves @@name, @@session.name, @@local.name and
 // @@global.name, case-insensitively. An unknown variable is NULL rather than
 // an error, since a client probing a dozen at once should still get the rest.
-func lookupVariable(ref string) (any, bool) {
+func lookupVariable(ref string, readOnly bool) (any, bool) {
 	name, ok := strings.CutPrefix(strings.ToLower(ref), "@@")
 	if !ok {
 		return nil, false
@@ -346,7 +365,7 @@ func lookupVariable(ref string) (any, bool) {
 	}
 	for _, v := range sessionVariables {
 		if v.name == name {
-			return v.value, true
+			return variableValue(v.name, v.value, readOnly), true
 		}
 	}
 	return nil, false
@@ -553,10 +572,10 @@ func likeMatcher(pattern string) func(string) bool {
 	return regexp.MustCompile(re.String()).MatchString
 }
 
-func handleShowVariables() (*mysql.Result, error) {
+func handleShowVariables(readOnly bool) (*mysql.Result, error) {
 	values := make([][]any, len(sessionVariables))
 	for i, v := range sessionVariables {
-		values[i] = []any{v.name, fmt.Sprint(v.value)}
+		values[i] = []any{v.name, fmt.Sprint(variableValue(v.name, v.value, readOnly))}
 	}
 	rs, err := mysql.BuildSimpleResultset([]string{"Variable_name", "Value"}, values, false)
 	if err != nil {
