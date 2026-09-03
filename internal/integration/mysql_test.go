@@ -11,28 +11,16 @@ import (
 	"github.com/lhpalacio/redash-wire/internal/redash"
 )
 
-func TestMySQL_ConnectionAndAuth(t *testing.T) {
+// TestMySQL_Connection: valid credentials get a session. The refusals live in
+// auth_test.go.
+func TestMySQL_Connection(t *testing.T) {
 	mock, registry := defaultMockAndRegistry(t)
 	addr := startMySQLServer(t, mock, registry)
 
-	t.Run("valid credentials", func(t *testing.T) {
-		db := connectMySQL(t, addr, "")
-		if err := db.Ping(); err != nil {
-			t.Fatalf("ping failed: %v", err)
-		}
-	})
-
-	t.Run("wrong username", func(t *testing.T) {
-		dsn := fmt.Sprintf("wronguser:%s@tcp(%s)/?allowNativePasswords=true", testPass, addr)
-		db, err := sql.Open("mysql", dsn)
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
-		defer db.Close()
-		if err := db.Ping(); err == nil {
-			t.Fatal("expected auth error, got nil")
-		}
-	})
+	db := connectMySQL(t, addr, "")
+	if err := db.Ping(); err != nil {
+		t.Fatalf("ping failed: %v", err)
+	}
 }
 
 func TestMySQL_UseDatabase(t *testing.T) {

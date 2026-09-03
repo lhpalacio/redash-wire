@@ -488,46 +488,6 @@ func TestLikeMatcher(t *testing.T) {
 	}
 }
 
-func TestHandleShowVariables(t *testing.T) {
-	result, err := handleShowVariables("SHOW VARIABLES", false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	rs := result.Resultset
-	if rs == nil {
-		t.Fatal("expected Resultset, got nil")
-	}
-	if got := rs.ColumnNumber(); got != 2 {
-		t.Errorf("column count = %d, want 2", got)
-	}
-
-	if got := string(rs.Fields[0].Name); got != "Variable_name" {
-		t.Errorf("field 0 name = %q, want %q", got, "Variable_name")
-	}
-	if got := string(rs.Fields[1].Name); got != "Value" {
-		t.Errorf("field 1 name = %q, want %q", got, "Value")
-	}
-
-	if got := len(rs.RowDatas); got < 10 {
-		t.Errorf("row count = %d, want at least 10", got)
-	}
-
-	rows := parseTextRows(t, rs)
-	found := false
-	for _, row := range rows {
-		if fieldValueString(row[0]) == "version" {
-			if got := fieldValueString(row[1]); got != "8.0.0-redash-wire" {
-				t.Errorf("version value = %q, want %q", got, "8.0.0-redash-wire")
-			}
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("expected to find 'version' variable in SHOW VARIABLES result")
-	}
-}
-
 func TestHandleLocalQuery(t *testing.T) {
 	sources := []redash.DataSource{
 		{ID: 1, Name: "prod_mysql", Type: "mysql"},
@@ -602,45 +562,6 @@ func TestHandleLocalQuery(t *testing.T) {
 		}
 		if got := fieldValueString(rows[0][0]); got != "prod_mysql" {
 			t.Errorf("database() = %q, want %q", got, "prod_mysql")
-		}
-	})
-}
-
-func TestSingleResult(t *testing.T) {
-	t.Run("string value", func(t *testing.T) {
-		result, err := singleResult("col", "hello")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		rs := result.Resultset
-		if rs == nil {
-			t.Fatal("expected Resultset, got nil")
-		}
-		if got := len(rs.RowDatas); got != 1 {
-			t.Errorf("row count = %d, want 1", got)
-		}
-		if got := rs.ColumnNumber(); got != 1 {
-			t.Errorf("column count = %d, want 1", got)
-		}
-		rows := parseTextRows(t, rs)
-		if got := fieldValueString(rows[0][0]); got != "hello" {
-			t.Errorf("value = %q, want %q", got, "hello")
-		}
-	})
-
-	t.Run("int value", func(t *testing.T) {
-		result, err := singleResult("num", 42)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		rs := result.Resultset
-		if rs == nil {
-			t.Fatal("expected Resultset, got nil")
-		}
-		rows := parseTextRows(t, rs)
-		got := fmt.Sprintf("%v", rows[0][0].Value())
-		if got != "42" {
-			t.Errorf("value = %s, want 42", got)
 		}
 	})
 }
@@ -777,6 +698,19 @@ func TestHandleLocalSelect(t *testing.T) {
 		}
 		if got := fieldValueString(row[0]); got != "a, from b" {
 			t.Errorf("s = %q", got)
+		}
+	})
+
+	t.Run("an empty select list still answers one row", func(t *testing.T) {
+		result, err := handleLocalQuery("SELECT", sess)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result == nil || result.Resultset == nil {
+			t.Fatal("no result set")
+		}
+		if rows := parseTextRows(t, result.Resultset); len(rows) != 1 || len(rows[0]) != 1 {
+			t.Errorf("got %d rows, want one row with one column", len(rows))
 		}
 	})
 }

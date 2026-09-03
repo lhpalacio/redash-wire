@@ -208,39 +208,6 @@ func (d Dialect) Redact(sql string) string {
 	return string(b)
 }
 
-// ReplaceOutsideStrings replaces every occurrence of old with replacement, but only
-// where the match lies entirely outside string literals, dollar-quoted strings,
-// and comments. Quoted identifier regions ARE eligible, which is where a database
-// qualifier like `db`. or "db". appears, so callers can strip such a qualifier
-// without mutating text inside an actual string value. old must be non-empty.
-func (d Dialect) ReplaceOutsideStrings(sql, old, replacement string) string {
-	if old == "" {
-		return sql
-	}
-	mask := d.scanMask(sql, false)
-	var b strings.Builder
-	i := 0
-	for i < len(sql) {
-		if i+len(old) <= len(sql) && sql[i:i+len(old)] == old && allTrue(mask[i:i+len(old)]) {
-			b.WriteString(replacement)
-			i += len(old)
-			continue
-		}
-		b.WriteByte(sql[i])
-		i++
-	}
-	return b.String()
-}
-
-func allTrue(bs []bool) bool {
-	for _, v := range bs {
-		if !v {
-			return false
-		}
-	}
-	return true
-}
-
 // SplitTopLevelCommas splits s on commas that are outside string literals, quoted
 // identifiers, dollar-quoting, and comments, and at parenthesis depth zero, so a
 // comma inside a function call (e.g. format_type(a, b)) or a literal does not split

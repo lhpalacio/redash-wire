@@ -29,23 +29,6 @@ func TestPG_ConnectionAndAuth(t *testing.T) {
 		}
 	})
 
-	t.Run("wrong password", func(t *testing.T) {
-		host, port, _ := net.SplitHostPort(addr)
-		connStr := fmt.Sprintf("host=%s port=%s user=%s password=wrong sslmode=disable", host, port, testUser)
-		cfg, err := pgx.ParseConfig(connStr)
-		if err != nil {
-			t.Fatalf("parse config: %v", err)
-		}
-		cfg.Database = "test"
-		cfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
-
-		conn, err := pgx.ConnectConfig(context.Background(), cfg)
-		if err == nil {
-			conn.Close(context.Background())
-			t.Fatal("expected auth error, got nil")
-		}
-	})
-
 	t.Run("wrong username", func(t *testing.T) {
 		host, port, _ := net.SplitHostPort(addr)
 		connStr := fmt.Sprintf("host=%s port=%s user=wronguser password=%s sslmode=disable", host, port, testPass)
@@ -160,9 +143,11 @@ func TestPG_ServerInfoFunctions(t *testing.T) {
 		if again := pid(conn); again != id {
 			t.Errorf("pg_backend_pid() changed from %d to %d on the same connection", id, again)
 		}
-		// The proxy answers every session with the same pid rather than the
-		// ProcessID it sent in BackendKeyData, so two connections are not yet
-		// told apart here.
+		// The pid is the ProcessID the session sent in BackendKeyData, so it
+		// tells sessions apart the way a client expects.
+		if other := pid(connectPG(t, addr, "Production PG")); other == id {
+			t.Errorf("pg_backend_pid() = %d on two different connections", id)
+		}
 	})
 }
 

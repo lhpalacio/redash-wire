@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -263,7 +264,7 @@ profiles:
     api_key: secret
 `,
 			profile: "",
-			wantErr: "field postgres_listen_adr not found",
+			wantErr: "postgres_listen_adr", // the offending key is named; the rest is yaml's wording
 		},
 		{
 			name: "profile enables postgres over file-level mysql-only",
@@ -338,8 +339,9 @@ func TestLoad_FileNotFound(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing file, got nil")
 	}
-	if !strings.Contains(err.Error(), "reading config file") {
-		t.Fatalf("error %q does not mention reading config file", err)
+	// Callers map a missing file to the not_configured exit code by this.
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("error %q does not wrap fs.ErrNotExist", err)
 	}
 }
 

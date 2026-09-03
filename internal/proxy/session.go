@@ -212,7 +212,7 @@ func (s *Session) handleQuery(ctx context.Context, sql string) {
 
 	if pgwire.IsLocalQuery(sql) {
 		sources := redash.FilterByType(s.registry.All(), redash.IsPostgresCompatible)
-		local := pgwire.LocalSession{StartupParams: s.params, Sources: sources, ListenAddr: s.listenAddr, ReadOnly: s.readOnly}
+		local := pgwire.LocalSession{StartupParams: s.params, Sources: sources, ListenAddr: s.listenAddr, ReadOnly: s.readOnly, BackendPID: s.backendKey.ProcessID}
 		if err := pgwire.HandleLocalQuery(s.conn, sql, local); err != nil {
 			s.logger.Error("handling local query", "error", err)
 		}

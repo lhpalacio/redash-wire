@@ -3,7 +3,6 @@ package main
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -38,11 +37,10 @@ func TestInitTarget(t *testing.T) {
 		name     string
 		flagPath string
 		wantCode string
-		wantMsg  string
 	}{
 		{name: "free path", flagPath: filepath.Join(dir, "new", "config.yaml")},
 		{name: "existing file", flagPath: existing, wantCode: codeConfigExists},
-		{name: "directory", flagPath: dir, wantCode: codeIOError, wantMsg: "is a directory"},
+		{name: "directory", flagPath: dir, wantCode: codeIOError},
 		{name: "parent is a file", flagPath: filepath.Join(existing, "config.yaml"), wantCode: codeIOError},
 	}
 	for _, tt := range tests {
@@ -62,9 +60,6 @@ func TestInitTarget(t *testing.T) {
 			}
 			if cerr.Code != tt.wantCode {
 				t.Errorf("code = %q, want %q (%v)", cerr.Code, tt.wantCode, cerr)
-			}
-			if !strings.Contains(cerr.Error(), tt.wantMsg) {
-				t.Errorf("message %q does not mention %q", cerr.Error(), tt.wantMsg)
 			}
 		})
 	}

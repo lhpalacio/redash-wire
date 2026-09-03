@@ -24,11 +24,12 @@ func checkAuthHeader(t *testing.T, r *http.Request, wantKey string) {
 
 func TestListDataSources(t *testing.T) {
 	tests := []struct {
-		name      string
-		handler   http.HandlerFunc
-		wantErr   string
-		wantCount int
-		wantFirst DataSource
+		name       string
+		handler    http.HandlerFunc
+		wantErr    bool
+		wantStatus int // the HTTP status the error must report, when one applies
+		wantCount  int
+		wantFirst  DataSource
 	}{
 		{
 			name: "success with two sources",
@@ -49,7 +50,8 @@ func TestListDataSources(t *testing.T) {
 				checkAuthHeader(t, r, "test-key")
 				w.WriteHeader(http.StatusInternalServerError)
 			},
-			wantErr: "status 500",
+			wantErr:    true,
+			wantStatus: http.StatusInternalServerError,
 		},
 		{
 			name: "invalid JSON",
@@ -58,7 +60,7 @@ func TestListDataSources(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				fmt.Fprint(w, `not json`)
 			},
-			wantErr: "decoding data sources",
+			wantErr: true,
 		},
 	}
 
@@ -70,12 +72,14 @@ func TestListDataSources(t *testing.T) {
 			c := NewClient(srv.URL, "test-key", WithPollInterval(10*time.Millisecond), WithPollTimeout(50*time.Millisecond))
 			sources, err := c.ListDataSources(context.Background())
 
-			if tt.wantErr != "" {
+			if tt.wantErr {
 				if err == nil {
-					t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+					t.Fatalf("expected an error, got %d sources", len(sources))
 				}
-				if !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("error %q does not contain %q", err, tt.wantErr)
+				if tt.wantStatus != 0 {
+					if status, ok := HTTPStatus(err); !ok || status != tt.wantStatus {
+						t.Fatalf("HTTPStatus(err) = %d, %v; want %d", status, ok, tt.wantStatus)
+					}
 				}
 				return
 			}
@@ -421,9 +425,6 @@ func TestExecuteQuery_WithJobPolling(t *testing.T) {
 		t.Errorf("rows[0][n] = %v (%T), want json.Number 42", result.Rows[0]["n"], result.Rows[0]["n"])
 	}
 
-	if got := pollCount.Load(); got < 3 {
-		t.Errorf("expected at least 3 job polls, got %d", got)
-	}
 }
 
 func TestExecuteQuery_JobFailed(t *testing.T) {

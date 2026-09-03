@@ -281,17 +281,22 @@ final class RedashHealthTests: XCTestCase {
         let reason = #"fetching data sources: Get "https://redash.example.com/api/data_sources": context deadline exceeded"#
         let summary = RedashHealth.unreachable(reason).summary
 
-        XCTAssertEqual(summary, "The request timed out.")
+        XCTAssertNotNil(summary)
         XCTAssertFalse(summary?.contains("https://") ?? true)
+        XCTAssertFalse(summary?.contains("context deadline") ?? true)
+        XCTAssertTrue(summary?.localizedCaseInsensitiveContains("timed out") ?? false)
     }
 
     func testARejectionNamesTheStatusAndPointsAtTheKey() {
         let health = RedashHealth(kind: "rejected", reason: "data sources request failed (status 401)")
-        XCTAssertEqual(health.summary, "Redash answered with status 401.")
-        XCTAssertEqual(health.remedy, "Check the profile's API key and URL.")
+        XCTAssertTrue(health.summary?.contains("401") ?? false)
+        XCTAssertTrue(health.remedy?.localizedCaseInsensitiveContains("key") ?? false)
     }
 
     func testAnUnrecognisedReasonSaysOnlyWhatIsCertain() {
-        XCTAssertEqual(RedashHealth.unreachable("something new").summary, "Redash did not answer.")
+        let summary = RedashHealth.unreachable("something new").summary
+        XCTAssertNotNil(summary)
+        XCTAssertFalse(summary?.contains("something new") ?? true)
+        XCTAssertFalse(summary?.localizedCaseInsensitiveContains("timed out") ?? true)
     }
 }

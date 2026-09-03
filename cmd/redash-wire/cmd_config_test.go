@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -18,17 +19,17 @@ func TestPrintConfigShowSecrets(t *testing.T) {
 	if strings.Contains(hidden.String(), testAPIKey) {
 		t.Errorf("API key printed without -show-secrets:\n%s", hidden.String())
 	}
-	if !strings.Contains(hidden.String(), "api key:     set") {
+	if !regexp.MustCompile(`api key:\s+set\b`).MatchString(hidden.String()) {
 		t.Errorf("expected the key reported as set:\n%s", hidden.String())
 	}
 
 	var shown bytes.Buffer
 	printConfig(&shown, buildConfigPayload(res, "explicit", sum, true))
-	if !strings.Contains(shown.String(), "api key:     "+testAPIKey) {
+	if !regexp.MustCompile(`api key:\s+` + regexp.QuoteMeta(testAPIKey)).MatchString(shown.String()) {
 		t.Errorf("-show-secrets must print the key in text mode:\n%s", shown.String())
 	}
 	// The broken profile has no key, so there is nothing to show for it.
-	if !strings.Contains(shown.String(), "api key:     missing") {
+	if !regexp.MustCompile(`api key:\s+missing\b`).MatchString(shown.String()) {
 		t.Errorf("a missing key must still read as missing under -show-secrets:\n%s", shown.String())
 	}
 }
