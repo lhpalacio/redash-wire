@@ -196,8 +196,13 @@ data source.
 - Writes go through unless the profile is read-only (see [Read-only
   mode](#read-only-mode)). Redash doesn't report rows changed, so neither does
   the proxy. Add `RETURNING` when you need a count.
+- On a MySQL data source, writes only stick when the data source's
+  **Autocommit** option is on in Redash. Redash opens a fresh connection per
+  query and closes it without `COMMIT`, so with autocommit off the change is
+  rolled back and the proxy has no way to tell.
 - Introspection is best-effort. The proxy answers common `pg_catalog`,
-  `information_schema`, and MySQL `SHOW` queries from its cached schema, and
-  every column type reports as `text`.
+  `information_schema`, and MySQL `SHOW` queries from the schema Redash
+  reports: table and column names and types, no keys, indexes, defaults or
+  nullability. On the Postgres wire every result column type reports as `text`.
 - Numbers stay exact. A value too big for the native type comes back as text.
 - No extended/prepared-statement protocol. Use the simple query protocol.

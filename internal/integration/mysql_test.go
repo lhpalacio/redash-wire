@@ -469,3 +469,35 @@ func TestMySQL_InformationSchema(t *testing.T) {
 		}
 	})
 }
+
+// TestMySQL_TableStructure: the query TablePlus sends for a table's structure
+// view is answered from the Redash schema, through a real client connection.
+func TestMySQL_TableStructure(t *testing.T) {
+	mock, registry := defaultMockAndRegistry()
+	addr := startMySQLServer(t, mock, registry)
+	db := connectMySQL(t, addr, "Analytics MySQL")
+
+	rows, err := db.Query("SELECT ordinal_position as ordinal_position,column_name as column_name,column_type AS data_type,is_nullable as is_nullable,column_comment AS comment FROM information_schema.columns WHERE table_schema='Analytics MySQL' AND table_name='orders' ORDER BY ordinal_position")
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	defer rows.Close()
+
+	var got []string
+	for rows.Next() {
+		var ordinal int
+		var name, dataType, comment string
+		var nullable sql.NullString
+		if err := rows.Scan(&ordinal, &name, &dataType, &nullable, &comment); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if nullable.Valid {
+			t.Errorf("is_nullable for %s = %q, want NULL (Redash does not report it)", name, nullable.String)
+		}
+		got = append(got, fmt.Sprintf("%d:%s:%s", ordinal, name, dataType))
+	}
+	want := "1:id:int,2:user_id:int,3:total:decimal"
+	if strings.Join(got, ",") != want {
+		t.Errorf("structure = %v, want %s", got, want)
+	}
+}

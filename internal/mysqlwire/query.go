@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -113,7 +114,7 @@ func handleLocalQuery(sql string, sess localSession) (*mysql.Result, error) {
 
 	if strings.HasPrefix(lower, "show variables") || strings.HasPrefix(lower, "show session variables") ||
 		strings.HasPrefix(lower, "show global variables") {
-		return handleShowVariables(sess.readOnly)
+		return handleShowVariables(sql, sess.readOnly)
 	}
 
 	if strings.HasPrefix(lower, "show session status") || strings.HasPrefix(lower, "show status") {
@@ -121,7 +122,7 @@ func handleLocalQuery(sql string, sess localSession) (*mysql.Result, error) {
 	}
 
 	if strings.Contains(lower, "information_schema.") {
-		return handleInformationSchema(lower, sess.schema)
+		return handleInformationSchema(sql, sess)
 	}
 
 	return handleLocalSelect(sql, sess)
@@ -150,7 +151,7 @@ func handleLocalSelect(sql string, sess localSession) (*mysql.Result, error) {
 	if len(names) == 0 {
 		return singleResult("result", "")
 	}
-	rs, err := mysql.BuildSimpleResultset(names, [][]any{values}, false)
+	rs, err := buildResultset(names, [][]any{values})
 	if err != nil {
 		return nil, err
 	}
@@ -163,10 +164,11 @@ var selectModifiers = map[string]bool{
 	"sql_no_cache": true, "sql_cache": true, "sql_calc_found_rows": true,
 }
 
-// selectList returns the select-list text of a FROM-less SELECT: what follows
-// the keyword up to a trailing LIMIT (the mysql CLI's `select @@version_comment
-// limit 1`) or semicolon, both located in the redacted text so neither is
-// matched inside a literal.
+// selectList returns the select-list text of a SELECT: what follows the
+// keyword up to the top-level FROM, a trailing LIMIT (the mysql CLI's `select
+// @@version_comment limit 1`) or a semicolon, all located in the redacted text
+// so none is matched inside a literal, and outside parentheses so a subquery's
+// FROM does not end the list early.
 func selectList(sql string) string {
 	red := strings.ToLower(sqltext.MySQL.Redact(sql))
 	start := strings.Index(red, "select")
@@ -190,6 +192,11 @@ scan:
 			}
 		case 'l':
 			if depth == 0 && tokenAt(red, i, "limit") {
+				end = i
+				break scan
+			}
+		case 'f':
+			if depth == 0 && tokenAt(red, i, "from") {
 				end = i
 				break scan
 			}
@@ -376,7 +383,7 @@ func handleShowDatabases(sources []redash.DataSource) (*mysql.Result, error) {
 	for i, ds := range sources {
 		values[i] = []any{ds.Name}
 	}
-	rs, err := mysql.BuildSimpleResultset([]string{"Database"}, values, false)
+	rs, err := buildResultset([]string{"Database"}, values)
 	if err != nil {
 		return nil, err
 	}
@@ -454,7 +461,7 @@ func handleShowTables(sql string, sess localSession) (*mysql.Result, error) {
 	if full {
 		names = append(names, "Table_type")
 	}
-	rs, err := mysql.BuildSimpleResultset(names, values, false)
+	rs, err := buildResultset(names, values)
 	if err != nil {
 		return nil, err
 	}
@@ -572,44 +579,76 @@ func likeMatcher(pattern string) func(string) bool {
 	return regexp.MustCompile(re.String()).MatchString
 }
 
-func handleShowVariables(readOnly bool) (*mysql.Result, error) {
-	values := make([][]any, len(sessionVariables))
-	for i, v := range sessionVariables {
-		values[i] = []any{v.name, fmt.Sprint(variableValue(v.name, v.value, readOnly))}
+// handleShowVariables answers SHOW [SESSION | GLOBAL] VARIABLES [LIKE
+// 'pattern' | WHERE Variable_name = 'name' | WHERE Variable_name IN (...)]
+// from the fixed session variables, with the read-only overrides applied.
+// The filter matters: a client that asks for one variable reads the first
+// row it gets, whatever its name.
+func handleShowVariables(sql string, readOnly bool) (*mysql.Result, error) {
+	match := func(string) bool { return true }
+	toks := lexTokens(strings.TrimRight(strings.TrimSpace(sql), ";"))
+	for i, t := range toks {
+		switch {
+		case t.is(tokWord, "like") && i+1 < len(toks) && toks[i+1].kind == tokString:
+			match = likeMatcher(toks[i+1].text)
+		case t.is(tokWord, "where"):
+			if names := variableNamesIn(toks[i+1:]); len(names) > 0 {
+				match = func(name string) bool { return slices.Contains(names, name) }
+			}
+		}
 	}
-	rs, err := mysql.BuildSimpleResultset([]string{"Variable_name", "Value"}, values, false)
-	if err != nil {
-		return nil, err
+	var values [][]any
+	for _, v := range sessionVariables {
+		if match(v.name) {
+			values = append(values, []any{v.name, fmt.Sprint(variableValue(v.name, v.value, readOnly))})
+		}
 	}
-	return mysql.NewResult(rs), nil
+	return resultOf([]string{"Variable_name", "Value"}, values)
+}
+
+// variableNamesIn collects the names a SHOW VARIABLES WHERE clause compares
+// Variable_name with, through = or IN (...), lowercased.
+func variableNamesIn(toks []token) []string {
+	var names []string
+	for j := 0; j+2 < len(toks); j++ {
+		if !strings.EqualFold(toks[j].text, "variable_name") || (toks[j].kind != tokWord && toks[j].kind != tokQuoted) {
+			continue
+		}
+		switch {
+		case toks[j+1].is(tokOp, "=") && toks[j+2].kind == tokString:
+			names = append(names, strings.ToLower(toks[j+2].text))
+		case toks[j+1].is(tokWord, "in") && toks[j+2].is(tokOp, "("):
+			for k := j + 3; k < len(toks) && !toks[k].is(tokOp, ")"); k++ {
+				if toks[k].kind == tokString {
+					names = append(names, strings.ToLower(toks[k].text))
+				}
+			}
+		}
+	}
+	return names
 }
 
 func handleShowStatus(lower string) (*mysql.Result, error) {
 	if strings.Contains(lower, "ssl_version") {
-		rs, err := mysql.BuildSimpleResultset(
-			[]string{"Variable_name", "Value"},
-			[][]any{{"Ssl_version", ""}},
-			false,
-		)
+		rs, err := buildResultset([]string{"Variable_name", "Value"}, [][]any{{"Ssl_version", ""}})
 		if err != nil {
 			return nil, err
 		}
 		return mysql.NewResult(rs), nil
 	}
 
-	rs, err := mysql.BuildSimpleResultset([]string{"Variable_name", "Value"}, [][]any{}, false)
+	rs, err := buildResultset([]string{"Variable_name", "Value"}, [][]any{})
 	if err != nil {
 		return nil, err
 	}
 	return mysql.NewResult(rs), nil
 }
 
-func handleInformationSchema(lower string, schema []redash.SchemaTable) (*mysql.Result, error) {
+func handleInformationSchema(sql string, sess localSession) (*mysql.Result, error) {
+	lower := normalize(sql)
+
 	if strings.Contains(lower, "information_schema.routines") {
-		rs, err := mysql.BuildSimpleResultset(
-			[]string{"function_schema", "function_name", "create_statement", "function_type"},
-			[][]any{}, false,
-		)
+		rs, err := buildResultset([]string{"function_schema", "function_name", "create_statement", "function_type"}, [][]any{})
 		if err != nil {
 			return nil, err
 		}
@@ -617,14 +656,273 @@ func handleInformationSchema(lower string, schema []redash.SchemaTable) (*mysql.
 	}
 
 	if strings.Contains(lower, "information_schema.tables") {
-		return handleInfoSchemaTables(lower, schema)
+		return handleInfoSchemaTables(lower, sess.schema)
 	}
 
 	if strings.Contains(lower, "information_schema.collation_character_set_applicability") {
-		return handleInfoSchemaTableDetails(schema)
+		return handleInfoSchemaTableDetails(sess.schema)
 	}
 
-	rs, err := mysql.BuildSimpleResultset([]string{"name"}, [][]any{}, false)
+	if strings.Contains(lower, "information_schema.columns") {
+		return handleInfoSchemaColumns(sql, sess)
+	}
+
+	// Redash reports no indexes, keys or constraints, so the other catalog
+	// tables are empty; the client still gets the columns it selected, named as
+	// it named them.
+	star := []string{"name"}
+	if strings.Contains(lower, "information_schema.statistics") {
+		star = infoSchemaStatisticsStar
+	}
+	return resultOf(itemNames(selectItems(sql, star)), nil)
+}
+
+// infoSchemaColumnsStar and infoSchemaStatisticsStar are the columns a SELECT
+// * gets from information_schema.columns and .statistics, in the real server's
+// order.
+var (
+	infoSchemaColumnsStar = []string{
+		"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME",
+		"ORDINAL_POSITION", "COLUMN_DEFAULT", "IS_NULLABLE", "DATA_TYPE",
+		"CHARACTER_MAXIMUM_LENGTH", "CHARACTER_OCTET_LENGTH", "NUMERIC_PRECISION",
+		"NUMERIC_SCALE", "DATETIME_PRECISION", "CHARACTER_SET_NAME", "COLLATION_NAME",
+		"COLUMN_TYPE", "COLUMN_KEY", "EXTRA", "PRIVILEGES", "COLUMN_COMMENT",
+		"GENERATION_EXPRESSION", "SRS_ID",
+	}
+	infoSchemaStatisticsStar = []string{
+		"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "NON_UNIQUE", "INDEX_SCHEMA",
+		"INDEX_NAME", "SEQ_IN_INDEX", "COLUMN_NAME", "COLLATION", "CARDINALITY",
+		"SUB_PART", "PACKED", "NULLABLE", "INDEX_TYPE", "COMMENT", "INDEX_COMMENT",
+		"IS_VISIBLE", "EXPRESSION",
+	}
+)
+
+// handleInfoSchemaColumns answers a query over information_schema.columns,
+// which is how TablePlus and DBeaver read a table's structure, from the schema
+// Redash reports: one row per column of every table the WHERE clause admits,
+// with the columns and aliases of the select list. Redash knows a column's
+// name, type and comment, so those are filled in; nullability, defaults, keys,
+// lengths and the rest are NULL rather than guessed.
+func handleInfoSchemaColumns(sql string, sess localSession) (*mysql.Result, error) {
+	items := selectItems(sql, infoSchemaColumnsStar)
+	admit := infoSchemaFilter(sql)
+	var rows [][]any
+	if admit("table_schema", sess.dbName) {
+		for _, t := range sess.schema {
+			if !admit("table_name", t.Name) {
+				continue
+			}
+			for ord, col := range t.Columns {
+				if !admit("column_name", col.Name) {
+					continue
+				}
+				row := make([]any, len(items))
+				for j, it := range items {
+					row[j] = it.eval(func(field string) any {
+						return infoSchemaColumnValue(field, sess.dbName, t.Name, ord+1, col)
+					})
+				}
+				rows = append(rows, row)
+			}
+		}
+	}
+	return resultOf(itemNames(items), rows)
+}
+
+// infoSchemaColumnValue is one field of an information_schema.columns row.
+func infoSchemaColumnValue(field, dbName, table string, ordinal int, col redash.SchemaColumn) any {
+	switch field {
+	case "table_catalog":
+		return "def"
+	case "table_schema":
+		return dbName
+	case "table_name":
+		return table
+	case "column_name":
+		return col.Name
+	case "ordinal_position":
+		return int64(ordinal)
+	case "data_type", "column_type":
+		if col.Type == "" {
+			return nil
+		}
+		return col.Type
+	case "column_comment":
+		return col.Comment
+	}
+	return nil
+}
+
+// selectItem is one entry of a select list: the name the output column gets
+// and the expression it is computed from.
+type selectItem struct {
+	name string
+	expr string
+}
+
+// selectItems parses the select list of a query over a catalog table. Each
+// item is named the way the real server names it: the alias when there is
+// one, otherwise the item's text as written. A `*` (or `t.*`) stands for
+// star, the table's own columns.
+func selectItems(sql string, star []string) []selectItem {
+	var items []selectItem
+	for _, item := range sqltext.MySQL.SplitTopLevelCommas(selectList(sql)) {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if item == "*" || strings.HasSuffix(item, ".*") {
+			for _, s := range star {
+				items = append(items, selectItem{name: s, expr: s})
+			}
+			continue
+		}
+		expr, alias := splitAlias(item)
+		if alias == "" {
+			alias = expr
+		}
+		items = append(items, selectItem{name: alias, expr: expr})
+	}
+	if len(items) == 0 {
+		for _, s := range star {
+			items = append(items, selectItem{name: s, expr: s})
+		}
+	}
+	return items
+}
+
+func itemNames(items []selectItem) []string {
+	names := make([]string, len(items))
+	for i, it := range items {
+		names[i] = it.name
+	}
+	return names
+}
+
+// eval resolves the item for one row: a column of the catalog table, bare or
+// qualified, through get (lowercased, so TABLE_NAME and table_name are the
+// same column); a literal as itself; anything else, a function call or a
+// CASE, is NULL.
+func (it selectItem) eval(get func(field string) any) any {
+	toks := lexTokens(it.expr)
+	isIdent := func(t token) bool { return t.kind == tokWord || t.kind == tokQuoted }
+	switch {
+	case len(toks) == 1 && isIdent(toks[0]):
+		return get(strings.ToLower(toks[0].text))
+	case len(toks) == 3 && isIdent(toks[0]) && toks[1].is(tokOp, ".") && isIdent(toks[2]):
+		return get(strings.ToLower(toks[2].text))
+	case len(toks) == 1 && toks[0].kind == tokString:
+		return toks[0].text
+	case len(toks) == 1 && toks[0].kind == tokNumber:
+		if n, err := strconv.ParseInt(toks[0].text, 10, 64); err == nil {
+			return n
+		}
+		if f, err := strconv.ParseFloat(toks[0].text, 64); err == nil {
+			return f
+		}
+	}
+	return nil
+}
+
+// infoSchemaFilter compiles the WHERE clause of a catalog query into a
+// predicate saying whether a row whose field has the given value is admitted.
+// It understands `field = 'v'`, `field IN ('v', ...)` and `field LIKE 'p'` on
+// table_schema, table_name and column_name, bare or qualified, joined by AND:
+// the forms TablePlus, DBeaver and Connector/J use. Comparisons are
+// case-insensitive like the real server's. Any other condition is ignored,
+// and a clause with an OR admits everything, so a client is never answered
+// with fewer rows than it asked for.
+func infoSchemaFilter(sql string) func(field, value string) bool {
+	accept := func(string, string) bool { return true }
+	red := strings.ToLower(sqltext.MySQL.Redact(sql))
+	at := -1
+	for i, depth := 0, 0; i < len(red) && at < 0; i++ {
+		switch red[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case 'w':
+			if depth == 0 && tokenAt(red, i, "where") {
+				at = i + len("where")
+			}
+		}
+	}
+	if at < 0 {
+		return accept
+	}
+
+	conds := map[string][]func(string) bool{}
+	toks := lexTokens(sql[at:])
+	isIdent := func(t token) bool { return t.kind == tokWord || t.kind == tokQuoted }
+	for i := 0; i < len(toks); i++ {
+		if toks[i].is(tokWord, "or") {
+			return accept
+		}
+		if !isIdent(toks[i]) {
+			continue
+		}
+		field := strings.ToLower(toks[i].text)
+		j := i + 1
+		if j+1 < len(toks) && toks[j].is(tokOp, ".") && isIdent(toks[j+1]) {
+			field = strings.ToLower(toks[j+1].text)
+			j += 2
+		}
+		if j >= len(toks) {
+			break
+		}
+		switch field {
+		case "table_schema", "table_name", "column_name":
+		default:
+			continue
+		}
+		var test func(string) bool
+		switch {
+		case toks[j].is(tokOp, "=") && j+1 < len(toks) && toks[j+1].kind == tokString:
+			v := toks[j+1].text
+			test = func(s string) bool { return strings.EqualFold(s, v) }
+			i = j + 1
+		case toks[j].is(tokWord, "like") && j+1 < len(toks) && toks[j+1].kind == tokString:
+			test = likeMatcher(toks[j+1].text)
+			i = j + 1
+		case toks[j].is(tokWord, "in") && j+1 < len(toks) && toks[j+1].is(tokOp, "("):
+			var values []string
+			k := j + 2
+			for ; k < len(toks) && !toks[k].is(tokOp, ")"); k++ {
+				if toks[k].kind == tokString {
+					values = append(values, toks[k].text)
+				}
+			}
+			test = func(s string) bool {
+				for _, v := range values {
+					if strings.EqualFold(s, v) {
+						return true
+					}
+				}
+				return false
+			}
+			i = k
+		default:
+			continue
+		}
+		conds[field] = append(conds[field], test)
+	}
+	return func(field, value string) bool {
+		for _, test := range conds[field] {
+			if !test(value) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+// resultOf is a text result set with the given columns and rows.
+func resultOf(names []string, rows [][]any) (*mysql.Result, error) {
+	if rows == nil {
+		rows = [][]any{}
+	}
+	rs, err := buildResultset(names, rows)
 	if err != nil {
 		return nil, err
 	}
@@ -637,10 +935,7 @@ func handleInfoSchemaTables(lower string, schema []redash.SchemaTable) (*mysql.R
 		for i, t := range schema {
 			values[i] = []any{t.Name, nil, nil, nil, nil}
 		}
-		rs, err := mysql.BuildSimpleResultset(
-			[]string{"name", "comment", "data_size", "index_size", "total_size"},
-			values, false,
-		)
+		rs, err := buildResultset([]string{"name", "comment", "data_size", "index_size", "total_size"}, values)
 		if err != nil {
 			return nil, err
 		}
@@ -651,7 +946,7 @@ func handleInfoSchemaTables(lower string, schema []redash.SchemaTable) (*mysql.R
 	for i, t := range schema {
 		values[i] = []any{t.Name, "BASE TABLE"}
 	}
-	rs, err := mysql.BuildSimpleResultset([]string{"table_name", "table_type"}, values, false)
+	rs, err := buildResultset([]string{"table_name", "table_type"}, values)
 	if err != nil {
 		return nil, err
 	}
@@ -663,10 +958,7 @@ func handleInfoSchemaTableDetails(schema []redash.SchemaTable) (*mysql.Result, e
 	for i, t := range schema {
 		values[i] = []any{"utf8mb4", "utf8mb4_general_ci", "InnoDB", t.Name, -1}
 	}
-	rs, err := mysql.BuildSimpleResultset(
-		[]string{"charset", "collation", "engine", "name", "estimated_row"},
-		values, false,
-	)
+	rs, err := buildResultset([]string{"charset", "collation", "engine", "name", "estimated_row"}, values)
 	if err != nil {
 		return nil, err
 	}
@@ -674,7 +966,7 @@ func handleInfoSchemaTableDetails(schema []redash.SchemaTable) (*mysql.Result, e
 }
 
 func singleResult(colName string, value any) (*mysql.Result, error) {
-	rs, err := mysql.BuildSimpleResultset([]string{colName}, [][]any{{value}}, false)
+	rs, err := buildResultset([]string{colName}, [][]any{{value}})
 	if err != nil {
 		return nil, err
 	}
@@ -868,7 +1160,7 @@ func buildResult(sql string, result *redash.QueryResult) (*mysql.Result, error) 
 		values[i] = rowValues
 	}
 
-	rs, err := mysql.BuildSimpleResultset(names, values, false)
+	rs, err := buildResultset(names, values)
 	if err != nil {
 		return nil, fmt.Errorf("building result set: %w", err)
 	}
@@ -1039,4 +1331,20 @@ func stringifyValue(val any, redashType string) string {
 		return strings.TrimSuffix(s, "Z")
 	}
 	return fmt.Sprintf("%v", val)
+}
+
+// buildResultset is mysql.BuildSimpleResultset with one correction. go-mysql
+// takes a byte-slice view of each string value and sends a nil slice as SQL
+// NULL, and its view of "" is nil, so every empty text value, from a Redash
+// row or from SHOW VARIABLES, reached the client as NULL. An empty []byte is
+// a zero-length string on the wire, so "" is sent as that.
+func buildResultset(names []string, values [][]any) (*mysql.Resultset, error) {
+	for _, row := range values {
+		for i, v := range row {
+			if s, ok := v.(string); ok && s == "" {
+				row[i] = []byte{}
+			}
+		}
+	}
+	return mysql.BuildSimpleResultset(names, values, false)
 }

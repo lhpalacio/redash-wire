@@ -322,14 +322,23 @@ func (h *handler) getSchema() []redash.SchemaTable {
 //
 // Without a parser, only the positions that unambiguously introduce a table
 // reference are rewritten: the identifier (quoted or not) right after FROM,
-// JOIN, INTO, and a leading UPDATE, which covers SELECT ... FROM, every JOIN
-// form, INSERT/REPLACE INTO, UPDATE and DELETE FROM. A qualifier anywhere else
-// is left alone, in particular `x.col` column references: with a data source
-// named orders, `orders`.id in a select list or ON clause is the table orders,
-// and stripping it would change the query's meaning. Known limitations: the
-// second and later tables of a comma-separated FROM list keep their qualifier,
-// as does a three-part db.table.col column reference; and a qualifier right
-// after the FROM inside EXTRACT/SUBSTRING/TRIM is stripped like a table's.
+// JOIN, INTO and TABLE, and a leading UPDATE, DESCRIBE, DESC or EXPLAIN, which
+// covers SELECT ... FROM, every JOIN form, INSERT/REPLACE INTO, UPDATE, DELETE
+// FROM, CREATE/ALTER/DROP/TRUNCATE TABLE, SHOW CREATE TABLE, SHOW COLUMNS and
+// SHOW INDEX FROM, and DESCRIBE. A qualifier anywhere else is left alone, in
+// particular `x.col` column references: with a data source named orders,
+// `orders`.id in a select list or ON clause is the table orders, and stripping
+// it would change the query's meaning. Known limitations: the second and later
+// tables of a comma-separated FROM list keep their qualifier, as does a
+// three-part db.table.col column reference; and a qualifier right after the
+// FROM inside EXTRACT/SUBSTRING/TRIM is stripped like a table's.
+//
+// A SHOW statement may also name the database on its own, as in SHOW TABLE
+// STATUS FROM db or SHOW COLUMNS FROM t FROM db, which the real server would
+// refuse as an unknown database. That FROM db (or IN db) is dropped: Redash's
+// connection is already in the right database. The first FROM of SHOW COLUMNS,
+// FIELDS, INDEX, INDEXES and KEYS names a table, so it is only ever rewritten
+// as db.table.
 func (h *handler) stripDBQualifier(query string) string {
 	if h.dbName == "" {
 		return query
@@ -339,50 +348,94 @@ func (h *handler) stripDBQualifier(query string) string {
 	// where a quoted one is still visible. Both share positions.
 	red := strings.ToLower(sqltext.MySQL.Redact(query))
 	first := len(red) - len(strings.TrimLeft(red, " \t\r\n"))
+	isShow := tokenAt(red, first, "show")
+	tableFirst := isShow && showNamesTableFirst(red, first+len("show"))
+	fromSeen := 0
 
 	var out strings.Builder
 	copied := 0
 	for i := 0; i < len(red); {
-		n := tableRefKeywordAt(red, i, first)
-		if n == 0 {
+		kw := tableRefKeywordAt(red, i, first, isShow)
+		if kw == "" {
 			i++
 			continue
 		}
-		i += n
+		kwStart := i
+		i += len(kw)
+		namesDatabase := false
+		if kw == "from" || kw == "in" {
+			fromSeen++
+			namesDatabase = isShow && (!tableFirst || fromSeen != 1)
+		}
 		start := i
 		for start < len(query) && strings.IndexByte(" \t\r\n", query[start]) >= 0 {
 			start++
 		}
 		name, end := identifierAt(query, start)
-		if end < len(query) && query[end] == '.' && strings.EqualFold(name, h.dbName) {
+		if !strings.EqualFold(name, h.dbName) {
+			continue
+		}
+		switch {
+		case end < len(query) && query[end] == '.':
 			out.WriteString(query[copied:start])
 			copied = end + 1
 			i = end + 1
+		case namesDatabase:
+			// Drop the keyword, the name and the blank before them, so SHOW
+			// TABLE STATUS FROM db ends where the real server's statement does.
+			cut := kwStart
+			for cut > copied && strings.IndexByte(" \t\r\n", query[cut-1]) >= 0 {
+				cut--
+			}
+			out.WriteString(query[copied:cut])
+			copied = end
+			i = end
 		}
 	}
 	out.WriteString(query[copied:])
 	return out.String()
 }
 
-// tableRefKeywordAt returns the length of the table-introducing keyword that
-// starts at red[i], or 0. UPDATE only counts at the start of the statement
-// (first), so the column after ON DUPLICATE KEY UPDATE is not mistaken for a
-// table.
-func tableRefKeywordAt(red string, i, first int) int {
-	for _, kw := range [...]string{"from", "join", "into", "update"} {
-		if !strings.HasPrefix(red[i:], kw) {
+// showNamesTableFirst reports whether the SHOW statement whose keyword ends at
+// red[i] is one of the forms whose first FROM (or IN) names a table rather
+// than a database: SHOW [FULL] {COLUMNS | FIELDS} FROM tbl and SHOW {INDEX |
+// INDEXES | KEYS} FROM tbl. Both take an optional second FROM db.
+func showNamesTableFirst(red string, i int) bool {
+	for _, w := range strings.Fields(red[i:]) {
+		switch w {
+		case "full", "extended":
 			continue
+		case "columns", "fields", "index", "indexes", "keys":
+			return true
 		}
-		end := i + len(kw)
-		if (i > 0 && isIdentByte(red[i-1])) || (end < len(red) && isIdentByte(red[end])) {
-			continue
-		}
-		if kw == "update" && i != first {
-			continue
-		}
-		return len(kw)
+		return false
 	}
-	return 0
+	return false
+}
+
+// tableRefKeywordAt returns the table-introducing keyword that starts at
+// red[i], or "". UPDATE, DESCRIBE, DESC and EXPLAIN only count at the start of
+// the statement (first), so the column after ON DUPLICATE KEY UPDATE and the
+// DESC of an ORDER BY are not mistaken for a table. IN only counts in a SHOW
+// statement, where it is a synonym for FROM.
+func tableRefKeywordAt(red string, i, first int, isShow bool) string {
+	for _, kw := range [...]string{"from", "join", "into", "table", "update", "describe", "desc", "explain", "in"} {
+		if !tokenAt(red, i, kw) {
+			continue
+		}
+		switch kw {
+		case "update", "describe", "desc", "explain":
+			if i != first {
+				continue
+			}
+		case "in":
+			if !isShow {
+				continue
+			}
+		}
+		return kw
+	}
+	return ""
 }
 
 // identifierAt reads the identifier at s[i]: a `quoted` or "quoted" one, or a

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
@@ -337,8 +338,8 @@ func TestHandleShowDatabases(t *testing.T) {
 
 func TestHandleShowTables(t *testing.T) {
 	schema := []redash.SchemaTable{
-		{Name: "users", Columns: []string{"id", "name"}},
-		{Name: "orders", Columns: []string{"id", "total"}},
+		{Name: "users", Columns: []redash.SchemaColumn{{Name: "id"}, {Name: "name"}}},
+		{Name: "orders", Columns: []redash.SchemaColumn{{Name: "id"}, {Name: "total"}}},
 		{Name: "user_roles"},
 	}
 	sess := localSession{
@@ -509,7 +510,7 @@ func TestLikeMatcher(t *testing.T) {
 }
 
 func TestHandleShowVariables(t *testing.T) {
-	result, err := handleShowVariables(false)
+	result, err := handleShowVariables("SHOW VARIABLES", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -799,4 +800,213 @@ func TestHandleLocalSelect(t *testing.T) {
 			t.Errorf("s = %q", got)
 		}
 	})
+}
+
+// tablePlusColumnsQuery is what TablePlus sends to fill a table's structure
+// view on MySQL, with the data source name as the schema.
+const tablePlusColumnsQuery = "SELECT ordinal_position as ordinal_position,column_name as column_name,column_type AS data_type,character_set_name as character_set,collation_name as collation,is_nullable as is_nullable,column_default as column_default,extra as extra,column_name AS foreign_key,column_comment AS comment FROM information_schema.columns WHERE table_schema='Analytics MySQL' AND table_name='users' ORDER BY ordinal_position"
+
+func TestHandleInfoSchemaColumns(t *testing.T) {
+	sess := localSession{
+		dbName: "Analytics MySQL",
+		schema: []redash.SchemaTable{
+			{Name: "users", Columns: []redash.SchemaColumn{
+				{Name: "id", Type: "int"},
+				{Name: "name", Type: "varchar", Comment: "display name"},
+				{Name: "email"},
+			}},
+			{Name: "orders", Columns: []redash.SchemaColumn{{Name: "id", Type: "int"}, {Name: "user_id", Type: "int"}}},
+		},
+	}
+
+	// run answers sql and renders the result as column names and rows of text,
+	// NULL for a null.
+	run := func(t *testing.T, sess localSession, sql string) ([]string, [][]string) {
+		t.Helper()
+		result, err := handleLocalQuery(sql, sess)
+		if err != nil {
+			t.Fatalf("handleLocalQuery(%q): %v", sql, err)
+		}
+		if result == nil || result.Resultset == nil {
+			t.Fatalf("handleLocalQuery(%q): no result set", sql)
+		}
+		names := make([]string, len(result.Fields))
+		for i, f := range result.Fields {
+			names[i] = string(f.Name)
+		}
+		var rows [][]string
+		for _, r := range parseTextRows(t, result.Resultset) {
+			row := make([]string, len(r))
+			for i, v := range r {
+				if v.Value() == nil {
+					row[i] = "NULL"
+				} else {
+					row[i] = fieldValueString(v)
+				}
+			}
+			rows = append(rows, row)
+		}
+		return names, rows
+	}
+	join := func(ss []string) string { return strings.Join(ss, "|") }
+
+	t.Run("TablePlus structure view", func(t *testing.T) {
+		names, rows := run(t, sess, tablePlusColumnsQuery)
+		if got, want := join(names), "ordinal_position|column_name|data_type|character_set|collation|is_nullable|column_default|extra|foreign_key|comment"; got != want {
+			t.Errorf("columns = %s\nwant %s", got, want)
+		}
+		want := []string{
+			"1|id|int|NULL|NULL|NULL|NULL|NULL|id|",
+			"2|name|varchar|NULL|NULL|NULL|NULL|NULL|name|display name",
+			"3|email|NULL|NULL|NULL|NULL|NULL|NULL|email|",
+		}
+		if len(rows) != len(want) {
+			t.Fatalf("got %d rows, want %d: %v", len(rows), len(want), rows)
+		}
+		for i, row := range rows {
+			if join(row) != want[i] {
+				t.Errorf("row %d = %s\nwant %s", i, join(row), want[i])
+			}
+		}
+	})
+
+	t.Run("DBeaver SELECT * in upper case", func(t *testing.T) {
+		names, rows := run(t, sess, "SELECT * FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='analytics mysql' AND TABLE_NAME='orders' ORDER BY ORDINAL_POSITION")
+		if len(names) != len(infoSchemaColumnsStar) || names[3] != "COLUMN_NAME" {
+			t.Errorf("columns = %v", names)
+		}
+		if len(rows) != 2 {
+			t.Fatalf("got %d rows, want 2: %v", len(rows), rows)
+		}
+		if rows[1][0] != "def" || rows[1][1] != "Analytics MySQL" || rows[1][2] != "orders" || rows[1][3] != "user_id" || rows[1][4] != "2" || rows[1][7] != "int" {
+			t.Errorf("row = %v", rows[1])
+		}
+	})
+
+	t.Run("qualified columns, IN and LIKE", func(t *testing.T) {
+		names, rows := run(t, sess, "SELECT c.column_name, `c`.`TABLE_NAME` FROM information_schema.columns c WHERE c.table_name IN ('users', 'nothing') AND c.column_name LIKE '%id%'")
+		if got := join(names); got != "c.column_name|`c`.`TABLE_NAME`" {
+			t.Errorf("columns = %s", got)
+		}
+		if len(rows) != 1 || join(rows[0]) != "id|users" {
+			t.Errorf("rows = %v, want [[id users]]", rows)
+		}
+	})
+
+	t.Run("no WHERE lists every column of every table", func(t *testing.T) {
+		_, rows := run(t, sess, "SELECT table_name, column_name FROM information_schema.columns")
+		if len(rows) != 5 {
+			t.Errorf("got %d rows, want 5", len(rows))
+		}
+	})
+
+	t.Run("another schema has nothing", func(t *testing.T) {
+		names, rows := run(t, sess, "SELECT column_name FROM information_schema.columns WHERE table_schema = 'other' AND table_name = 'users'")
+		if len(rows) != 0 || join(names) != "column_name" {
+			t.Errorf("rows = %v, columns = %v", rows, names)
+		}
+	})
+
+	t.Run("OR is not evaluated, so everything is admitted", func(t *testing.T) {
+		_, rows := run(t, sess, "SELECT column_name FROM information_schema.columns WHERE table_name = 'users' OR table_name = 'orders'")
+		if len(rows) != 5 {
+			t.Errorf("got %d rows, want 5", len(rows))
+		}
+	})
+
+	t.Run("literals and unknown expressions", func(t *testing.T) {
+		_, rows := run(t, sess, "SELECT 'x' AS lit, 7 AS n, CASE column_key WHEN 'PRI' THEN 1 ELSE 0 END AS pk, UPPER(column_name) FROM information_schema.columns WHERE table_name = 'orders'")
+		if len(rows) != 2 || join(rows[0]) != "x|7|NULL|NULL" {
+			t.Errorf("rows = %v", rows)
+		}
+	})
+
+	t.Run("statistics is empty with the requested columns", func(t *testing.T) {
+		names, rows := run(t, sess, "SELECT sub_part as index_length,index_name as index_name,index_type AS index_algorithm,CASE non_unique WHEN 0 THEN'TRUE'ELSE'FALSE'END AS is_unique,column_name as column_name FROM information_schema.statistics WHERE table_schema='Analytics MySQL' AND table_name='users'")
+		if got := join(names); got != "index_length|index_name|index_algorithm|is_unique|column_name" {
+			t.Errorf("columns = %s", got)
+		}
+		if len(rows) != 0 {
+			t.Errorf("rows = %v, want none", rows)
+		}
+	})
+
+	t.Run("no database selected", func(t *testing.T) {
+		_, rows := run(t, localSession{}, tablePlusColumnsQuery)
+		if len(rows) != 0 {
+			t.Errorf("rows = %v, want none", rows)
+		}
+	})
+}
+
+// TestEmptyStringIsNotNull: go-mysql sends a Go "" as SQL NULL, so an empty
+// text value from Redash used to reach the client as NULL. It must arrive as a
+// zero-length string, distinct from a real NULL in the same column.
+func TestEmptyStringIsNotNull(t *testing.T) {
+	result, err := buildResult("SELECT s FROM t", &redash.QueryResult{
+		Columns: []redash.Column{{Name: "s", Type: "string"}},
+		Rows:    []map[string]any{{"s": ""}, {"s": nil}, {"s": "x"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := parseTextRows(t, result.Resultset)
+	if len(rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(rows))
+	}
+	if v := rows[0][0].Value(); v == nil || len(v.([]byte)) != 0 {
+		t.Errorf("empty string came back as %#v, want a zero-length string", v)
+	}
+	if v := rows[1][0].Value(); v != nil {
+		t.Errorf("NULL came back as %#v", v)
+	}
+
+	// The same through a locally answered query: init_connect is "".
+	vars, err := handleLocalQuery("SHOW VARIABLES", localSession{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range parseTextRows(t, vars.Resultset) {
+		if fieldValueString(row[0]) == "init_connect" && row[1].Value() == nil {
+			t.Error("init_connect came back as NULL, want an empty string")
+		}
+	}
+}
+
+// TestShowVariablesFilter: SHOW VARIABLES honours LIKE and WHERE, since a
+// client asking for one variable reads whatever row comes first.
+func TestShowVariablesFilter(t *testing.T) {
+	tests := []struct {
+		sql  string
+		want []string
+	}{
+		{"SHOW VARIABLES LIKE 'lower_case%'", []string{"lower_case_table_names"}},
+		{"show session variables like 'SQL_MODE'", []string{"sql_mode"}},
+		{"SHOW GLOBAL VARIABLES WHERE Variable_name = 'version'", []string{"version"}},
+		{"SHOW VARIABLES WHERE `Variable_name` IN ('autocommit', 'time_zone');", []string{"autocommit", "time_zone"}},
+		{"SHOW VARIABLES LIKE 'no_such_variable'", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.sql, func(t *testing.T) {
+			result, err := handleLocalQuery(tt.sql, localSession{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for _, row := range parseTextRows(t, result.Resultset) {
+				got = append(got, fieldValueString(row[0]))
+			}
+			if strings.Join(got, ",") != strings.Join(tt.want, ",") {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	result, err := handleLocalQuery("SHOW VARIABLES", localSession{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(parseTextRows(t, result.Resultset)); n != len(sessionVariables) {
+		t.Errorf("unfiltered SHOW VARIABLES returned %d rows, want %d", n, len(sessionVariables))
+	}
 }

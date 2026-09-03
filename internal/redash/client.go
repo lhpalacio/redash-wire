@@ -93,9 +93,18 @@ type DataSource struct {
 	Type string `json:"type"`
 }
 
+// SchemaColumn is one column of a table as Redash reports it. Every runner
+// gives the name; the SQL runners also give the type, in the data source's own
+// spelling ("int", "varchar", "character varying"), and MySQL the comment.
+type SchemaColumn struct {
+	Name    string
+	Type    string
+	Comment string
+}
+
 type SchemaTable struct {
-	Name    string   `json:"name"`
-	Columns []string `json:"-"`
+	Name    string `json:"name"`
+	Columns []SchemaColumn
 }
 
 type schemaTableRaw struct {
@@ -108,14 +117,16 @@ func (r *schemaTableRaw) toSchemaTable() SchemaTable {
 	for _, raw := range r.Columns {
 		var s string
 		if json.Unmarshal(raw, &s) == nil {
-			t.Columns = append(t.Columns, s)
+			t.Columns = append(t.Columns, SchemaColumn{Name: s})
 			continue
 		}
 		var obj struct {
-			Name string `json:"name"`
+			Name        string `json:"name"`
+			Type        string `json:"type"`
+			Description string `json:"description"`
 		}
 		if json.Unmarshal(raw, &obj) == nil {
-			t.Columns = append(t.Columns, obj.Name)
+			t.Columns = append(t.Columns, SchemaColumn{Name: obj.Name, Type: obj.Type, Comment: obj.Description})
 		}
 	}
 	return t
@@ -265,33 +276,145 @@ func (c *Client) GetSchema(ctx context.Context, dataSourceID int) ([]SchemaTable
 		return nil, fmt.Errorf("schema request failed (status %d)", resp.StatusCode)
 	}
 
-	// Redash reports a schema-fetch failure (a dead data source, a permissions
-	// problem) as HTTP 200 carrying an "error" key and no "schema". Decoding only
-	// "schema" turned that into an empty-but-successful schema, which the cache
-	// then remembered as ready for the whole session. Treat a response that
-	// carries an error, or that omits "schema" entirely, as a failure so the
-	// caller's retry policy applies and nothing empty is cached.
-	var envelope struct {
-		Schema []schemaTableRaw `json:"schema"`
-		Error  json.RawMessage  `json:"error"`
-	}
+	var envelope schemaEnvelope
 	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
 		return nil, fmt.Errorf("decoding schema: %w", err)
 	}
-	if len(envelope.Error) > 0 && string(envelope.Error) != "null" {
-		return nil, fmt.Errorf("schema request failed: %s", strings.TrimSpace(string(envelope.Error)))
+
+	// Since Redash 10 the endpoint answers with the schema only when it has one
+	// cached in Redis. Otherwise it enqueues a job that reads the schema from the
+	// data source and returns that job instead; the schema is the job's result
+	// once it finishes. A source the Redash scheduler has not refreshed yet (one
+	// just added, or any source after a Redis flush) always takes this path, so
+	// treating the job as "no schema" left every table listing empty until the
+	// next scheduled refresh, up to half an hour later.
+	if envelope.Job != nil {
+		return c.pollSchemaJob(ctx, envelope.Job)
+	}
+	return envelope.tables()
+}
+
+// schemaEnvelope is the body of GET /api/data_sources/{id}/schema: the schema,
+// an error, or (Redash 10 and later, when nothing is cached) a job to poll.
+type schemaEnvelope struct {
+	Schema []schemaTableRaw `json:"schema"`
+	Error  json.RawMessage  `json:"error"`
+	Job    *schemaJob       `json:"job"`
+}
+
+// tables converts a schema answer. Redash reports a schema-fetch failure (a
+// dead data source, a permissions problem) as HTTP 200 carrying an "error" key
+// and no "schema". Decoding only "schema" turned that into an empty-but-
+// successful schema, which the cache then remembered as ready for the whole
+// session. A response that carries an error, or that omits "schema" entirely,
+// is a failure so the caller's retry policy applies and nothing empty is cached.
+func (e *schemaEnvelope) tables() ([]SchemaTable, error) {
+	if len(e.Error) > 0 && string(e.Error) != "null" {
+		return nil, fmt.Errorf("schema request failed: %s", errorText(e.Error))
 	}
 	// A present-but-empty schema ("schema": []) is a valid answer for a source
 	// with no tables; an absent key (nil) is not.
-	if envelope.Schema == nil {
+	if e.Schema == nil {
 		return nil, fmt.Errorf("schema response contained no schema")
 	}
-
-	tables := make([]SchemaTable, len(envelope.Schema))
-	for i, raw := range envelope.Schema {
+	tables := make([]SchemaTable, len(e.Schema))
+	for i, raw := range e.Schema {
 		tables[i] = raw.toSchemaTable()
 	}
 	return tables, nil
+}
+
+// schemaJob is the job the schema endpoint returns while the schema is being
+// read from the data source. It is decoded apart from jobInfo because Redash
+// serializes every job the same way, so here "result" and "query_result_id"
+// both carry the schema itself rather than an id, and "error" may be an
+// object rather than a string.
+type schemaJob struct {
+	ID     string          `json:"id"`
+	Status int             `json:"status"`
+	Error  json.RawMessage `json:"error"`
+	Result json.RawMessage `json:"result"`
+}
+
+type schemaJobEnvelope struct {
+	Job schemaJob `json:"job"`
+}
+
+// pollSchemaJob follows a schema job to completion under the same interval,
+// timeout and transient-failure policy as a query job.
+func (c *Client) pollSchemaJob(ctx context.Context, job *schemaJob) ([]SchemaTable, error) {
+	deadline := time.After(c.pollTimeout)
+	ticker := time.NewTicker(c.pollInterval)
+	defer ticker.Stop()
+
+	consecutiveErrors := 0
+	for {
+		switch job.Status {
+		case jobStatusQueued, jobStatusStarted:
+		case jobStatusFinished:
+			return schemaFromJobResult(job.Result)
+		case jobStatusFailed:
+			return nil, fmt.Errorf("schema request failed: %s", errorText(job.Error))
+		default:
+			return nil, fmt.Errorf("unknown schema job status: %d", job.Status)
+		}
+
+		select {
+		case <-ctx.Done():
+			c.cancelJob(job.ID)
+			return nil, ctx.Err()
+		case <-deadline:
+			c.cancelJob(job.ID)
+			return nil, fmt.Errorf("schema fetch timed out after %s", c.pollTimeout)
+		case <-ticker.C:
+		}
+
+		var envelope schemaJobEnvelope
+		if err := c.fetchJob(ctx, job.ID, &envelope); err != nil {
+			var he *httpError
+			if errors.As(err, &he) && isFatalStatus(he.statusCode) {
+				return nil, err
+			}
+			if ctx.Err() != nil {
+				c.cancelJob(job.ID)
+				return nil, ctx.Err()
+			}
+			consecutiveErrors++
+			if consecutiveErrors >= maxConsecutivePollErrors {
+				c.cancelJob(job.ID)
+				return nil, fmt.Errorf("schema job polling failed %d times in a row: %w", consecutiveErrors, err)
+			}
+			continue
+		}
+		consecutiveErrors = 0
+		job = &envelope.Job
+	}
+}
+
+// schemaFromJobResult reads a finished schema job's result: the array of
+// tables, or the same array under a "schema" key.
+func schemaFromJobResult(raw json.RawMessage) ([]SchemaTable, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, fmt.Errorf("schema job finished without a schema")
+	}
+	var envelope schemaEnvelope
+	if err := json.Unmarshal(raw, &envelope.Schema); err != nil {
+		if json.Unmarshal(raw, &envelope) != nil {
+			return nil, fmt.Errorf("decoding schema job result: %w", err)
+		}
+	}
+	return envelope.tables()
+}
+
+// errorText renders a Redash "error" value for a log line or an error: a JSON
+// string without its quotes, anything else (an object with code and message)
+// as written.
+func errorText(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	return strings.TrimSpace(string(raw))
 }
 
 type queryRequest struct {
@@ -464,28 +587,36 @@ func (c *Client) cancelJob(jobID string) {
 }
 
 func (c *Client) getJob(ctx context.Context, jobID string) (*jobInfo, error) {
+	var envelope jobEnvelope
+	if err := c.fetchJob(ctx, jobID, &envelope); err != nil {
+		return nil, err
+	}
+	return &envelope.Job, nil
+}
+
+// fetchJob reads GET /api/jobs/{id} into dst, which decides how the job's
+// result is typed: an id for a query job, the schema itself for a schema job.
+func (c *Client) fetchJob(ctx context.Context, jobID string, dst any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/api/jobs/%s", c.baseURL, jobID), nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating job request: %w", err)
+		return fmt.Errorf("creating job request: %w", err)
 	}
 	req.Header.Set("Authorization", "Key "+c.apiKey)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("getting job status: %w", err)
+		return fmt.Errorf("getting job status: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, &httpError{statusCode: resp.StatusCode, message: fmt.Sprintf("job status request failed (status %d)", resp.StatusCode)}
+		return &httpError{statusCode: resp.StatusCode, message: fmt.Sprintf("job status request failed (status %d)", resp.StatusCode)}
 	}
 
-	var envelope jobEnvelope
-	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
-		return nil, fmt.Errorf("decoding job response: %w", err)
+	if err := json.NewDecoder(resp.Body).Decode(dst); err != nil {
+		return fmt.Errorf("decoding job response: %w", err)
 	}
-
-	return &envelope.Job, nil
+	return nil
 }
 
 func (c *Client) getQueryResult(ctx context.Context, resultID int) (*QueryResult, error) {
@@ -525,8 +656,15 @@ func (c *Client) getQueryResult(ctx context.Context, resultID int) (*QueryResult
 	return c.parseQueryResult(envelope.QueryResult.Data.Columns, envelope.QueryResult.Data.Rows)
 }
 
+// isNoDataError recognises the failure a Redash query runner reports for a
+// statement that ran but produced no result set, which is what a successful
+// INSERT, UPDATE or DELETE looks like to Redash. Each runner has its own
+// wording: pg, db2 and sqlite say "Query completed but it returned no data.",
+// mysql, mssql and vertica say "No data was returned."
 func isNoDataError(msg string) bool {
-	return strings.Contains(strings.ToLower(msg), "query completed but it returned no data")
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "query completed but it returned no data") ||
+		strings.Contains(lower, "no data was returned")
 }
 
 // redashErrorMessage extracts a concise message from a Redash JSON error body for

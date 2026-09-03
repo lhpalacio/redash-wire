@@ -155,6 +155,34 @@ func TestStripDBQualifier(t *testing.T) {
 		{"inside a literal", "SELECT * FROM orders.t WHERE s = 'from orders.users'", "SELECT * FROM t WHERE s = 'from orders.users'"},
 		{"inside a comment", "SELECT * FROM orders.t -- from orders.x", "SELECT * FROM t -- from orders.x"},
 		{"no qualifier", "SELECT * FROM users", "SELECT * FROM users"},
+
+		// Statements a client sends to read a table's structure.
+		{"SHOW CREATE TABLE", "SHOW CREATE TABLE `orders`.`users`", "SHOW CREATE TABLE `users`"},
+		{"SHOW COLUMNS FROM db.table", "SHOW FULL COLUMNS FROM `orders`.`users`", "SHOW FULL COLUMNS FROM `users`"},
+		{"SHOW COLUMNS FROM table FROM db", "SHOW COLUMNS FROM `users` FROM `orders`", "SHOW COLUMNS FROM `users`"},
+		{"SHOW COLUMNS FROM table IN db LIKE", "SHOW COLUMNS FROM users IN orders LIKE 'id%'", "SHOW COLUMNS FROM users LIKE 'id%'"},
+		{"SHOW INDEX FROM db.table", "SHOW INDEX FROM orders.users", "SHOW INDEX FROM users"},
+		{"SHOW KEYS FROM table FROM db", "SHOW KEYS FROM users FROM orders", "SHOW KEYS FROM users"},
+		{"SHOW TABLE STATUS FROM db", "SHOW TABLE STATUS FROM `orders` LIKE 'users'", "SHOW TABLE STATUS LIKE 'users'"},
+		{"SHOW TABLE STATUS IN db", "SHOW TABLE STATUS IN orders", "SHOW TABLE STATUS"},
+		{"SHOW TRIGGERS FROM db", "SHOW TRIGGERS FROM orders", "SHOW TRIGGERS"},
+		{"DESCRIBE", "DESCRIBE `orders`.`users`", "DESCRIBE `users`"},
+		{"DESC", "DESC orders.users", "DESC users"},
+		{"EXPLAIN table", "EXPLAIN orders.users", "EXPLAIN users"},
+		{"EXPLAIN query", "EXPLAIN SELECT * FROM orders.users", "EXPLAIN SELECT * FROM users"},
+		{"CREATE TABLE", "CREATE TABLE orders.t (id INT)", "CREATE TABLE t (id INT)"},
+		{"ALTER TABLE", "ALTER TABLE `orders`.`t` ADD COLUMN a INT", "ALTER TABLE `t` ADD COLUMN a INT"},
+		{"DROP TABLE", "DROP TABLE orders.t", "DROP TABLE t"},
+		{"TRUNCATE TABLE", "TRUNCATE TABLE orders.t", "TRUNCATE TABLE t"},
+
+		// Positions that only look like the forms above.
+		{"ORDER BY DESC is not DESCRIBE", "SELECT * FROM orders.t ORDER BY a DESC", "SELECT * FROM t ORDER BY a DESC"},
+		{"IN outside SHOW is a set", "SELECT * FROM orders.t WHERE a IN (1, 2)", "SELECT * FROM t WHERE a IN (1, 2)"},
+		{"IN list naming the database outside SHOW survives", "SELECT * FROM t WHERE name IN orders", "SELECT * FROM t WHERE name IN orders"},
+		{"SHOW COLUMNS FROM a table named like the database", "SHOW COLUMNS FROM orders", "SHOW COLUMNS FROM orders"},
+		{"SHOW INDEX FROM a table named like the database, FROM db", "SHOW INDEX FROM orders FROM orders", "SHOW INDEX FROM orders"},
+		{"SHOW ... FROM another database survives", "SHOW TABLE STATUS FROM other", "SHOW TABLE STATUS FROM other"},
+		{"SHOW ... FROM db inside a literal", "SHOW TABLE STATUS LIKE 'from orders'", "SHOW TABLE STATUS LIKE 'from orders'"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -816,7 +816,7 @@ func columnRows(sql string, schema []redash.SchemaTable, cols []selCol, kindOK b
 	var rows [][]any
 	for _, i := range admittedTables(sql, schema, kindOK) {
 		for ord, column := range schema[i].Columns {
-			rows = append(rows, rowFor(cols, pgAttributeLookup(i, schema[i], ord+1, column)))
+			rows = append(rows, rowFor(cols, pgAttributeLookup(i, schema[i], ord+1, column.Name)))
 		}
 	}
 	return rows
