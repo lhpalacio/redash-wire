@@ -3,6 +3,7 @@ package pgwire
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -320,6 +321,12 @@ func TestHandleLocalQuery(t *testing.T) {
 				cc := msgs[0].(*pgproto3.CommandComplete)
 				if string(cc.CommandTag) != "SET" {
 					t.Errorf("CommandTag = %q, want %q", cc.CommandTag, "SET")
+				}
+			}
+			if tt.name == "SELECT version()" {
+				row := msgs[1].(*pgproto3.DataRow)
+				if len(row.Values) != 1 || !strings.Contains(string(row.Values[0]), "redash-wire") {
+					t.Errorf("version() = %q, want the proxy's version string", row.Values)
 				}
 			}
 		})

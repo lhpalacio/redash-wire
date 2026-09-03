@@ -20,7 +20,8 @@ const mysqlDatabase = "Analytics MySQL"
 
 func startGatedPGServer(t *testing.T, gate *health.Gate) string {
 	t.Helper()
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
+	mock.ExecuteQueryFunc = redashRunsAnything
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -45,7 +46,8 @@ func startGatedPGServer(t *testing.T, gate *health.Gate) string {
 
 func startGatedMySQLServer(t *testing.T, gate *health.Gate) string {
 	t.Helper()
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
+	mock.ExecuteQueryFunc = redashRunsAnything
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -267,7 +269,8 @@ func TestMySQLWithNoDatabaseIsToldWhyWhileRedashIsUnreachable(t *testing.T) {
 func TestServersWithoutAGateServeUnconditionally(t *testing.T) {
 	// The wire-protocol tests construct servers with no gate at all; that must
 	// keep meaning "always serve", not "never serve".
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
+	mock.ExecuteQueryFunc = redashRunsAnything
 	addr := startPGServer(t, mock, registry)
 
 	conn, err := dialPG(addr, pgDatabase)

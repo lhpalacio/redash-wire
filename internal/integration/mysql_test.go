@@ -12,7 +12,7 @@ import (
 )
 
 func TestMySQL_ConnectionAndAuth(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	addr := startMySQLServer(t, mock, registry)
 
 	t.Run("valid credentials", func(t *testing.T) {
@@ -36,7 +36,7 @@ func TestMySQL_ConnectionAndAuth(t *testing.T) {
 }
 
 func TestMySQL_UseDatabase(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	addr := startMySQLServer(t, mock, registry)
 	db := connectMySQL(t, addr, "")
 
@@ -69,7 +69,7 @@ func TestMySQL_UseDatabase(t *testing.T) {
 }
 
 func TestMySQL_ShowDatabases(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	addr := startMySQLServer(t, mock, registry)
 	db := connectMySQL(t, addr, "")
 
@@ -101,7 +101,7 @@ func TestMySQL_ShowDatabases(t *testing.T) {
 }
 
 func TestMySQL_ShowTables(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	addr := startMySQLServer(t, mock, registry)
 	db := connectMySQL(t, addr, "")
 
@@ -142,20 +142,24 @@ func TestMySQL_ShowTables(t *testing.T) {
 		}
 		defer rows.Close()
 
+		types := map[string]string{}
 		for rows.Next() {
 			var name, tableType string
 			if err := rows.Scan(&name, &tableType); err != nil {
 				t.Fatalf("scan: %v", err)
 			}
-			if tableType != "BASE TABLE" {
-				t.Errorf("expected table type 'BASE TABLE', got %q for %q", tableType, name)
+			types[name] = tableType
+		}
+		for _, name := range []string{"users", "orders"} {
+			if types[name] != "BASE TABLE" {
+				t.Errorf("table %q: type = %q, want BASE TABLE (tables listed: %v)", name, types[name], types)
 			}
 		}
 	})
 }
 
 func TestMySQL_ShowVariables(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	addr := startMySQLServer(t, mock, registry)
 	db := connectMySQL(t, addr, "")
 
@@ -184,7 +188,7 @@ func TestMySQL_ShowVariables(t *testing.T) {
 }
 
 func TestMySQL_LocalSelects(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	addr := startMySQLServer(t, mock, registry)
 	db := connectMySQL(t, addr, "")
 
@@ -197,7 +201,6 @@ func TestMySQL_LocalSelects(t *testing.T) {
 		{"@@version_comment", "SELECT @@version_comment", "redash-wire MySQL proxy"},
 		{"version()", "SELECT version()", "8.0.0-redash-wire"},
 		{"user()", "SELECT user()", "redash@localhost"},
-		{"connection_id()", "SELECT connection_id()", "1"},
 		{"@@sql_mode", "SELECT @@sql_mode", "ONLY_FULL_GROUP_BY"},
 	}
 
@@ -214,13 +217,47 @@ func TestMySQL_LocalSelects(t *testing.T) {
 		})
 	}
 
+	t.Run("connection_id()", func(t *testing.T) {
+		ctx := context.Background()
+		connID := func(c *sql.Conn) int64 {
+			t.Helper()
+			var id int64
+			if err := c.QueryRowContext(ctx, "SELECT connection_id()").Scan(&id); err != nil {
+				t.Fatalf("query failed: %v", err)
+			}
+			return id
+		}
+		first, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer first.Close()
+		id := connID(first)
+		if id <= 0 {
+			t.Fatalf("connection_id() = %d, want a positive id", id)
+		}
+		if again := connID(first); again != id {
+			t.Errorf("connection_id() changed from %d to %d on the same connection", id, again)
+		}
+		second, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer second.Close()
+		if other := connID(second); other == id {
+			t.Errorf("two connections share connection_id() %d", id)
+		}
+	})
+
 	t.Run("database() without USE", func(t *testing.T) {
 		var val sql.NullString
 		err := db.QueryRow("SELECT database()").Scan(&val)
 		if err != nil {
 			t.Fatalf("query failed: %v", err)
 		}
-		// Should be NULL or empty when no database selected
+		if val.Valid && val.String != "" {
+			t.Fatalf("database() = %q with no database selected, want NULL", val.String)
+		}
 	})
 
 	t.Run("database() after USE", func(t *testing.T) {
@@ -240,7 +277,7 @@ func TestMySQL_LocalSelects(t *testing.T) {
 }
 
 func TestMySQL_RemoteQueryExecution(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 
 	var capturedSQL string
 	var capturedDSID int
@@ -317,78 +354,38 @@ func TestMySQL_RemoteQueryExecution(t *testing.T) {
 	}
 }
 
-func TestMySQL_DML(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
-	mock.ExecuteQueryFunc = func(ctx context.Context, sql string, dataSourceID int) (*redash.QueryResult, error) {
-		return &redash.QueryResult{
-			Columns: []redash.Column{{Name: "id", Type: "integer"}},
-			Rows: []map[string]any{
-				{"id": json.Number("1")},
-				{"id": json.Number("2")},
-				{"id": json.Number("3")},
-			},
-		}, nil
-	}
+// TestMySQL_Writes: Redash runs a write but reports no rows for it, so the
+// client sees success and, as the README says, no affected-row count.
+func TestMySQL_Writes(t *testing.T) {
+	mock, registry := defaultMockAndRegistry(t)
+	mock.ExecuteQueryFunc = redashRunsAnything
 
 	addr := startMySQLServer(t, mock, registry)
-	db := connectMySQL(t, addr, "")
+	db := connectMySQL(t, addr, "Analytics MySQL")
 
-	_, err := db.Exec("USE `Analytics MySQL`")
-	if err != nil {
-		t.Fatalf("USE failed: %v", err)
-	}
-
-	tests := []struct {
-		name         string
-		sql          string
-		expectedRows int64
-	}{
-		{"INSERT", "INSERT INTO t (id) VALUES (1)", 3},
-		{"UPDATE", "UPDATE t SET x = 1", 3},
-		{"DELETE", "DELETE FROM t WHERE x = 1", 3},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := db.Exec(tt.sql)
+	for _, stmt := range []string{
+		"INSERT INTO t (id) VALUES (1)",
+		"UPDATE customers SET name = 'test' WHERE id = 1",
+		"DELETE FROM t WHERE x = 1",
+	} {
+		t.Run(stmt, func(t *testing.T) {
+			result, err := db.Exec(stmt)
 			if err != nil {
-				t.Fatalf("exec %q failed: %v", tt.sql, err)
+				t.Fatalf("exec failed: %v", err)
 			}
 			affected, err := result.RowsAffected()
 			if err != nil {
 				t.Fatalf("rows affected: %v", err)
 			}
-			if affected != tt.expectedRows {
-				t.Fatalf("expected %d affected rows, got %d", tt.expectedRows, affected)
+			if affected != 0 {
+				t.Errorf("RowsAffected = %d, want 0: Redash reports no count", affected)
 			}
 		})
 	}
 }
 
-func TestMySQL_DMLNoData(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
-	// Simulate Redash's "query completed but returned no data": the query
-	// executed successfully but Redash does not return affected row counts.
-	mock.ExecuteQueryFunc = func(ctx context.Context, sql string, dataSourceID int) (*redash.QueryResult, error) {
-		return &redash.QueryResult{}, nil
-	}
-
-	addr := startMySQLServer(t, mock, registry)
-	db := connectMySQL(t, addr, "")
-
-	_, err := db.Exec("USE `Analytics MySQL`")
-	if err != nil {
-		t.Fatalf("USE failed: %v", err)
-	}
-
-	_, err = db.Exec("UPDATE customers SET name = 'test' WHERE id = 1")
-	if err != nil {
-		t.Fatalf("exec failed: %v", err)
-	}
-}
-
 func TestMySQL_NoDatabaseSelected(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	addr := startMySQLServer(t, mock, registry)
 	db := connectMySQL(t, addr, "")
 
@@ -402,7 +399,7 @@ func TestMySQL_NoDatabaseSelected(t *testing.T) {
 }
 
 func TestMySQL_InformationSchema(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	addr := startMySQLServer(t, mock, registry)
 	db := connectMySQL(t, addr, "")
 
@@ -457,15 +454,19 @@ func TestMySQL_InformationSchema(t *testing.T) {
 		}
 		defer rows.Close()
 
+		// One row per table, carrying the table's name, is what TablePlus
+		// reads from this query; the rest of the row is padding.
+		var names []string
 		for rows.Next() {
 			var charset, collation, engine, name string
 			var estimatedRow int64
 			if err := rows.Scan(&charset, &collation, &engine, &name, &estimatedRow); err != nil {
 				t.Fatalf("scan: %v", err)
 			}
-			if charset != "utf8mb4" {
-				t.Errorf("expected charset 'utf8mb4', got %q", charset)
-			}
+			names = append(names, name)
+		}
+		if got := strings.Join(names, ","); got != "users,orders" {
+			t.Errorf("tables = %q, want users,orders", got)
 		}
 	})
 }
@@ -473,7 +474,7 @@ func TestMySQL_InformationSchema(t *testing.T) {
 // TestMySQL_TableStructure: the query TablePlus sends for a table's structure
 // view is answered from the Redash schema, through a real client connection.
 func TestMySQL_TableStructure(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	addr := startMySQLServer(t, mock, registry)
 	db := connectMySQL(t, addr, "Analytics MySQL")
 

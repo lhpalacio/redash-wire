@@ -244,45 +244,24 @@ func TestBuildResult(t *testing.T) {
 		}
 	})
 
-	t.Run("INSERT returns affected rows", func(t *testing.T) {
-		qr := &redash.QueryResult{
-			Rows: []map[string]any{{}, {}, {}},
-		}
-
-		result, err := buildResult("INSERT INTO users (name) VALUES ('x')", qr)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if result.AffectedRows != 3 {
-			t.Errorf("AffectedRows = %d, want 3", result.AffectedRows)
-		}
-	})
-
-	t.Run("UPDATE returns affected rows", func(t *testing.T) {
-		qr := &redash.QueryResult{
-			Rows: []map[string]any{{}},
-		}
-
-		result, err := buildResult("UPDATE users SET name='y' WHERE id=1", qr)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if result.AffectedRows != 1 {
-			t.Errorf("AffectedRows = %d, want 1", result.AffectedRows)
-		}
-	})
-
-	t.Run("DELETE returns affected rows", func(t *testing.T) {
-		qr := &redash.QueryResult{
-			Rows: []map[string]any{{}, {}},
-		}
-
-		result, err := buildResult("DELETE FROM logs WHERE id < 10", qr)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if result.AffectedRows != 2 {
-			t.Errorf("AffectedRows = %d, want 2", result.AffectedRows)
+	t.Run("a write is an OK packet without a row count", func(t *testing.T) {
+		// A MySQL write yields no result set, and Redash reports no
+		// affected-row count, so the client gets a plain OK with 0 rows.
+		for _, sql := range []string{
+			"INSERT INTO users (name) VALUES ('x')",
+			"UPDATE users SET name='y' WHERE id=1",
+			"DELETE FROM logs WHERE id < 10",
+		} {
+			result, err := buildResult(sql, &redash.QueryResult{})
+			if err != nil {
+				t.Fatalf("%s: unexpected error: %v", sql, err)
+			}
+			if result.Resultset != nil {
+				t.Errorf("%s: got a result set, want a plain OK", sql)
+			}
+			if result.AffectedRows != 0 {
+				t.Errorf("%s: AffectedRows = %d, want 0", sql, result.AffectedRows)
+			}
 		}
 	})
 

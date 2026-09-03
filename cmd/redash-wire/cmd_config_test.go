@@ -38,9 +38,20 @@ func TestPrintConfigInvalidReasonInReport(t *testing.T) {
 	path, sum := writeTestConfig(t)
 	res := config.ResolveResult{Path: path, Found: true}
 
+	payload := buildConfigPayload(res, "explicit", sum, false)
+	var reason string
+	for _, p := range payload.Profiles {
+		if !p.Valid {
+			reason = p.Error
+		}
+	}
+	if reason == "" {
+		t.Fatalf("fixture has no invalid profile with a reason: %+v", payload.Profiles)
+	}
+
 	var out bytes.Buffer
-	printConfig(&out, buildConfigPayload(res, "explicit", sum, false))
-	if !strings.Contains(out.String(), "invalid:     api_key is required") {
-		t.Errorf("invalid reason missing from the report:\n%s", out.String())
+	printConfig(&out, payload)
+	if !strings.Contains(out.String(), reason) {
+		t.Errorf("invalid reason %q missing from the report:\n%s", reason, out.String())
 	}
 }

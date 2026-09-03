@@ -3,6 +3,7 @@ package mysqlwire
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -45,6 +46,49 @@ func errorCode(t *testing.T, err error) uint16 {
 	return myErr.Code
 }
 
+// localValue runs a locally answered single-value statement on h and returns
+// the value as a client prints it, "" for NULL. It is how a test observes the
+// session's state: SELECT DATABASE() for the selected source, SELECT
+// CONNECTION_ID() for the id, SHOW TABLES for the schema in use.
+func localValue(t *testing.T, h *handler, sql string) string {
+	t.Helper()
+	result, err := h.HandleQuery(sql)
+	if err != nil {
+		t.Fatalf("HandleQuery(%q): %v", sql, err)
+	}
+	if result == nil || result.Resultset == nil {
+		t.Fatalf("HandleQuery(%q): no result set", sql)
+	}
+	rows := parseTextRows(t, result.Resultset)
+	if len(rows) != 1 || len(rows[0]) != 1 {
+		t.Fatalf("HandleQuery(%q): want one value, got %d rows", sql, len(rows))
+	}
+	return fieldValueString(rows[0][0])
+}
+
+// capturingMock is a Redash mock that records the data source id of every
+// remote query in dsID, which is how a test observes which source a session
+// has selected.
+func capturingMock(dsID *int) *testutil.MockRedashAPI {
+	return &testutil.MockRedashAPI{
+		ExecuteQueryFunc: func(_ context.Context, _ string, id int) (*redash.QueryResult, error) {
+			*dsID = id
+			return &redash.QueryResult{}, nil
+		},
+	}
+}
+
+// selectedSource runs a remote query on h and reports the data source id it
+// reached, through a mock built by capturingMock over dsID.
+func selectedSource(t *testing.T, h *handler, dsID *int) int {
+	t.Helper()
+	*dsID = 0
+	if _, err := h.HandleQuery("SELECT 1 FROM t"); err != nil {
+		t.Fatalf("remote query: %v", err)
+	}
+	return *dsID
+}
+
 func TestUseDBBeforeLogin(t *testing.T) {
 	sources := []redash.DataSource{
 		{ID: 1, Name: "prod_mysql", Type: "mysql"},
@@ -59,9 +103,6 @@ func TestUseDBBeforeLogin(t *testing.T) {
 			if err := h.UseDB(db); err != nil {
 				t.Errorf("UseDB(%q) before login = %v, want nil: it discloses the registry or the outage", db, err)
 			}
-		}
-		if h.dataSourceID != 0 {
-			t.Errorf("dataSourceID = %d before login, want 0", h.dataSourceID)
 		}
 	})
 
@@ -88,16 +129,20 @@ func TestUseDBBeforeLogin(t *testing.T) {
 	})
 
 	t.Run("valid database is selected at login", func(t *testing.T) {
-		h := newRawHandler(t, sources, &testutil.MockRedashAPI{}, health.NewGate(), nil)
+		var dsID int
+		h := newRawHandler(t, sources, capturingMock(&dsID), health.NewGate(), nil)
 		_ = h.UseDB("prod_mysql")
 		if err := h.login(5); err != nil {
 			t.Fatalf("login: %v", err)
 		}
-		if h.dataSourceID != 1 || h.dbName != "prod_mysql" {
-			t.Errorf("after login dataSourceID = %d, dbName = %q; want 1, prod_mysql", h.dataSourceID, h.dbName)
+		if got := localValue(t, h, "SELECT DATABASE()"); got != "prod_mysql" {
+			t.Errorf("DATABASE() after login = %q, want prod_mysql", got)
 		}
-		if h.connID != 5 {
-			t.Errorf("connID = %d, want 5", h.connID)
+		if got := selectedSource(t, h, &dsID); got != 1 {
+			t.Errorf("queries reach data source %d, want 1", got)
+		}
+		if got := localValue(t, h, "SELECT CONNECTION_ID()"); got != "5" {
+			t.Errorf("CONNECTION_ID() = %q, want the id go-mysql assigned (5)", got)
 		}
 		// Once authenticated, USE validates right away.
 		if code := errorCode(t, h.UseDB("nonexistent")); code != mysql.ER_BAD_DB_ERROR {
@@ -360,16 +405,16 @@ func TestUseDB(t *testing.T) {
 	}
 
 	t.Run("valid MySQL source", func(t *testing.T) {
-		h := newTestHandler(t, sources, &testutil.MockRedashAPI{})
-		err := h.UseDB("prod_mysql")
-		if err != nil {
+		var dsID int
+		h := newTestHandler(t, sources, capturingMock(&dsID))
+		if err := h.UseDB("prod_mysql"); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if h.dataSourceID != 1 {
-			t.Errorf("dataSourceID = %d, want 1", h.dataSourceID)
+		if got := localValue(t, h, "SELECT DATABASE()"); got != "prod_mysql" {
+			t.Errorf("DATABASE() = %q, want prod_mysql", got)
 		}
-		if h.dbName != "prod_mysql" {
-			t.Errorf("dbName = %q, want %q", h.dbName, "prod_mysql")
+		if got := selectedSource(t, h, &dsID); got != 1 {
+			t.Errorf("queries reach data source %d, want 1", got)
 		}
 	})
 
@@ -389,42 +434,55 @@ func TestUseDB(t *testing.T) {
 		}
 	})
 
-	t.Run("UseDB resets schema cache", func(t *testing.T) {
-		fetches := 0
+	t.Run("USE switches the table list to the new source", func(t *testing.T) {
+		two := []redash.DataSource{
+			{ID: 1, Name: "prod_mysql", Type: "mysql"},
+			{ID: 3, Name: "staging_mysql", Type: "mysql"},
+		}
 		mock := &testutil.MockRedashAPI{
-			GetSchemaFunc: func(_ context.Context, _ int) ([]redash.SchemaTable, error) {
-				fetches++
-				return []redash.SchemaTable{{Name: "t"}}, nil
+			GetSchemaFunc: func(_ context.Context, dsID int) ([]redash.SchemaTable, error) {
+				return []redash.SchemaTable{{Name: fmt.Sprintf("table_of_%d", dsID)}}, nil
 			},
 		}
-		h := newTestHandler(t, sources, mock)
+		h := newTestHandler(t, two, mock)
 
 		if err := h.UseDB("prod_mysql"); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		_ = h.getSchema()
-		if fetches != 1 {
-			t.Fatalf("expected 1 fetch after priming, got %d", fetches)
+		if got := localValue(t, h, "SHOW TABLES"); got != "table_of_1" {
+			t.Fatalf("SHOW TABLES = %q, want table_of_1", got)
 		}
 
-		// Re-selecting even the same database must reset the cache so the next getSchema re-fetches.
-		if err := h.UseDB("prod_mysql"); err != nil {
+		// The schema is cached for the session; switching source must not keep
+		// serving the old source's tables.
+		if err := h.UseDB("staging_mysql"); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		_ = h.getSchema()
-		if fetches != 2 {
-			t.Errorf("expected re-fetch after UseDB reset, got %d fetches", fetches)
+		if got := localValue(t, h, "SHOW TABLES"); got != "table_of_3" {
+			t.Errorf("after USE staging_mysql, SHOW TABLES = %q, want table_of_3", got)
+		}
+
+		// Re-selecting the current source keeps answering for it.
+		if err := h.UseDB("staging_mysql"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := localValue(t, h, "SHOW TABLES"); got != "table_of_3" {
+			t.Errorf("after a repeated USE, SHOW TABLES = %q, want table_of_3", got)
 		}
 	})
 
 	t.Run("case insensitive lookup", func(t *testing.T) {
-		h := newTestHandler(t, sources, &testutil.MockRedashAPI{})
-		err := h.UseDB("PROD_MYSQL")
-		if err != nil {
+		var dsID int
+		h := newTestHandler(t, sources, capturingMock(&dsID))
+		if err := h.UseDB("PROD_MYSQL"); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if h.dataSourceID != 1 {
-			t.Errorf("dataSourceID = %d, want 1", h.dataSourceID)
+		if got := selectedSource(t, h, &dsID); got != 1 {
+			t.Errorf("queries reach data source %d, want 1", got)
+		}
+		// The session reports the source's own name, not the client's spelling.
+		if got := localValue(t, h, "SELECT DATABASE()"); got != "prod_mysql" {
+			t.Errorf("DATABASE() = %q, want prod_mysql", got)
 		}
 	})
 }
@@ -499,43 +557,35 @@ func TestHandleQuery_Routing(t *testing.T) {
 	})
 
 	t.Run("USE command switches database", func(t *testing.T) {
-		mock := &testutil.MockRedashAPI{
-			ExecuteQueryFunc: func(_ context.Context, _ string, dsID int) (*redash.QueryResult, error) {
-				return &redash.QueryResult{
-					Columns: []redash.Column{{Name: "n", Type: "integer"}},
-					Rows:    []map[string]any{{"n": 1}},
-				}, nil
-			},
-		}
-		h := newTestHandler(t, sources, mock)
+		var dsID int
+		h := newTestHandler(t, sources, capturingMock(&dsID))
 
-		_, err := h.HandleQuery("USE prod_mysql")
-		if err != nil {
+		if _, err := h.HandleQuery("USE prod_mysql"); err != nil {
 			t.Fatalf("HandleQuery(USE): %v", err)
 		}
-		if h.dataSourceID != 1 {
-			t.Errorf("dataSourceID after USE = %d, want 1", h.dataSourceID)
+		if got := selectedSource(t, h, &dsID); got != 1 {
+			t.Errorf("after USE, queries reach data source %d, want 1", got)
 		}
 
-		_, err = h.HandleQuery("USE staging_mysql")
-		if err != nil {
+		if _, err := h.HandleQuery("USE staging_mysql"); err != nil {
 			t.Fatalf("HandleQuery(USE staging): %v", err)
 		}
-		if h.dataSourceID != 2 {
-			t.Errorf("dataSourceID after second USE = %d, want 2", h.dataSourceID)
+		if got := selectedSource(t, h, &dsID); got != 2 {
+			t.Errorf("after the second USE, queries reach data source %d, want 2", got)
+		}
+		if got := localValue(t, h, "SELECT DATABASE()"); got != "staging_mysql" {
+			t.Errorf("DATABASE() = %q, want staging_mysql", got)
 		}
 	})
 
 	t.Run("USE with backticks and semicolons", func(t *testing.T) {
-		mock := &testutil.MockRedashAPI{}
-		h := newTestHandler(t, sources, mock)
+		h := newTestHandler(t, sources, &testutil.MockRedashAPI{})
 
-		_, err := h.HandleQuery("USE `prod_mysql`;")
-		if err != nil {
+		if _, err := h.HandleQuery("USE `prod_mysql`;"); err != nil {
 			t.Fatalf("HandleQuery(USE with backticks): %v", err)
 		}
-		if h.dataSourceID != 1 {
-			t.Errorf("dataSourceID = %d, want 1", h.dataSourceID)
+		if got := localValue(t, h, "SELECT DATABASE()"); got != "prod_mysql" {
+			t.Errorf("DATABASE() = %q, want prod_mysql", got)
 		}
 	})
 

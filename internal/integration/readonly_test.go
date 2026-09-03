@@ -19,8 +19,8 @@ import (
 
 // countingMock records how many statements reached Redash, which is the whole
 // point of read-only mode: a refused write must never have left the proxy.
-func countingMock() (*testutil.MockRedashAPI, *testutil.MockSourceRegistry, *atomic.Int32) {
-	mock, registry := defaultMockAndRegistry()
+func countingMock(t *testing.T) (*testutil.MockRedashAPI, *testutil.MockSourceRegistry, *atomic.Int32) {
+	mock, registry := defaultMockAndRegistry(t)
 	var calls atomic.Int32
 	mock.ExecuteQueryFunc = func(ctx context.Context, sql string, dataSourceID int) (*redash.QueryResult, error) {
 		calls.Add(1)
@@ -33,7 +33,7 @@ func countingMock() (*testutil.MockRedashAPI, *testutil.MockSourceRegistry, *ato
 }
 
 func TestPG_ReadOnlyRefusesWritesBeforeRedash(t *testing.T) {
-	mock, registry, calls := countingMock()
+	mock, registry, calls := countingMock(t)
 	addr := startPGServer(t, mock, registry, proxy.WithReadOnly(true))
 	conn := connectPG(t, addr, "Production PG")
 
@@ -96,7 +96,7 @@ func TestPG_ReadOnlyRefusesWritesBeforeRedash(t *testing.T) {
 // A session cannot switch the proxy's read-only mode off, and the proxy says so
 // rather than answering SET with a silent OK.
 func TestPG_ReadOnlyIsAdvertisedAndCannotBeEscaped(t *testing.T) {
-	mock, registry, _ := countingMock()
+	mock, registry, _ := countingMock(t)
 	addr := startPGServer(t, mock, registry, proxy.WithReadOnly(true))
 	conn := connectPG(t, addr, "Production PG")
 
@@ -131,7 +131,7 @@ func TestPG_ReadOnlyIsAdvertisedAndCannotBeEscaped(t *testing.T) {
 }
 
 func TestPG_WritableReportsReadOnlyOff(t *testing.T) {
-	mock, registry, _ := countingMock()
+	mock, registry, _ := countingMock(t)
 	addr := startPGServer(t, mock, registry)
 	conn := connectPG(t, addr, "Production PG")
 
@@ -151,7 +151,7 @@ func TestPG_WritableReportsReadOnlyOff(t *testing.T) {
 }
 
 func TestMySQL_ReadOnlyRefusesWritesBeforeRedash(t *testing.T) {
-	mock, registry, calls := countingMock()
+	mock, registry, calls := countingMock(t)
 	addr := startMySQLServer(t, mock, registry, mysqlwire.WithReadOnly(true))
 	db := connectMySQL(t, addr, "Analytics MySQL")
 
@@ -202,7 +202,7 @@ func TestMySQL_ReadOnlyRefusesWritesBeforeRedash(t *testing.T) {
 }
 
 func TestMySQL_ReadOnlyIsAdvertised(t *testing.T) {
-	mock, registry, _ := countingMock()
+	mock, registry, _ := countingMock(t)
 
 	check := func(t *testing.T, addr string, want int) {
 		t.Helper()

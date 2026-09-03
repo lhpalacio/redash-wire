@@ -24,15 +24,31 @@ const (
 
 var discardLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
-func defaultMockAndRegistry() (*testutil.MockRedashAPI, *testutil.MockSourceRegistry) {
+// defaultMockAndRegistry is a Redash that serves the sample schema and fails
+// the test if any statement reaches it. A test that means a statement to run
+// on Redash sets ExecuteQueryFunc; every other test thereby also proves the
+// proxy answered its statements itself.
+func defaultMockAndRegistry(t *testing.T) (*testutil.MockRedashAPI, *testutil.MockSourceRegistry) {
+	t.Helper()
 	sources := testutil.SampleDataSources()
 	mock := &testutil.MockRedashAPI{
 		GetSchemaFunc: func(ctx context.Context, dataSourceID int) ([]redash.SchemaTable, error) {
 			return testutil.SampleSchema(), nil
 		},
+		ExecuteQueryFunc: func(ctx context.Context, sql string, dataSourceID int) (*redash.QueryResult, error) {
+			t.Errorf("unexpected query to Redash: %s", sql)
+			return &redash.QueryResult{}, nil
+		},
 	}
 	registry := testutil.NewMockSourceRegistry(sources)
 	return mock, registry
+}
+
+// redashRunsAnything stands in for a Redash that runs any statement and
+// returns no rows, for tests about what happens around a query rather than
+// about its result.
+func redashRunsAnything(context.Context, string, int) (*redash.QueryResult, error) {
+	return &redash.QueryResult{}, nil
 }
 
 func startPGServer(t *testing.T, mock *testutil.MockRedashAPI, registry *testutil.MockSourceRegistry, opts ...proxy.ServerOption) string {

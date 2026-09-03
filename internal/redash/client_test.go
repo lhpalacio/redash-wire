@@ -3,6 +3,7 @@ package redash
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -316,15 +317,20 @@ func TestExecuteQuery_Immediate(t *testing.T) {
 			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
 		}
 
-		var body queryRequest
+		// The field names are Redash's API contract, so they are checked as
+		// written on the wire rather than through the client's own struct.
+		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatalf("decoding request body: %v", err)
 		}
-		if body.Query != "SELECT 1" {
-			t.Errorf("query = %q, want %q", body.Query, "SELECT 1")
+		if body["query"] != "SELECT 1" {
+			t.Errorf("query = %v, want %q", body["query"], "SELECT 1")
 		}
-		if body.DataSourceID != 7 {
-			t.Errorf("data_source_id = %d, want 7", body.DataSourceID)
+		if body["data_source_id"] != float64(7) {
+			t.Errorf("data_source_id = %v, want 7", body["data_source_id"])
+		}
+		if maxAge, ok := body["max_age"]; !ok || maxAge != float64(0) {
+			t.Errorf("max_age = %v (present %v), want 0 so Redash never serves a cached result", maxAge, ok)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -444,12 +450,19 @@ func TestExecuteQuery_JobFailed(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for failed job, got nil")
 	}
-	if !strings.Contains(err.Error(), "syntax error at position 10") {
-		t.Fatalf("error %q does not contain expected message", err)
+	// Only a QueryError is shown to the SQL client; anything else is masked as
+	// an infrastructure failure, so the type is the contract, not just the text.
+	var qe *QueryError
+	if !errors.As(err, &qe) {
+		t.Fatalf("error %v (%T) is not a QueryError, so the client would never see the SQL error", err, err)
+	}
+	if !strings.Contains(qe.Message, "syntax error at position 10") {
+		t.Fatalf("QueryError message %q does not carry the job's error", qe.Message)
 	}
 }
 
 func TestExecuteQuery_Timeout(t *testing.T) {
+	var cancelled atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		checkAuthHeader(t, r, "test-key")
 		w.Header().Set("Content-Type", "application/json")
@@ -463,7 +476,7 @@ func TestExecuteQuery_Timeout(t *testing.T) {
 			fmt.Fprint(w, `{"job":{"id":"job-slow","status":1}}`)
 
 		case r.Method == http.MethodDelete && r.URL.Path == "/api/jobs/job-slow":
-			// Best-effort cancellation on timeout.
+			cancelled.Store(true)
 			w.WriteHeader(http.StatusOK)
 
 		default:
@@ -476,10 +489,18 @@ func TestExecuteQuery_Timeout(t *testing.T) {
 	c := NewClient(srv.URL, "test-key", WithPollInterval(10*time.Millisecond), WithPollTimeout(50*time.Millisecond))
 	_, err := c.ExecuteQuery(context.Background(), "SELECT pg_sleep(999)", 1)
 	if err == nil {
-		t.Fatal("expected timeout error, got nil")
+		t.Fatal("expected an error once the poll timeout passed, got nil")
 	}
-	if !strings.Contains(err.Error(), "timed out") {
-		t.Fatalf("error %q does not indicate timeout", err)
+
+	// Giving up must also stop the job on Redash's side, or the warehouse
+	// query keeps running unattended. cancelJob runs on a fresh background
+	// context, so give it a moment to reach the server.
+	deadline := time.Now().Add(2 * time.Second)
+	for !cancelled.Load() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !cancelled.Load() {
+		t.Fatal("timed out without cancelling the job; the warehouse query would keep running")
 	}
 }
 
@@ -521,14 +542,18 @@ func TestExecuteQuery_TransientPollError(t *testing.T) {
 	}
 }
 
-// TestExecuteQuery_FatalPollError verifies a 404 during polling aborts immediately.
+// TestExecuteQuery_FatalPollError verifies a 404 during polling aborts at
+// once: a job Redash no longer knows is not retried, and the status reaches
+// the caller.
 func TestExecuteQuery_FatalPollError(t *testing.T) {
+	var polls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/query_results":
 			fmt.Fprint(w, `{"job":{"id":"job-y","status":1}}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/jobs/job-y":
+			polls.Add(1)
 			w.WriteHeader(http.StatusNotFound)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -540,6 +565,12 @@ func TestExecuteQuery_FatalPollError(t *testing.T) {
 	_, err := c.ExecuteQuery(context.Background(), "SELECT 1", 1)
 	if err == nil {
 		t.Fatal("expected fatal error on 404, got nil")
+	}
+	if status, ok := HTTPStatus(err); !ok || status != http.StatusNotFound {
+		t.Errorf("HTTPStatus(err) = %d, %v; want 404, true", status, ok)
+	}
+	if n := polls.Load(); n != 1 {
+		t.Errorf("job polled %d times after a 404, want 1: a fatal status must not be retried", n)
 	}
 }
 
