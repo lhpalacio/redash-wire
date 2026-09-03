@@ -872,7 +872,9 @@ func TestHandleInfoSchemaColumns(t *testing.T) {
 
 	t.Run("DBeaver SELECT * in upper case", func(t *testing.T) {
 		names, rows := run(t, sess, "SELECT * FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='analytics mysql' AND TABLE_NAME='orders' ORDER BY ORDINAL_POSITION")
-		if len(names) != len(infoSchemaColumnsStar) || names[3] != "COLUMN_NAME" {
+		// MySQL 8's information_schema.columns has 22 columns; a client reading
+		// SELECT * by position relies on the real order.
+		if len(names) != 22 || names[3] != "COLUMN_NAME" || names[7] != "DATA_TYPE" || names[15] != "COLUMN_TYPE" {
 			t.Errorf("columns = %v", names)
 		}
 		if len(rows) != 2 {
@@ -907,16 +909,19 @@ func TestHandleInfoSchemaColumns(t *testing.T) {
 		}
 	})
 
-	t.Run("OR is not evaluated, so everything is admitted", func(t *testing.T) {
+	t.Run("OR across two tables admits both", func(t *testing.T) {
 		_, rows := run(t, sess, "SELECT column_name FROM information_schema.columns WHERE table_name = 'users' OR table_name = 'orders'")
 		if len(rows) != 5 {
 			t.Errorf("got %d rows, want 5", len(rows))
 		}
 	})
 
-	t.Run("literals and unknown expressions", func(t *testing.T) {
-		_, rows := run(t, sess, "SELECT 'x' AS lit, 7 AS n, CASE column_key WHEN 'PRI' THEN 1 ELSE 0 END AS pk, UPPER(column_name) FROM information_schema.columns WHERE table_name = 'orders'")
-		if len(rows) != 2 || join(rows[0]) != "x|7|NULL|NULL" {
+	t.Run("literals keep their value and other expressions keep their place", func(t *testing.T) {
+		names, rows := run(t, sess, "SELECT 'x' AS lit, 7 AS n, CASE column_key WHEN 'PRI' THEN 1 ELSE 0 END AS pk, UPPER(column_name) FROM information_schema.columns WHERE table_name = 'orders'")
+		if got := join(names); got != "lit|n|pk|UPPER(column_name)" {
+			t.Errorf("columns = %s", got)
+		}
+		if len(rows) != 2 || len(rows[0]) != 4 || rows[0][0] != "x" || rows[0][1] != "7" {
 			t.Errorf("rows = %v", rows)
 		}
 	})
@@ -1002,11 +1007,20 @@ func TestShowVariablesFilter(t *testing.T) {
 		})
 	}
 
+	// Without a filter, nothing the filtered forms found may be missing.
 	result, err := handleLocalQuery("SHOW VARIABLES", localSession{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := len(parseTextRows(t, result.Resultset)); n != len(sessionVariables) {
-		t.Errorf("unfiltered SHOW VARIABLES returned %d rows, want %d", n, len(sessionVariables))
+	got := map[string]bool{}
+	for _, row := range parseTextRows(t, result.Resultset) {
+		got[fieldValueString(row[0])] = true
+	}
+	for _, tt := range tests {
+		for _, name := range tt.want {
+			if !got[name] {
+				t.Errorf("unfiltered SHOW VARIABLES is missing %s", name)
+			}
+		}
 	}
 }

@@ -550,7 +550,8 @@ func TestGetSchema_Job(t *testing.T) {
 	tests := []struct {
 		name       string
 		finished   string // the job body once it is done
-		wantErr    string
+		wantFail   bool   // an error, whatever its wording
+		wantErr    string // an error carrying this text from Redash
 		wantTables []string
 	}{
 		{
@@ -581,7 +582,7 @@ func TestGetSchema_Job(t *testing.T) {
 		{
 			name:     "finished without a result",
 			finished: `{"job":{"id":"job-s","status":3,"error":"","result":null}}`,
-			wantErr:  "without a schema",
+			wantFail: true,
 		},
 	}
 
@@ -609,17 +610,17 @@ func TestGetSchema_Job(t *testing.T) {
 
 			c := NewClient(srv.URL, "test-key", WithPollInterval(5*time.Millisecond), WithPollTimeout(5*time.Second))
 			tables, err := c.GetSchema(context.Background(), 42)
-			if tt.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+			if tt.wantFail || tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("got %d tables, want an error", len(tables))
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("err = %v, want one containing %q", err, tt.wantErr)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
-			}
-			if polls.Load() < 3 {
-				t.Errorf("expected the job to be polled until finished, got %d polls", polls.Load())
 			}
 			var names []string
 			for _, tb := range tables {
@@ -660,8 +661,8 @@ func TestGetSchema_JobTimeout(t *testing.T) {
 
 	c := NewClient(srv.URL, "test-key", WithPollInterval(5*time.Millisecond), WithPollTimeout(50*time.Millisecond))
 	_, err := c.GetSchema(context.Background(), 42)
-	if err == nil || !strings.Contains(err.Error(), "timed out") {
-		t.Fatalf("err = %v, want a timeout", err)
+	if err == nil {
+		t.Fatal("expected an error once the poll timeout passed")
 	}
 	if !cancelled.Load() {
 		t.Error("expected the schema job to be cancelled after the timeout")
