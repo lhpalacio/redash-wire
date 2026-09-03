@@ -13,7 +13,7 @@ import (
 // TestMySQLRejectsWrongPassword guards against the auth-bypass regression where
 // the MySQL listener accepted any password for a known username.
 func TestMySQLRejectsWrongPassword(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	addr := startMySQLServer(t, mock, registry)
 
 	dsn := fmt.Sprintf("%s:%s@tcp(%s)/?allowNativePasswords=true", testUser, "WRONG_PASSWORD", addr)
@@ -29,7 +29,7 @@ func TestMySQLRejectsWrongPassword(t *testing.T) {
 }
 
 func TestMySQLRejectsWrongUser(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	addr := startMySQLServer(t, mock, registry)
 
 	dsn := fmt.Sprintf("%s:%s@tcp(%s)/?allowNativePasswords=true", "wronguser", testPass, addr)
@@ -45,7 +45,7 @@ func TestMySQLRejectsWrongUser(t *testing.T) {
 }
 
 func TestPGRejectsWrongPassword(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	addr := startPGServer(t, mock, registry)
 
 	host, port, _ := net.SplitHostPort(addr)

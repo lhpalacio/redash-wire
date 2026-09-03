@@ -148,9 +148,10 @@ func TestConfigPayloadRedactsAPIKey(t *testing.T) {
 	}
 }
 
-// TestErrorPayloadNeverCarriesAPIKey guards the other direction: an error built
-// from a message that happens to contain the key must not be emitted verbatim by
-// a caller that assumes error text is safe.
+// TestErrorPayloadRoundTrip pins the {"error":{"code","message"}} envelope the
+// README documents; scripts branch on the code, so its shape is the contract.
+// Error text is emitted as written: there is no redaction, so callers must
+// not put a key in a message.
 func TestErrorPayloadRoundTrip(t *testing.T) {
 	cerr := failf(codeAuthenticationFailed, "session request failed (status 401)")
 	got := errorPayload{Error: errorBody{Code: cerr.Code, Message: cerr.Error()}}
@@ -174,44 +175,6 @@ func TestDataSourcesPayloadEmptyIsArray(t *testing.T) {
 	}
 	if string(data) != "[]" {
 		t.Errorf("empty data source list = %s, want []", data)
-	}
-}
-
-func TestDataSourcesPayloadSortsByName(t *testing.T) {
-	sources := []redash.DataSource{
-		{ID: 1, Name: "zebra", Type: "pg"},
-		{ID: 2, Name: "Alpha", Type: "pg"},
-		{ID: 3, Name: "middle", Type: "pg"},
-	}
-
-	got := buildDataSourcesPayload(sources)
-	want := []string{"Alpha", "middle", "zebra"}
-	for i, name := range want {
-		if got[i].Name != name {
-			t.Errorf("position %d = %q, want %q", i, got[i].Name, name)
-		}
-	}
-}
-
-func TestWireProtocol(t *testing.T) {
-	tests := map[string]string{
-		"pg":           "postgres",
-		"postgres":     "postgres",
-		"redshift":     "postgres",
-		"cockroachdb":  "postgres",
-		"mysql":        "mysql",
-		"rds_mysql":    "mysql",
-		"aurora_mysql": "mysql",
-		"mariadb":      "mysql",
-		"bigquery":     "",
-		"athena":       "",
-		"":             "",
-	}
-
-	for dsType, want := range tests {
-		if got := wireProtocol(dsType); got != want {
-			t.Errorf("wireProtocol(%q) = %q, want %q", dsType, got, want)
-		}
 	}
 }
 

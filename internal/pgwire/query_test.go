@@ -3,6 +3,7 @@ package pgwire
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -94,6 +95,8 @@ func TestIsLocalQuery(t *testing.T) {
 		{name: "SELECT current_database()", sql: "SELECT current_database()", want: true},
 		{name: "pg_database reference", sql: "SELECT * FROM pg_database", want: true},
 		{name: "regular table", sql: "SELECT * FROM users", want: false},
+		{name: "function over a table, FROM on its own line", sql: "SELECT version()\nFROM dual", want: false},
+		{name: "SELECTED is not SELECT", sql: "SELECTED version()", want: false},
 		{name: "INSERT", sql: "INSERT INTO logs VALUES (1)", want: false},
 		{name: "case insensitive set", sql: "set timezone='UTC'", want: true},
 	}
@@ -126,30 +129,6 @@ func TestIsCatalogQuery(t *testing.T) {
 			got := IsCatalogQuery(tt.sql)
 			if got != tt.want {
 				t.Errorf("IsCatalogQuery(%q) = %v, want %v", tt.sql, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestIsSimpleSelect(t *testing.T) {
-	tests := []struct {
-		name  string
-		lower string
-		want  bool
-	}{
-		{name: "function call", lower: "select version()", want: true},
-		{name: "has FROM", lower: "select * from users", want: false},
-		{name: "has FROM after newline", lower: "select version()\nfrom dual", want: false},
-		{name: "newline after select", lower: "select\nversion()", want: true},
-		{name: "not select", lower: "show something", want: false},
-		{name: "selected is not select", lower: "selected version()", want: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := isSimpleSelect(tt.lower)
-			if got != tt.want {
-				t.Errorf("isSimpleSelect(%q) = %v, want %v", tt.lower, got, tt.want)
 			}
 		})
 	}
@@ -322,6 +301,12 @@ func TestHandleLocalQuery(t *testing.T) {
 					t.Errorf("CommandTag = %q, want %q", cc.CommandTag, "SET")
 				}
 			}
+			if tt.name == "SELECT version()" {
+				row := msgs[1].(*pgproto3.DataRow)
+				if len(row.Values) != 1 || !strings.Contains(string(row.Values[0]), "redash-wire") {
+					t.Errorf("version() = %q, want the proxy's version string", row.Values)
+				}
+			}
 		})
 	}
 }
@@ -349,31 +334,6 @@ func msgTypeName(msg pgproto3.BackendMessage) string {
 		return "EmptyQueryResponse"
 	default:
 		return "Unknown"
-	}
-}
-
-func TestFormatDatetime(t *testing.T) {
-	tests := []struct {
-		name string
-		val  any
-		kind datetimeKind
-		want string
-	}{
-		{name: "Z becomes +00", val: "2024-01-15T10:30:00Z", kind: datetimeAware, want: "2024-01-15 10:30:00+00"},
-		{name: "already server form", val: "2024-01-15 10:30:00+00", kind: datetimeAware, want: "2024-01-15 10:30:00+00"},
-		{name: "offset normalized to UTC", val: "2024-01-15T13:30:00.250+03:00", kind: datetimeAware, want: "2024-01-15 10:30:00.25+00"},
-		{name: "naive isoformat", val: "2024-01-15T10:30:00", kind: datetimeNaive, want: "2024-01-15 10:30:00"},
-		{name: "naive with microseconds", val: "2024-01-15T10:30:00.123456", kind: datetimeNaive, want: "2024-01-15 10:30:00.123456"},
-		{name: "date only", val: "2024-01-15", kind: datetimeNaive, want: "2024-01-15 00:00:00"},
-		{name: "text column passes through", val: "2024-01-15T10:30:00Z", kind: datetimeText, want: "2024-01-15T10:30:00Z"},
-		{name: "unparseable passes through", val: json.Number("1700000000"), kind: datetimeNaive, want: "1700000000"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := formatDatetime(tt.val, tt.kind); got != tt.want {
-				t.Errorf("formatDatetime(%v, %d) = %q, want %q", tt.val, tt.kind, got, tt.want)
-			}
-		})
 	}
 }
 
@@ -432,6 +392,13 @@ func TestSendQueryResult_DatetimeColumns(t *testing.T) {
 			wantOID: OidTimestampTZ,
 			wantRaw: []string{"2024-01-15 10:30:00+00", "2024-01-15 10:30:00.5+00", "2024-01-15 10:30:00+00"},
 			wantAt:  []time.Time{utc(10, 30, 0, 0), utc(10, 30, 0, 500000000), utc(10, 30, 0, 0)},
+		},
+		{
+			name:    "a date alone is a timestamp at midnight",
+			values:  []any{"2024-01-15"},
+			wantOID: OidTimestamp,
+			wantRaw: []string{"2024-01-15 00:00:00"},
+			wantAt:  []time.Time{utc(0, 0, 0, 0)},
 		},
 		{
 			name:    "nulls do not decide the kind",
@@ -515,6 +482,22 @@ func TestHandleLocalQuery_ShowStripsTerminator(t *testing.T) {
 				t.Errorf("rows = %v, want [[14.0]]", rows)
 			}
 		})
+	}
+}
+
+// TestHandleLocalQuery_BackendPID: pg_backend_pid() names the session by the
+// ProcessID it was given in BackendKeyData, the id a CancelRequest uses.
+func TestHandleLocalQuery_BackendPID(t *testing.T) {
+	var buf bytes.Buffer
+	if err := HandleLocalQuery(&buf, "SELECT pg_backend_pid()", LocalSession{StartupParams: nil, Sources: nil, ListenAddr: "127.0.0.1:15432", BackendPID: 4242}); err != nil {
+		t.Fatal(err)
+	}
+	cols, rows := collectResult(t, &buf)
+	if len(cols) != 1 || cols[0] != "pg_backend_pid" {
+		t.Errorf("columns = %v, want [pg_backend_pid]", cols)
+	}
+	if len(rows) != 1 || rows[0][0] != "4242" {
+		t.Errorf("rows = %v, want [[4242]]", rows)
 	}
 }
 

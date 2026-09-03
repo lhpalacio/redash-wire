@@ -52,11 +52,28 @@ fi
 
 echo "==> Admin API key: $API_KEY"
 
-echo "==> Adding sample PostgreSQL data source..."
-DS_RESPONSE=$(curl -sf "$REDASH_URL/api/data_sources" \
-  -H "Authorization: Key $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
+# add_data_source NAME JSON_BODY: creates the data source unless one with that
+# name already exists, so re-running this script does not pile up duplicates.
+add_data_source() {
+  local name="$1" body="$2"
+  local existing
+  existing=$(curl -sf "$REDASH_URL/api/data_sources" -H "Authorization: Key $API_KEY" \
+    | python3 -c "import sys,json; print(next((d['id'] for d in json.load(sys.stdin) if d['name'] == sys.argv[1]), ''))" "$name")
+  if [ -n "$existing" ]; then
+    echo "    $name: already exists (id $existing)"
+    return
+  fi
+  local response
+  response=$(curl -sf "$REDASH_URL/api/data_sources" \
+    -H "Authorization: Key $API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "$body" 2>&1) || true
+  echo "$response" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'    {d[\"name\"]}: created (id {d[\"id\"]})')" 2>/dev/null \
+    || echo "    $name: could not create ($response)"
+}
+
+echo "==> Adding sample data sources..."
+add_data_source "Sample PostgreSQL" '{
     "name": "Sample PostgreSQL",
     "type": "pg",
     "options": {
@@ -66,9 +83,22 @@ DS_RESPONSE=$(curl -sf "$REDASH_URL/api/data_sources" \
       "user": "sample",
       "password": "sample"
     }
-  }' 2>&1) || true
-
-echo "$DS_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'    Data source ID: {d.get(\"id\", \"already exists\")}')" 2>/dev/null || echo "    (data source may already exist)"
+  }'
+# autocommit matters: Redash opens a fresh connection per query and closes it
+# without COMMIT, so with autocommit off every INSERT/UPDATE/DELETE sent
+# through the proxy is rolled back.
+add_data_source "Sample MySQL" '{
+    "name": "Sample MySQL",
+    "type": "mysql",
+    "options": {
+      "host": "sample-mysql",
+      "port": 3306,
+      "db": "sample",
+      "user": "sample",
+      "passwd": "sample",
+      "autocommit": true
+    }
+  }'
 
 CONFIG_FILE="config.yaml"
 if [ -f "$CONFIG_FILE" ]; then
@@ -97,5 +127,6 @@ echo ""
 echo "  Run redash-wire:"
 echo "    make run"
 echo ""
-echo "  Then connect with psql:"
-echo "    psql -h 127.0.0.1 -p 15432 -U redash-wire"
+echo "  Then connect with psql or mysql:"
+echo "    psql -h 127.0.0.1 -p 15432 -U redash-wire -d 'Sample PostgreSQL'"
+echo "    mysql -h 127.0.0.1 -P 13306 -u redash-wire -psupersecret -D 'Sample MySQL'"

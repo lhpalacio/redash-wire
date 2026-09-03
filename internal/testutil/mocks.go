@@ -71,7 +71,7 @@ func SampleDataSources() []redash.DataSource {
 
 func SampleSchema() []redash.SchemaTable {
 	return []redash.SchemaTable{
-		{Name: "users", Columns: []string{"id", "name", "email"}},
-		{Name: "orders", Columns: []string{"id", "user_id", "total"}},
+		{Name: "users", Columns: []redash.SchemaColumn{{Name: "id", Type: "int"}, {Name: "name", Type: "varchar"}, {Name: "email", Type: "varchar"}}},
+		{Name: "orders", Columns: []redash.SchemaColumn{{Name: "id", Type: "int"}, {Name: "user_id", Type: "int"}, {Name: "total", Type: "decimal"}}},
 	}
 }

@@ -1,6 +1,9 @@
 package redash
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func newTestRegistry(t *testing.T) *DataSourceRegistry {
 	t.Helper()
@@ -218,5 +221,52 @@ func assertIDs(t *testing.T, got []DataSource, wantIDs []int) {
 		if ds.ID != wantIDs[i] {
 			t.Errorf("result[%d].ID = %d, want %d", i, ds.ID, wantIDs[i])
 		}
+	}
+}
+
+// TestWireProtocol pins which Redash data source types the proxy serves, and
+// over which wire: the `datasources -json` output and the app's menu both
+// read this.
+func TestWireProtocol(t *testing.T) {
+	tests := map[string]string{
+		"pg":           "postgres",
+		"postgres":     "postgres",
+		"redshift":     "postgres",
+		"cockroachdb":  "postgres",
+		"mysql":        "mysql",
+		"rds_mysql":    "mysql",
+		"aurora_mysql": "mysql",
+		"mariadb":      "mysql",
+		"bigquery":     "",
+		"athena":       "",
+		"":             "",
+	}
+	for dsType, want := range tests {
+		if got := WireProtocol(dsType); got != want {
+			t.Errorf("WireProtocol(%q) = %q, want %q", dsType, got, want)
+		}
+	}
+}
+
+// TestNewDataSourceViews: the app renders the views as a menu, so they come
+// sorted by name regardless of case, ties broken by id, each carrying its wire.
+func TestNewDataSourceViews(t *testing.T) {
+	views := NewDataSourceViews([]DataSource{
+		{ID: 7, Name: "zebra", Type: "pg"},
+		{ID: 3, Name: "Alpha", Type: "bigquery"},
+		{ID: 9, Name: "alpha", Type: "mysql"},
+		{ID: 5, Name: "middle", Type: "redshift"},
+	})
+
+	var got []string
+	for _, v := range views {
+		got = append(got, v.Name+"/"+v.Wire)
+	}
+	want := "Alpha/,alpha/mysql,middle/postgres,zebra/postgres"
+	if strings.Join(got, ",") != want {
+		t.Errorf("views = %v, want %s", got, want)
+	}
+	if views[0].ID != 3 || views[1].ID != 9 {
+		t.Errorf("equal names must order by id: got ids %d, %d", views[0].ID, views[1].ID)
 	}
 }

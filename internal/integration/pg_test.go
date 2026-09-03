@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -13,7 +14,7 @@ import (
 )
 
 func TestPG_ConnectionAndAuth(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	addr := startPGServer(t, mock, registry)
 
 	t.Run("valid credentials", func(t *testing.T) {
@@ -25,23 +26,6 @@ func TestPG_ConnectionAndAuth(t *testing.T) {
 		}
 		if !strings.Contains(result, "redash-wire") {
 			t.Fatalf("expected version to contain 'redash-wire', got %q", result)
-		}
-	})
-
-	t.Run("wrong password", func(t *testing.T) {
-		host, port, _ := net.SplitHostPort(addr)
-		connStr := fmt.Sprintf("host=%s port=%s user=%s password=wrong sslmode=disable", host, port, testUser)
-		cfg, err := pgx.ParseConfig(connStr)
-		if err != nil {
-			t.Fatalf("parse config: %v", err)
-		}
-		cfg.Database = "test"
-		cfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
-
-		conn, err := pgx.ConnectConfig(context.Background(), cfg)
-		if err == nil {
-			conn.Close(context.Background())
-			t.Fatal("expected auth error, got nil")
 		}
 	})
 
@@ -64,7 +48,7 @@ func TestPG_ConnectionAndAuth(t *testing.T) {
 }
 
 func TestPG_LocalQueries(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	addr := startPGServer(t, mock, registry)
 	conn := connectPG(t, addr, "Production PG")
 
@@ -104,7 +88,7 @@ func TestPG_LocalQueries(t *testing.T) {
 }
 
 func TestPG_ServerInfoFunctions(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	addr := startPGServer(t, mock, registry)
 	conn := connectPG(t, addr, "Production PG")
 
@@ -123,7 +107,6 @@ func TestPG_ServerInfoFunctions(t *testing.T) {
 		{"inet_server_addr()", "SELECT inet_server_addr()", "127.0.0.1"},
 		{"inet_server_port()", "SELECT inet_server_port()", port},
 		{"pg_is_in_recovery()", "SELECT pg_is_in_recovery()", "f"},
-		{"pg_backend_pid()", "SELECT pg_backend_pid()", "1"},
 	}
 
 	for _, tt := range tests {
@@ -138,10 +121,38 @@ func TestPG_ServerInfoFunctions(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("pg_backend_pid()", func(t *testing.T) {
+		// Every column the proxy sends is text, so the pid is parsed here.
+		pid := func(c *pgx.Conn) int64 {
+			t.Helper()
+			var text string
+			if err := c.QueryRow(context.Background(), "SELECT pg_backend_pid()").Scan(&text); err != nil {
+				t.Fatalf("query failed: %v", err)
+			}
+			id, err := strconv.ParseInt(text, 10, 64)
+			if err != nil {
+				t.Fatalf("pg_backend_pid() = %q, want an integer", text)
+			}
+			return id
+		}
+		id := pid(conn)
+		if id <= 0 {
+			t.Fatalf("pg_backend_pid() = %d, want a positive id", id)
+		}
+		if again := pid(conn); again != id {
+			t.Errorf("pg_backend_pid() changed from %d to %d on the same connection", id, again)
+		}
+		// The pid is the ProcessID the session sent in BackendKeyData, so it
+		// tells sessions apart the way a client expects.
+		if other := pid(connectPG(t, addr, "Production PG")); other == id {
+			t.Errorf("pg_backend_pid() = %d on two different connections", id)
+		}
+	})
 }
 
 func TestPG_PgDatabaseListing(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	addr := startPGServer(t, mock, registry)
 	conn := connectPG(t, addr, "Production PG")
 
@@ -177,7 +188,7 @@ func TestPG_PgDatabaseListing(t *testing.T) {
 }
 
 func TestPG_CatalogQueries(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	addr := startPGServer(t, mock, registry)
 	conn := connectPG(t, addr, "Production PG")
 
@@ -198,7 +209,16 @@ func TestPG_CatalogQueries(t *testing.T) {
 			t.Fatalf("query failed: %v", err)
 		}
 		defer rows.Close()
-		// pg_type returns empty result, just verify no error
+		var cols []string
+		for _, f := range rows.FieldDescriptions() {
+			cols = append(cols, f.Name)
+		}
+		if strings.Join(cols, ",") != "oid,typname" {
+			t.Errorf("columns = %v, want [oid typname]", cols)
+		}
+		if rows.Next() {
+			t.Error("pg_type returned a row; the proxy knows no types")
+		}
 	})
 
 	t.Run("pg_class", func(t *testing.T) {
@@ -248,7 +268,7 @@ func TestPG_CatalogQueries(t *testing.T) {
 }
 
 func TestPG_RemoteQueryExecution(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 
 	var capturedSQL string
 	var capturedDSID int
@@ -345,7 +365,7 @@ func TestPG_RemoteQueryExecution(t *testing.T) {
 }
 
 func TestPG_DMLCommandTags(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	mock.ExecuteQueryFunc = func(ctx context.Context, sql string, dataSourceID int) (*redash.QueryResult, error) {
 		return &redash.QueryResult{
 			Columns: []redash.Column{{Name: "id", Type: "integer"}},
@@ -384,7 +404,7 @@ func TestPG_DMLCommandTags(t *testing.T) {
 }
 
 func TestPG_DMLNoData(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	// Simulate Redash's "query completed but returned no data": the query
 	// executed successfully but Redash does not return affected row counts.
 	mock.ExecuteQueryFunc = func(ctx context.Context, sql string, dataSourceID int) (*redash.QueryResult, error) {
@@ -394,14 +414,17 @@ func TestPG_DMLNoData(t *testing.T) {
 	addr := startPGServer(t, mock, registry)
 	conn := connectPG(t, addr, "Production PG")
 
-	_, err := conn.Exec(context.Background(), "UPDATE customers SET name = 'test' WHERE id = 1")
+	tag, err := conn.Exec(context.Background(), "UPDATE customers SET name = 'test' WHERE id = 1")
 	if err != nil {
 		t.Fatalf("exec failed: %v", err)
+	}
+	if tag.String() != "UPDATE 0" {
+		t.Errorf("command tag = %q, want UPDATE 0: Redash reports no count", tag.String())
 	}
 }
 
 func TestPG_NoDataSourceSelected(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	addr := startPGServer(t, mock, registry)
 
 	conn := connectPG(t, addr, "nonexistent")
@@ -416,7 +439,7 @@ func TestPG_NoDataSourceSelected(t *testing.T) {
 }
 
 func TestPG_QueryExecutionError(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	// A real SQL error surfaces as a *redash.QueryError (a failed Redash job), which
 	// is safe to forward verbatim to the client.
 	mock.ExecuteQueryFunc = func(ctx context.Context, sql string, dataSourceID int) (*redash.QueryResult, error) {
@@ -436,7 +459,7 @@ func TestPG_QueryExecutionError(t *testing.T) {
 }
 
 func TestPG_InfraErrorIsMasked(t *testing.T) {
-	mock, registry := defaultMockAndRegistry()
+	mock, registry := defaultMockAndRegistry(t)
 	// A non-QueryError (e.g. an internal Redash/network failure) must NOT be leaked
 	// verbatim to the client, since it can contain internal hostnames/credentials.
 	mock.ExecuteQueryFunc = func(ctx context.Context, sql string, dataSourceID int) (*redash.QueryResult, error) {

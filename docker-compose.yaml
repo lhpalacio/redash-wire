@@ -79,5 +79,23 @@ services:
       timeout: 3s
       retries: 5
 
+  # Sample MySQL database to use as a Redash data source
+  sample-mysql:
+    image: mysql:8.4
+    ports:
+      - "13307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_USER: sample
+      MYSQL_PASSWORD: sample
+      MYSQL_DATABASE: sample
+    volumes:
+      - ./dev/seed.mysql.sql:/docker-entrypoint-initdb.d/seed.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-usample", "-psample"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   postgres-data:

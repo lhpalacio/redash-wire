@@ -8,16 +8,20 @@
 ## Local dev environment
 
 `make dev-setup` boots a complete local Redash (server, scheduler, worker, Redis,
-Postgres) plus a seeded sample PostgreSQL data source, creates an admin user, and
-writes a `config.yaml` pointing at it:
+Postgres) plus seeded sample PostgreSQL and MySQL data sources, creates an admin
+user, and writes a `config.yaml` pointing at it:
 
 ```bash
 make dev-setup
 make run         # build and start the proxy against the local stack
 
-# connect with psql (password is in the printed banner / your config.yaml)
+# connect with psql or mysql (password is in the printed banner / your config.yaml)
 psql -h 127.0.0.1 -p 15432 -U redash-wire -d "Sample PostgreSQL"
+mysql -h 127.0.0.1 -P 13306 -u redash-wire -p -D "Sample MySQL"
 ```
+
+Without a local `mysql` client, the sample MySQL container has one:
+`docker compose exec sample-mysql mysql -h host.docker.internal -P 13306 -u redash-wire -p`.
 
 `make dev-down` tears the stack down; `make dev-logs` tails it.
 

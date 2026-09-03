@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -537,5 +539,33 @@ func TestRunDoesNotRepeatAProbeAlreadyMade(t *testing.T) {
 	case <-lister.probed:
 		t.Fatal("Run repeated the probe serve had just made")
 	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// TestSuspicious pins the rule for when a failed query is allowed to wake the
+// checker: a failure of the SQL itself, or of the caller (a client that went
+// away, a deadline that passed), says nothing about Redash; anything else,
+// such as a transport failure or an unexpected status, is worth one probe.
+func TestSuspicious(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"no error", nil, false},
+		{"the SQL failed on the data source", &redash.QueryError{Message: "syntax error"}, false},
+		{"a wrapped SQL failure", fmt.Errorf("running: %w", &redash.QueryError{Message: "no such table"}), false},
+		{"the client went away", context.Canceled, false},
+		{"the client went away, wrapped", fmt.Errorf("executing request: %w", context.Canceled), false},
+		{"the caller gave up", fmt.Errorf("polling: %w", context.DeadlineExceeded), false},
+		{"a transport failure", &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}, true},
+		{"an unexpected status", errors.New("redash API error (status 502): bad gateway"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := health.Suspicious(tt.err); got != tt.want {
+				t.Errorf("Suspicious(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }

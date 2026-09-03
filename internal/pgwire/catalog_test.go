@@ -12,8 +12,8 @@ import (
 
 func TestHandleCatalogQuery(t *testing.T) {
 	schema := []redash.SchemaTable{
-		{Name: "users", Columns: []string{"id", "name"}},
-		{Name: "orders", Columns: []string{"id", "total"}},
+		{Name: "users", Columns: []redash.SchemaColumn{{Name: "id"}, {Name: "name"}}},
+		{Name: "orders", Columns: []redash.SchemaColumn{{Name: "id"}, {Name: "total"}}},
 	}
 	sources := []redash.DataSource{
 		{ID: 1, Name: "mydb", Type: "pg"},
@@ -23,21 +23,30 @@ func TestHandleCatalogQuery(t *testing.T) {
 		name         string
 		sql          string
 		wantDataRows int
+		// wantColumn is a column whose values, one per row, must be wantValues.
+		wantColumn string
+		wantValues []string
 	}{
 		{
 			name:         "pg_database returns sources",
 			sql:          "SELECT datname FROM pg_database",
 			wantDataRows: 1,
+			wantColumn:   "datname",
+			wantValues:   []string{"mydb"},
 		},
 		{
 			name:         "pg_class returns tables",
 			sql:          "SELECT oid, relname FROM pg_class WHERE relkind='r'",
 			wantDataRows: 2,
+			wantColumn:   "relname",
+			wantValues:   []string{"users", "orders"},
 		},
 		{
 			name:         "pg_namespace returns public",
 			sql:          "SELECT nspname FROM pg_namespace",
 			wantDataRows: 1,
+			wantColumn:   "nspname",
+			wantValues:   []string{"public"},
 		},
 		{
 			name:         "pg_type returns empty",
@@ -53,6 +62,8 @@ func TestHandleCatalogQuery(t *testing.T) {
 			name:         "pg_statio_user_tables returns tables",
 			sql:          "SELECT * FROM pg_statio_user_tables",
 			wantDataRows: 2,
+			wantColumn:   "name",
+			wantValues:   []string{"users", "orders"},
 		},
 	}
 
@@ -102,6 +113,31 @@ func TestHandleCatalogQuery(t *testing.T) {
 			if dataRowCount != tt.wantDataRows {
 				t.Errorf("DataRow count = %d, want %d", dataRowCount, tt.wantDataRows)
 			}
+
+			if tt.wantColumn == "" {
+				return
+			}
+			var replay bytes.Buffer
+			if err := HandleCatalogQuery(&replay, tt.sql, schema, sources); err != nil {
+				t.Fatal(err)
+			}
+			cols, rows := collectResult(t, &replay)
+			at := -1
+			for i, c := range cols {
+				if c == tt.wantColumn {
+					at = i
+				}
+			}
+			if at < 0 {
+				t.Fatalf("columns = %v, want one named %s", cols, tt.wantColumn)
+			}
+			var got []string
+			for _, row := range rows {
+				got = append(got, row[at])
+			}
+			if !reflect.DeepEqual(got, tt.wantValues) {
+				t.Errorf("%s = %v, want %v", tt.wantColumn, got, tt.wantValues)
+			}
 		})
 	}
 }
@@ -132,8 +168,8 @@ func collectResult(t *testing.T, buf *bytes.Buffer) (cols []string, rows [][]str
 
 func TestHandleCatalogQuery_InformationSchema(t *testing.T) {
 	schema := []redash.SchemaTable{
-		{Name: "users", Columns: []string{"id", "name"}},
-		{Name: "orders", Columns: []string{"id", "total"}},
+		{Name: "users", Columns: []redash.SchemaColumn{{Name: "id"}, {Name: "name"}}},
+		{Name: "orders", Columns: []redash.SchemaColumn{{Name: "id"}, {Name: "total"}}},
 	}
 
 	t.Run("information_schema.tables returns requested columns", func(t *testing.T) {
@@ -193,8 +229,8 @@ func TestHandleCatalogQuery_InformationSchema(t *testing.T) {
 // verbatim queries captured from its session.
 func TestHandleCatalogQuery_KindFilters(t *testing.T) {
 	schema := []redash.SchemaTable{
-		{Name: "users", Columns: []string{"id", "name"}},
-		{Name: "orders", Columns: []string{"id", "total"}},
+		{Name: "users", Columns: []redash.SchemaColumn{{Name: "id"}, {Name: "name"}}},
+		{Name: "orders", Columns: []redash.SchemaColumn{{Name: "id"}, {Name: "total"}}},
 	}
 
 	tests := []struct {
@@ -426,8 +462,8 @@ ORDER BY pg_catalog.pg_get_expr(c.relpartbound, c.oid) = 'DEFAULT', c.oid::pg_ca
 
 func TestHandleCatalogQuery_PsqlDescribe(t *testing.T) {
 	schema := []redash.SchemaTable{
-		{Name: "users", Columns: []string{"id", "name"}},
-		{Name: "orders", Columns: []string{"id", "total"}},
+		{Name: "users", Columns: []redash.SchemaColumn{{Name: "id"}, {Name: "name"}}},
+		{Name: "orders", Columns: []redash.SchemaColumn{{Name: "id"}, {Name: "total"}}},
 	}
 
 	tests := []struct {
@@ -546,8 +582,8 @@ func TestHandleCatalogQuery_PsqlDescribe(t *testing.T) {
 // to single out one table, and the header a real server would give each item.
 func TestHandleCatalogQuery_RelationFilters(t *testing.T) {
 	schema := []redash.SchemaTable{
-		{Name: "users", Columns: []string{"id", "name"}},
-		{Name: "orders", Columns: []string{"id", "total"}},
+		{Name: "users", Columns: []redash.SchemaColumn{{Name: "id"}, {Name: "name"}}},
+		{Name: "orders", Columns: []redash.SchemaColumn{{Name: "id"}, {Name: "total"}}},
 	}
 
 	tests := []struct {

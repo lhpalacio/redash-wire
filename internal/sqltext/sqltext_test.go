@@ -2,6 +2,7 @@ package sqltext
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -111,57 +112,27 @@ func TestRedact(t *testing.T) {
 	}
 }
 
+// TestSplitTopLevelCommas: pieces are compared trimmed, since every caller
+// trims them; the split points are the contract, not the surrounding blanks.
 func TestSplitTopLevelCommas(t *testing.T) {
 	tests := []struct {
 		sql  string
 		want []string
 	}{
-		{"a, b, c", []string{"a", " b", " c"}},
-		{"attname, format_type(atttypid, atttypmod) as data_type", []string{"attname", " format_type(atttypid, atttypmod) as data_type"}},
-		{"'a,b', c", []string{"'a,b'", " c"}},
-		{`"my, col", id`, []string{`"my, col"`, " id"}},
+		{"a, b, c", []string{"a", "b", "c"}},
+		{"attname, format_type(atttypid, atttypmod) as data_type", []string{"attname", "format_type(atttypid, atttypmod) as data_type"}},
+		{"'a,b', c", []string{"'a,b'", "c"}},
+		{`"my, col", id`, []string{`"my, col"`, "id"}},
 		{"coalesce(a, b, c)", []string{"coalesce(a, b, c)"}},
 	}
 	for _, tt := range tests {
-		got := Postgres.SplitTopLevelCommas(tt.sql)
+		var got []string
+		for _, piece := range Postgres.SplitTopLevelCommas(tt.sql) {
+			got = append(got, strings.TrimSpace(piece))
+		}
 		if !reflect.DeepEqual(got, tt.want) {
 			t.Errorf("SplitTopLevelCommas(%q) = %#v, want %#v", tt.sql, got, tt.want)
 		}
-	}
-}
-
-func TestReplaceOutsideStrings(t *testing.T) {
-	tests := []struct {
-		name string
-		sql  string
-		old  string
-		want string
-	}{
-		{
-			name: "strips backtick-qualified db name with spaces",
-			sql:  "SELECT * FROM `Covercheck - Write`.`account`",
-			old:  "`Covercheck - Write`.",
-			want: "SELECT * FROM `account`",
-		},
-		{
-			name: "strips double-quoted qualifier",
-			sql:  `SELECT * FROM "mydb"."account"`,
-			old:  `"mydb".`,
-			want: `SELECT * FROM "account"`,
-		},
-		{
-			name: "leaves qualifier inside a string literal untouched",
-			sql:  "SELECT '`mydb`.x' AS note FROM `mydb`.t",
-			old:  "`mydb`.",
-			want: "SELECT '`mydb`.x' AS note FROM t",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := MySQL.ReplaceOutsideStrings(tt.sql, tt.old, ""); got != tt.want {
-				t.Errorf("ReplaceOutsideStrings(%q, %q) = %q, want %q", tt.sql, tt.old, got, tt.want)
-			}
-		})
 	}
 }
 

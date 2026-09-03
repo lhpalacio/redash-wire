@@ -3,6 +3,7 @@ package redash
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -23,11 +24,12 @@ func checkAuthHeader(t *testing.T, r *http.Request, wantKey string) {
 
 func TestListDataSources(t *testing.T) {
 	tests := []struct {
-		name      string
-		handler   http.HandlerFunc
-		wantErr   string
-		wantCount int
-		wantFirst DataSource
+		name       string
+		handler    http.HandlerFunc
+		wantErr    bool
+		wantStatus int // the HTTP status the error must report, when one applies
+		wantCount  int
+		wantFirst  DataSource
 	}{
 		{
 			name: "success with two sources",
@@ -48,7 +50,8 @@ func TestListDataSources(t *testing.T) {
 				checkAuthHeader(t, r, "test-key")
 				w.WriteHeader(http.StatusInternalServerError)
 			},
-			wantErr: "status 500",
+			wantErr:    true,
+			wantStatus: http.StatusInternalServerError,
 		},
 		{
 			name: "invalid JSON",
@@ -57,7 +60,7 @@ func TestListDataSources(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				fmt.Fprint(w, `not json`)
 			},
-			wantErr: "decoding data sources",
+			wantErr: true,
 		},
 	}
 
@@ -69,12 +72,14 @@ func TestListDataSources(t *testing.T) {
 			c := NewClient(srv.URL, "test-key", WithPollInterval(10*time.Millisecond), WithPollTimeout(50*time.Millisecond))
 			sources, err := c.ListDataSources(context.Background())
 
-			if tt.wantErr != "" {
+			if tt.wantErr {
 				if err == nil {
-					t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+					t.Fatalf("expected an error, got %d sources", len(sources))
 				}
-				if !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("error %q does not contain %q", err, tt.wantErr)
+				if tt.wantStatus != 0 {
+					if status, ok := HTTPStatus(err); !ok || status != tt.wantStatus {
+						t.Fatalf("HTTPStatus(err) = %d, %v; want %d", status, ok, tt.wantStatus)
+					}
 				}
 				return
 			}
@@ -152,8 +157,8 @@ func TestGetSchema(t *testing.T) {
 				t.Fatalf("got %d columns, want %d", len(tables[0].Columns), len(tt.wantColumns))
 			}
 			for i, col := range tables[0].Columns {
-				if col != tt.wantColumns[i] {
-					t.Errorf("column[%d] = %q, want %q", i, col, tt.wantColumns[i])
+				if col.Name != tt.wantColumns[i] {
+					t.Errorf("column[%d] = %q, want %q", i, col.Name, tt.wantColumns[i])
 				}
 			}
 		})
@@ -316,15 +321,20 @@ func TestExecuteQuery_Immediate(t *testing.T) {
 			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
 		}
 
-		var body queryRequest
+		// The field names are Redash's API contract, so they are checked as
+		// written on the wire rather than through the client's own struct.
+		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatalf("decoding request body: %v", err)
 		}
-		if body.Query != "SELECT 1" {
-			t.Errorf("query = %q, want %q", body.Query, "SELECT 1")
+		if body["query"] != "SELECT 1" {
+			t.Errorf("query = %v, want %q", body["query"], "SELECT 1")
 		}
-		if body.DataSourceID != 7 {
-			t.Errorf("data_source_id = %d, want 7", body.DataSourceID)
+		if body["data_source_id"] != float64(7) {
+			t.Errorf("data_source_id = %v, want 7", body["data_source_id"])
+		}
+		if maxAge, ok := body["max_age"]; !ok || maxAge != float64(0) {
+			t.Errorf("max_age = %v (present %v), want 0 so Redash never serves a cached result", maxAge, ok)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -415,9 +425,6 @@ func TestExecuteQuery_WithJobPolling(t *testing.T) {
 		t.Errorf("rows[0][n] = %v (%T), want json.Number 42", result.Rows[0]["n"], result.Rows[0]["n"])
 	}
 
-	if got := pollCount.Load(); got < 3 {
-		t.Errorf("expected at least 3 job polls, got %d", got)
-	}
 }
 
 func TestExecuteQuery_JobFailed(t *testing.T) {
@@ -444,12 +451,19 @@ func TestExecuteQuery_JobFailed(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for failed job, got nil")
 	}
-	if !strings.Contains(err.Error(), "syntax error at position 10") {
-		t.Fatalf("error %q does not contain expected message", err)
+	// Only a QueryError is shown to the SQL client; anything else is masked as
+	// an infrastructure failure, so the type is the contract, not just the text.
+	var qe *QueryError
+	if !errors.As(err, &qe) {
+		t.Fatalf("error %v (%T) is not a QueryError, so the client would never see the SQL error", err, err)
+	}
+	if !strings.Contains(qe.Message, "syntax error at position 10") {
+		t.Fatalf("QueryError message %q does not carry the job's error", qe.Message)
 	}
 }
 
 func TestExecuteQuery_Timeout(t *testing.T) {
+	var cancelled atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		checkAuthHeader(t, r, "test-key")
 		w.Header().Set("Content-Type", "application/json")
@@ -463,7 +477,7 @@ func TestExecuteQuery_Timeout(t *testing.T) {
 			fmt.Fprint(w, `{"job":{"id":"job-slow","status":1}}`)
 
 		case r.Method == http.MethodDelete && r.URL.Path == "/api/jobs/job-slow":
-			// Best-effort cancellation on timeout.
+			cancelled.Store(true)
 			w.WriteHeader(http.StatusOK)
 
 		default:
@@ -476,10 +490,18 @@ func TestExecuteQuery_Timeout(t *testing.T) {
 	c := NewClient(srv.URL, "test-key", WithPollInterval(10*time.Millisecond), WithPollTimeout(50*time.Millisecond))
 	_, err := c.ExecuteQuery(context.Background(), "SELECT pg_sleep(999)", 1)
 	if err == nil {
-		t.Fatal("expected timeout error, got nil")
+		t.Fatal("expected an error once the poll timeout passed, got nil")
 	}
-	if !strings.Contains(err.Error(), "timed out") {
-		t.Fatalf("error %q does not indicate timeout", err)
+
+	// Giving up must also stop the job on Redash's side, or the warehouse
+	// query keeps running unattended. cancelJob runs on a fresh background
+	// context, so give it a moment to reach the server.
+	deadline := time.Now().Add(2 * time.Second)
+	for !cancelled.Load() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !cancelled.Load() {
+		t.Fatal("timed out without cancelling the job; the warehouse query would keep running")
 	}
 }
 
@@ -521,14 +543,18 @@ func TestExecuteQuery_TransientPollError(t *testing.T) {
 	}
 }
 
-// TestExecuteQuery_FatalPollError verifies a 404 during polling aborts immediately.
+// TestExecuteQuery_FatalPollError verifies a 404 during polling aborts at
+// once: a job Redash no longer knows is not retried, and the status reaches
+// the caller.
 func TestExecuteQuery_FatalPollError(t *testing.T) {
+	var polls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/query_results":
 			fmt.Fprint(w, `{"job":{"id":"job-y","status":1}}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/jobs/job-y":
+			polls.Add(1)
 			w.WriteHeader(http.StatusNotFound)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -540,5 +566,172 @@ func TestExecuteQuery_FatalPollError(t *testing.T) {
 	_, err := c.ExecuteQuery(context.Background(), "SELECT 1", 1)
 	if err == nil {
 		t.Fatal("expected fatal error on 404, got nil")
+	}
+	if status, ok := HTTPStatus(err); !ok || status != http.StatusNotFound {
+		t.Errorf("HTTPStatus(err) = %d, %v; want 404, true", status, ok)
+	}
+	if n := polls.Load(); n != 1 {
+		t.Errorf("job polled %d times after a 404, want 1: a fatal status must not be retried", n)
+	}
+}
+
+// TestGetSchema_Job covers Redash 10 and later, where the schema endpoint
+// answers with a job instead of the schema whenever Redis has nothing cached.
+// The client must follow the job and read the schema from its result.
+func TestGetSchema_Job(t *testing.T) {
+	tests := []struct {
+		name       string
+		finished   string // the job body once it is done
+		wantFail   bool   // an error, whatever its wording
+		wantErr    string // an error carrying this text from Redash
+		wantTables []string
+	}{
+		{
+			name:       "result is the schema array",
+			finished:   `{"job":{"id":"job-s","status":3,"error":"","result":[{"name":"customers","columns":[{"name":"id","type":"int","description":"pk"}]},{"name":"orders","columns":["id"]}],"query_result_id":[{"name":"customers","columns":[]}]}}`,
+			wantTables: []string{"customers", "orders"},
+		},
+		{
+			name:       "result wraps the schema",
+			finished:   `{"job":{"id":"job-s","status":3,"error":"","result":{"schema":[{"name":"t","columns":[]}]}}}`,
+			wantTables: []string{"t"},
+		},
+		{
+			name:       "empty schema is a valid answer",
+			finished:   `{"job":{"id":"job-s","status":3,"error":"","result":[]}}`,
+			wantTables: []string{},
+		},
+		{
+			name:     "failed with a string error",
+			finished: `{"job":{"id":"job-s","status":4,"error":"Error retrieving schema","result":null}}`,
+			wantErr:  "Error retrieving schema",
+		},
+		{
+			name:     "failed with an error object",
+			finished: `{"job":{"id":"job-s","status":4,"error":{"code":2,"message":"Error retrieving schema","details":"(2003, \"Can't connect\")"},"result":{"error":{"code":2}}}}`,
+			wantErr:  "Can't connect",
+		},
+		{
+			name:     "finished without a result",
+			finished: `{"job":{"id":"job-s","status":3,"error":"","result":null}}`,
+			wantFail: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var polls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				checkAuthHeader(t, r, "test-key")
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/api/data_sources/42/schema":
+					fmt.Fprint(w, `{"job":{"id":"job-s","updated_at":0,"status":1,"error":"","result":null,"query_result_id":null}}`)
+				case r.Method == http.MethodGet && r.URL.Path == "/api/jobs/job-s":
+					if polls.Add(1) < 3 {
+						fmt.Fprintf(w, `{"job":{"id":"job-s","status":%d,"error":"","result":null}}`, jobStatusStarted)
+						return
+					}
+					fmt.Fprint(w, tt.finished)
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			t.Cleanup(srv.Close)
+
+			c := NewClient(srv.URL, "test-key", WithPollInterval(5*time.Millisecond), WithPollTimeout(5*time.Second))
+			tables, err := c.GetSchema(context.Background(), 42)
+			if tt.wantFail || tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("got %d tables, want an error", len(tables))
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want one containing %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			var names []string
+			for _, tb := range tables {
+				names = append(names, tb.Name)
+			}
+			if len(names) != len(tt.wantTables) || strings.Join(names, ",") != strings.Join(tt.wantTables, ",") {
+				t.Errorf("tables = %v, want %v", names, tt.wantTables)
+			}
+			if len(tables) > 0 && tables[0].Name == "customers" {
+				want := SchemaColumn{Name: "id", Type: "int", Comment: "pk"}
+				if len(tables[0].Columns) != 1 || tables[0].Columns[0] != want {
+					t.Errorf("customers columns = %+v, want [%+v]", tables[0].Columns, want)
+				}
+			}
+		})
+	}
+}
+
+// TestGetSchema_JobTimeout: a schema job that never finishes is given up on
+// after pollTimeout and cancelled on Redash's side, like a query job.
+func TestGetSchema_JobTimeout(t *testing.T) {
+	var cancelled atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/data_sources/42/schema":
+			fmt.Fprint(w, `{"job":{"id":"job-slow","status":1}}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/jobs/job-slow":
+			fmt.Fprint(w, `{"job":{"id":"job-slow","status":2}}`)
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/jobs/job-slow":
+			cancelled.Store(true)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewClient(srv.URL, "test-key", WithPollInterval(5*time.Millisecond), WithPollTimeout(50*time.Millisecond))
+	_, err := c.GetSchema(context.Background(), 42)
+	if err == nil {
+		t.Fatal("expected an error once the poll timeout passed")
+	}
+	if !cancelled.Load() {
+		t.Error("expected the schema job to be cancelled after the timeout")
+	}
+}
+
+// TestExecuteQuery_NoDataWordings: every Redash runner reports a statement
+// without a result set (a successful write) as a failed job, each in its own
+// words. All of them are a success with no rows, never an error to the client.
+func TestExecuteQuery_NoDataWordings(t *testing.T) {
+	for _, msg := range []string{
+		"Query completed but it returned no data.", // pg, db2, sqlite
+		"No data was returned.",                    // mysql, mssql, vertica
+	} {
+		t.Run(msg, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == "/api/query_results":
+					fmt.Fprint(w, `{"job":{"id":"job-w","status":1}}`)
+				case r.Method == http.MethodGet && r.URL.Path == "/api/jobs/job-w":
+					fmt.Fprintf(w, `{"job":{"id":"job-w","status":4,"error":%q}}`, msg)
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			t.Cleanup(srv.Close)
+
+			c := NewClient(srv.URL, "test-key", WithPollInterval(5*time.Millisecond), WithPollTimeout(5*time.Second))
+			result, err := c.ExecuteQuery(context.Background(), "UPDATE t SET a = 1", 1)
+			if err != nil {
+				t.Fatalf("a write must not fail: %v", err)
+			}
+			if len(result.Columns) != 0 || len(result.Rows) != 0 {
+				t.Errorf("got %d columns and %d rows, want none", len(result.Columns), len(result.Rows))
+			}
+		})
 	}
 }

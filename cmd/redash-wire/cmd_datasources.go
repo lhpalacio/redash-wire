@@ -56,10 +56,6 @@ func buildDataSourcesPayload(sources []redash.DataSource) []dataSourcePayload {
 	return redash.NewDataSourceViews(sources)
 }
 
-func wireProtocol(dsType string) string {
-	return redash.WireProtocol(dsType)
-}
-
 func printDataSources(sources []dataSourcePayload) {
 	if len(sources) == 0 {
 		fmt.Println("no data sources")

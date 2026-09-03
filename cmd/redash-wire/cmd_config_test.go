@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -18,17 +19,17 @@ func TestPrintConfigShowSecrets(t *testing.T) {
 	if strings.Contains(hidden.String(), testAPIKey) {
 		t.Errorf("API key printed without -show-secrets:\n%s", hidden.String())
 	}
-	if !strings.Contains(hidden.String(), "api key:     set") {
+	if !regexp.MustCompile(`api key:\s+set\b`).MatchString(hidden.String()) {
 		t.Errorf("expected the key reported as set:\n%s", hidden.String())
 	}
 
 	var shown bytes.Buffer
 	printConfig(&shown, buildConfigPayload(res, "explicit", sum, true))
-	if !strings.Contains(shown.String(), "api key:     "+testAPIKey) {
+	if !regexp.MustCompile(`api key:\s+` + regexp.QuoteMeta(testAPIKey)).MatchString(shown.String()) {
 		t.Errorf("-show-secrets must print the key in text mode:\n%s", shown.String())
 	}
 	// The broken profile has no key, so there is nothing to show for it.
-	if !strings.Contains(shown.String(), "api key:     missing") {
+	if !regexp.MustCompile(`api key:\s+missing\b`).MatchString(shown.String()) {
 		t.Errorf("a missing key must still read as missing under -show-secrets:\n%s", shown.String())
 	}
 }
@@ -38,9 +39,20 @@ func TestPrintConfigInvalidReasonInReport(t *testing.T) {
 	path, sum := writeTestConfig(t)
 	res := config.ResolveResult{Path: path, Found: true}
 
+	payload := buildConfigPayload(res, "explicit", sum, false)
+	var reason string
+	for _, p := range payload.Profiles {
+		if !p.Valid {
+			reason = p.Error
+		}
+	}
+	if reason == "" {
+		t.Fatalf("fixture has no invalid profile with a reason: %+v", payload.Profiles)
+	}
+
 	var out bytes.Buffer
-	printConfig(&out, buildConfigPayload(res, "explicit", sum, false))
-	if !strings.Contains(out.String(), "invalid:     api_key is required") {
-		t.Errorf("invalid reason missing from the report:\n%s", out.String())
+	printConfig(&out, payload)
+	if !strings.Contains(out.String(), reason) {
+		t.Errorf("invalid reason %q missing from the report:\n%s", reason, out.String())
 	}
 }

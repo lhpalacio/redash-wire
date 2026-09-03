@@ -563,6 +563,9 @@ type LocalSession struct {
 	// ReadOnly makes SHOW transaction_read_only answer on, and refuses the SET
 	// and BEGIN forms that would ask for a read-write transaction.
 	ReadOnly bool
+	// BackendPID is the ProcessID the session sent in BackendKeyData, so
+	// pg_backend_pid() names the same session a CancelRequest would.
+	BackendPID uint32
 }
 
 // ReadOnlyHint is the hint attached to every read-only refusal, so a client (or
@@ -673,7 +676,7 @@ func HandleLocalQuery(conn io.Writer, sql string, sess LocalSession) error {
 		return SendSingleRowResult(conn, "pg_is_in_recovery", "f")
 	}
 	if strings.Contains(lower, "pg_backend_pid") {
-		return SendSingleRowResult(conn, "pg_backend_pid", "1")
+		return SendSingleRowResult(conn, "pg_backend_pid", strconv.FormatUint(uint64(sess.BackendPID), 10))
 	}
 	if strings.Contains(lower, "pg_postmaster_start_time") {
 		return SendSingleRowResult(conn, "pg_postmaster_start_time", time.Now().UTC().Format("2006-01-02 15:04:05+00"))
