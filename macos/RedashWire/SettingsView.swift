@@ -9,15 +9,19 @@ struct SettingsView: View {
     @ObservedObject var supervisor: ProxySupervisor
     @ObservedObject var updates: UpdateChecker
     @ObservedObject var notifier: Notifier
+    @AppStorage("settingsTab") private var tab = "general"
 
     var body: some View {
-        TabView {
+        TabView(selection: $tab) {
             general
                 .tabItem { Label("General", systemImage: "gearshape") }
+                .tag("general")
             profiles
                 .tabItem { Label("Profiles", systemImage: "rectangle.stack") }
+                .tag("profiles")
             advanced
                 .tabItem { Label("Advanced", systemImage: "wrench.and.screwdriver") }
+                .tag("advanced")
         }
         .frame(width: 520, height: 420)
     }

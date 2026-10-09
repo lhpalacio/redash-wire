@@ -6,8 +6,15 @@ import Foundation
 final class LogFile: @unchecked Sendable {
     static let shared = LogFile()
 
-    static let directory = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Logs/RedashWire", isDirectory: true)
+    /// A development run pointed at another config with REDASH_WIRE_CONFIG
+    /// keeps its log beside that config.
+    static let directory: URL = {
+        if let config = ProcessInfo.processInfo.environment["REDASH_WIRE_CONFIG"] {
+            return URL(fileURLWithPath: config).deletingLastPathComponent()
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/RedashWire", isDirectory: true)
+    }()
     static let url = directory.appendingPathComponent("redash-wire.log")
 
     private static let rotateAt: UInt64 = 5 * 1024 * 1024

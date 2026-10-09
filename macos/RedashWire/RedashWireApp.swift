@@ -62,8 +62,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if model.needsOnboarding {
                 WindowPresenter.shared.show("onboarding")
             }
+            #if DEBUG
+            presentForScreenshot()
+            #endif
         }
     }
+
+    #if DEBUG
+    /// `-present <window id>` or `-present menu`, for dev/screenshots.sh.
+    private func presentForScreenshot() {
+        guard let target = UserDefaults.standard.string(forKey: "present") else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            guard target == "menu" else {
+                WindowPresenter.shared.show(target)
+                return
+            }
+            func button(in view: NSView?) -> NSStatusBarButton? {
+                guard let view else { return nil }
+                if let button = view as? NSStatusBarButton { return button }
+                return view.subviews.lazy.compactMap { button(in: $0) }.first
+            }
+            NSApp.windows.lazy.compactMap { button(in: $0.contentView) }.first?.performClick(nil)
+        }
+    }
+    #endif
 
     /// Opening the app again from Finder or Spotlight shows something, rather
     /// than nothing at all when the menu bar has no room for the icon.

@@ -1,221 +1,174 @@
 # redash-wire
 
-**Query [Redash](https://redash.io/) from any PostgreSQL or MySQL client.**
+Query [Redash](https://redash.io/) data sources from any PostgreSQL or MySQL
+client: psql, TablePlus, DBeaver, DataGrip.
 
-`redash-wire` lets you connect apps like TablePlus or DBeaver straight to
-Redash and query your data sources as if they were normal databases. No Redash
-UI, no pasting SQL into the query editor.
-
-![redash-wire starting up, then a psql session querying a Redash data source](dev/demo.gif)
-
-## How it works
+![psql querying a Redash data source through redash-wire](dev/demo.gif)
 
 ```
-psql / TablePlus / DBeaver  ──▶  redash-wire  ──▶  Redash  ──▶  your data sources
+your client  ──▶  redash-wire  ──▶  Redash API  ──▶  your data sources
 ```
 
-To your client it looks like a regular Postgres or MySQL server. Underneath,
-it talks to the Redash REST API. Connect with the name of a Redash data source
-as the database name (on MySQL, pick one with `USE <name>`). The proxy runs
-each query through Redash and returns the rows as a normal result set.
+redash-wire speaks the PostgreSQL and MySQL wire protocols. Each query runs
+through Redash and comes back as a normal result set. The database name is
+the Redash data source name.
 
 ## Install
 
-On macOS or Linux:
+### macOS app
+
+A menu bar app that runs the proxy for you. It bundles the CLI and needs
+macOS 13 or later.
+
+1. Download `RedashWire_<version>_macos_universal.zip` from the
+   [releases page](https://github.com/lhpalacio/redash-wire/releases).
+2. Move `RedashWire.app` to Applications.
+3. The app is not notarized, so clear the quarantine flag once:
+
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/RedashWire.app
+   ```
+
+4. Open it and enter your Redash URL and API key.
+
+### CLI
+
+macOS and Linux, amd64 and arm64:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lhpalacio/redash-wire/main/install.sh | sh
+redash-wire   # the first run asks for your Redash URL and API key
 ```
 
-The script installs the latest release to `/usr/local/bin` (set `BIN_DIR` or
-`VERSION` to override). Binaries for Linux and macOS, amd64 and arm64, are on
-the [releases page](https://github.com/lhpalacio/redash-wire/releases).
-Windows is not supported.
+The script installs to `/usr/local/bin`. Set `BIN_DIR` or `VERSION` to change
+that. Windows is not supported.
 
-Then run `redash-wire`. The first run asks for your Redash URL and API key,
-tests the connection, and writes `~/.redash-wire/config.yaml` with one profile.
+## Connect
 
-![first run: the setup wizard connects to Redash and writes the config](dev/wizard.gif)
+```bash
+psql  -h 127.0.0.1 -p 15432 -U redash-wire -d "Analytics"
+mysql -h 127.0.0.1 -P 13306 -u redash-wire -p -D "Orders"
+```
+
+The password is `supersecret` until you set one in the config. Your Redash API
+key is on your Redash profile page, `<redash-url>/users/me`.
+
+## The macOS app
+
+<p>
+  <img src="dev/menu.png" alt="The menu: running, with its listeners and data sources" height="380">
+  <img src="dev/settings.png" alt="Settings, listing two profiles" height="380">
+</p>
+
+- Lists your data sources. Open one in TablePlus or any app that handles
+  `postgresql://` and `mysql://` links, or copy a `psql` or `mysql` command.
+- Shows whether Redash is reachable, and what to do when it isn't: VPN down,
+  API key rejected, port in use.
+- Gives up a start that can't reach Redash after 2 minutes, and tries again
+  when the network changes. Once connected, it keeps the proxy up through an
+  outage so open sessions survive.
+- Notifies you when Redash goes offline or the proxy needs attention.
+- Locks a profile to read-only from the menu.
+- Writes its log to `~/Library/Logs/RedashWire/`.
+
+Build it from source with `make macos` (needs Xcode).
 
 ## Configuration
 
 The proxy reads `-config <path>`, then `./config.yaml`, then
-`~/.redash-wire/config.yaml`. To talk to more than one Redash, add profiles
-and pick one with `-profile` ([`config.example.yaml`](config.example.yaml)):
+`~/.redash-wire/config.yaml`. See [`config.example.yaml`](config.example.yaml)
+for every key.
 
 ```yaml
-# Top-level keys are defaults for every profile; a profile can override them.
-# At least one listener must be configured.
-postgres_listen_addr: "127.0.0.1:15432"  # omit to disable; keep on loopback unless you mean to expose it
+postgres_listen_addr: "127.0.0.1:15432"  # omit to disable
 mysql_listen_addr: "127.0.0.1:13306"     # omit to disable
-
-# Proxy login. Defaults to redash-wire / supersecret; change them for anything
-# beyond loopback.
 username: "redash-wire"
 password: "supersecret"
-
-poll_interval: "500ms"  # how often to poll Redash for query completion
-poll_timeout: "120s"    # give up on a query after this long
-
-read_only: false  # true refuses every statement that is not a read (see below)
-
-# Profile used when the -profile flag is omitted.
-default_profile: integration
+default_profile: staging
 
 profiles:
-  integration:
-    redash_url: "https://redash.integration.example.com"
-    api_key: "${REDASH_INTEGRATION_API_KEY}"  # ${ENV_VAR} expansion works for redash_url and api_key
+  staging:
+    redash_url: "https://redash.staging.example.com"
+    api_key: "${REDASH_STAGING_API_KEY}"
   prod:
-    redash_url: "https://redash.prod.example.com"
+    redash_url: "https://redash.example.com"
     api_key: "${REDASH_PROD_API_KEY}"
-    postgres_listen_addr: "127.0.0.1:25432"  # per-profile override
-    read_only: true                          # lock this one
+    postgres_listen_addr: "127.0.0.1:25432"
+    read_only: true
 ```
 
-Unknown keys fail at startup. Traffic between client and proxy is plaintext,
-and any client that logs in can reach everything the API key can, so keep the
-listeners on localhost unless you trust the network.
+Top-level keys apply to every profile, and a profile can override any of them.
+`${ENV_VAR}` works in `redash_url` and `api_key`. Unknown keys fail at startup.
 
-### Read-only mode
+Traffic between client and proxy is plaintext, and any client that logs in can
+query everything the API key can reach. Keep the listeners on `127.0.0.1`.
 
-`read_only: true` makes the proxy refuse every statement that is not a read
-before it reaches Redash. Set it at the top level for every profile, or on one
-profile; a profile can also set `read_only: false` under a top-level `true`.
-It's meant for a profile an AI agent or a script connects through, where a
-stray `UPDATE` would cost more than the query is worth.
+## Read-only mode
 
-What goes through: `SELECT`, `WITH … SELECT`, `VALUES`, `TABLE`, `SHOW`,
-`DESCRIBE`, and `EXPLAIN` of any of those. Everything else is refused, including
-a read that carries a write: a data-modifying CTE, `SELECT … INTO`, `SELECT …
-FOR UPDATE`, `EXPLAIN ANALYZE UPDATE …`. The refusal is the one a read-only
-server sends, so clients already know it: SQLSTATE `25006` on PostgreSQL, error
-`1290` on MySQL, with a hint naming redash-wire. The mode is reported too:
-`SHOW transaction_read_only` and `SELECT @@read_only` say on, and DBeaver and
-DataGrip show their read-only badge. A session can't switch it off; `SET
-transaction_read_only = off` is refused rather than silently accepted.
+`read_only: true` in a profile, or `redash-wire -read-only`, refuses every
+statement that is not a read before it reaches Redash.
 
-The check is text matching, not a database permission. A function with side
-effects, like `setval()` or `pg_terminate_backend()`, is not caught. When you
-need a real boundary, give the Redash data source a read-only database user.
+- Allowed: `SELECT`, `WITH … SELECT`, `VALUES`, `TABLE`, `SHOW`, `DESCRIBE`,
+  and `EXPLAIN` of those.
+- Refused: everything else, including `SELECT … INTO`, `SELECT … FOR UPDATE`
+  and data-modifying CTEs. Clients get the standard read-only error: SQLSTATE
+  `25006` on PostgreSQL, `1290` on MySQL.
 
-`redash-wire -read-only` forces the mode for one run. It can only tighten: a
-profile with `read_only: true` stays read-only without the flag.
+The check matches statement text. A function with side effects, such as
+`setval()`, gets through. For a hard boundary, give the Redash data source a
+read-only database user.
 
-## CLI
+## CLI reference
 
-`redash-wire` with no arguments starts the proxy. Flags: `-config <path>`,
-`-profile <name>`, `-debug`, `-version`, `-log-format <text|json>`,
-`-exit-on-stdin-eof` (quit when stdin closes, for supervisors),
-`-wait-for-redash` (bind the listeners first, and keep retrying an unreachable
-Redash instead of exiting 1), and `-read-only` (refuse writes for this run,
-whatever the profile says).
-
-The proxy checks Redash every 10 seconds, so a data source added while it runs
-shows up without a restart. When Redash stops answering, the proxy refuses new
-sessions and answers queries on open ones with the reason, then serves again
-once Redash is back. While it stays away, the checks slow down, doubling up to
-one every 2 minutes. `kill -USR1 $(pgrep redash-wire)` forces a check.
-
-Subcommands answer a question and exit, for scripts and supervisors:
+| Flag | |
+|---|---|
+| `-config <path>` | Config file |
+| `-profile <name>` | Profile to run; defaults to `default_profile` |
+| `-read-only` | Refuse writes for this run |
+| `-debug` | Debug logging |
+| `-log-format text\|json` | Log format |
+| `-wait-for-redash` | Start listening even when Redash is unreachable, and keep retrying |
+| `-exit-on-stdin-eof` | Quit when stdin closes, for supervisors |
+| `-version` | Print the version |
 
 ```bash
-redash-wire config [-json] [-show-secrets] [-config <path>]
-redash-wire datasources [-json] [-config <path>] [-profile <name>]
-redash-wire init -url <url> [-profile <name>] [-username <u>] [-password <p>] [-read-only] [-config <path>] [-json]
-redash-wire help
+redash-wire config [-json] [-show-secrets]          # resolved config, API key hidden
+redash-wire datasources [-json] [-profile <name>]   # data sources and the wire serving each
+pbpaste | redash-wire init -url <url> [-profile <name>] [-read-only] [-json]
 ```
 
-- `config` shows the resolved configuration for every profile, with the API key
-  hidden unless you pass `-show-secrets`. A missing config file reports as
-  `"exists": false` with exit 0; every other command exits non-zero with
-  `not_configured`.
-- `datasources` lists one profile's data sources as `id`, `name`, `type`, and
-  `wire`. An empty `wire` means the proxy won't serve that source.
-- `init` is the setup wizard driven by flags. It reads the API key from stdin
-  (`pbpaste | redash-wire init -url https://redash.example.com`), so the key
-  stays out of `ps` and shell history. It writes `~/.redash-wire/config.yaml`
-  unless `-config` says otherwise, and won't overwrite an existing file.
-  `-read-only` writes `read_only: true` on the new profile.
+`init` writes a config without prompts. It reads the API key from stdin and
+won't overwrite an existing config.
 
-Results go to stdout and logs to stderr. Exit 0 on success, 2 for a usage
-mistake, 1 for everything else. With `-json` an error prints as
-`{"error":{"code":"...","message":"..."}}`. The codes are stable, so branch on
-the code, not the message:
+The proxy checks Redash every 10 seconds, and slows to every 2 minutes while
+Redash is down. `kill -USR1 $(pgrep redash-wire)` checks now.
 
-- `usage`: a required flag is missing or malformed, or the API key wasn't piped in.
-- `not_configured`: no config file at any of the lookup paths.
-- `invalid_config`: bad YAML, an unknown key, a `default_profile` that doesn't
-  exist, or a profile that fails validation.
-- `profile_not_found`: `-profile` names a profile the config doesn't have.
-- `connection_failed`: Redash didn't answer, or answered with an unrelated
-  error such as a 500.
-- `authentication_failed`: Redash rejected the key, or the URL isn't Redash.
-  Redash answers a bad key with a 404, so both look alike; the message says which.
-- `config_exists`: `init` found a config already in place and left it alone.
-- `io_error`: a file couldn't be read or written.
+Exit status is 0 on success, 2 for a usage error, and 1 otherwise. With
+`-json`, errors print as `{"error":{"code":"…","message":"…"}}`. The codes are
+stable:
 
-## macOS app
+| Code | Meaning |
+|---|---|
+| `usage` | Missing or malformed flag, or no API key on stdin |
+| `not_configured` | No config file found |
+| `invalid_config` | Bad YAML, unknown key, or an invalid profile |
+| `profile_not_found` | `-profile` names a profile the config lacks |
+| `connection_failed` | Redash didn't answer, or answered with an unrelated error |
+| `authentication_failed` | Redash rejected the key, or the URL isn't Redash |
+| `config_exists` | `init` found a config and left it alone |
+| `io_error` | A file couldn't be read or written |
 
-A menu bar app runs the proxy for you: no terminal, no Dock icon. It needs
-macOS 13 or newer and bundles its own copy of `redash-wire`. The first run asks
-for your Redash URL and API key, and whether to start read-only. From the menu
-you can:
+## Limitations
 
-- Pick a profile and start or stop the proxy. `default_profile` starts at launch.
-- Lock the selected profile to read-only. The choice is remembered per Redash
-  URL, so renaming the profile keeps it, and the proxy restarts with it; a profile whose config says `read_only: true`
-  shows as locked and can't be unlocked from the menu. The status line and the
-  profile list say which profiles are read-only.
-- Browse the proxy's data sources and copy a `psql` or `mysql` command or a
-  connection URI for each, or open one in an app that handles `postgresql://`
-  links, like TablePlus.
-- Copy the proxy username and password. A copied password leaves the clipboard
-  after 60 seconds.
-- See whether Redash is answering, in plain words with the fix next to it. A
-  dropped VPN shows within about fifteen seconds. A start that can't reach
-  Redash keeps trying for 2 minutes, then stops and tries again when the
-  network changes; a rejected API key stops it at once. Once Redash has
-  answered, an outage is waited out so open sessions survive.
-- Get a notification when Redash has been offline for 30 seconds (and when it
-  is back), or when the proxy gives up, is refused, or fails. Settings turns
-  them off.
-- Follow the proxy's log stream, filtered by level and text, or pause it to
-  read back. Everything is also written to
-  `~/Library/Logs/RedashWire/redash-wire.log`, and Copy Diagnostics puts
-  versions, the status and the last 200 lines on the clipboard for a bug
-  report.
-- Open Settings (⌘,) to turn on launch at login and the daily update check,
-  see every profile with its listeners, lock and any config error, open
-  `config.yaml` to edit it, and turn on verbose logging.
+- One statement per query. No prepared statements: use the simple query
+  protocol.
+- Redash doesn't report affected rows. Add `RETURNING` to get a count.
+- MySQL writes only persist when the data source has Autocommit on in Redash.
+- Table and column info comes from the Redash schema: names and types, with no
+  keys, indexes, defaults or nullability. The PostgreSQL catalog reports every
+  column as `text`.
+- A number too large for its type comes back as text.
 
-The status dot and the menu bar icon show the proxy's state: grey stopped,
-yellow connecting, green running, amber offline after it had been working, red
-when something needs you.
+## Contributing
 
-Build it with `make macos`, or `make macos-run` to build and open it. That
-needs full Xcode 16 or newer, not just the Command Line Tools. The app is
-signed ad-hoc and not notarized, so Gatekeeper blocks a copy that arrived over
-the network: right-click it and choose Open, or run
-`xattr -dr com.apple.quarantine /path/to/RedashWire.app`. Build from a checkout
-you trust before handing the app a Redash API key.
-
-## Supported SQL & limitations
-
-The proxy runs read queries against any PostgreSQL- or MySQL-compatible Redash
-data source.
-
-- One statement per request. The proxy rejects multi-statement batches outright.
-- Writes go through unless the profile is read-only (see [Read-only
-  mode](#read-only-mode)). Redash doesn't report rows changed, so neither does
-  the proxy. Add `RETURNING` when you need a count.
-- On a MySQL data source, writes only stick when the data source's
-  **Autocommit** option is on in Redash. Redash opens a fresh connection per
-  query and closes it without `COMMIT`, so with autocommit off the change is
-  rolled back and the proxy has no way to tell.
-- Introspection is best-effort. The proxy answers common `pg_catalog`,
-  `information_schema`, and MySQL `SHOW` queries from the schema Redash
-  reports: table and column names and types, no keys, indexes, defaults or
-  nullability. On the Postgres wire every result column type reports as `text`.
-- Numbers stay exact. A value too big for the native type comes back as text.
-- No extended/prepared-statement protocol. Use the simple query protocol.
+See [CONTRIBUTING.md](CONTRIBUTING.md). MIT licensed.

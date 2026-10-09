@@ -201,9 +201,11 @@ extension WireCLI {
     }
 
     /// The bundled binary, so the app and the proxy cannot disagree on the contract.
-    /// REDASH_WIRE_BINARY overrides it during development.
-    static func standard(configPath: String = defaultConfigPath) -> WireCLI {
-        WireCLI(binaryURL: bundledBinaryURL(), configPath: configPath)
+    /// REDASH_WIRE_BINARY and REDASH_WIRE_CONFIG override the binary and the
+    /// config during development.
+    static func standard() -> WireCLI {
+        let configPath = ProcessInfo.processInfo.environment["REDASH_WIRE_CONFIG"] ?? defaultConfigPath
+        return WireCLI(binaryURL: bundledBinaryURL(), configPath: configPath)
     }
 
     static func bundledBinaryURL() -> URL {

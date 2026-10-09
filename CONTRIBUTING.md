@@ -86,6 +86,10 @@ make build
 REDASH_WIRE_BINARY=$PWD/bin/redash-wire build/RedashWire.app/Contents/MacOS/RedashWire
 ```
 
+`REDASH_WIRE_CONFIG=<path>` does the same for the config, for example the dev
+stack's `config.yaml`. The app then keeps its log next to that file instead of
+in `~/Library/Logs/RedashWire`.
+
 ## JSON output and golden files
 
 The macOS menu bar app decodes the `-json` payloads of `config`, `datasources`,
@@ -102,6 +106,13 @@ A golden diff means a consumer breaks, so update the files only as part of a
 change you meant to make, and read the diff before you commit it. The error
 codes in `cmd/redash-wire/cli.go` are part of the same contract: adding a code
 is safe, renaming or repurposing one is not.
+
+## README screenshots
+
+`dev/screenshots.sh` rewrites `dev/menu.png` and `dev/settings.png` from a demo
+copy of the app pointed at `dev/fake-redash.py`, so no real Redash or data
+source names end up in them. It needs Screen Recording permission for the
+terminal, and leaves an installed copy of the app and its settings alone.
 
 ## README demo GIFs
 
