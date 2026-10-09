@@ -178,8 +178,9 @@ you can:
   network changes; a rejected API key stops it at once. Once Redash has
   answered, an outage is waited out so open sessions survive.
 - Follow the proxy's log stream, filtered by level and text.
-- Turn on launch at login, check for a new release, edit `config.yaml`, and
-  reload it.
+- Open Settings (⌘,) to turn on launch at login and the daily update check,
+  see every profile with its listeners, lock and any config error, open
+  `config.yaml` to edit it, and turn on verbose logging.
 
 The status dot and the menu bar icon show the proxy's state: grey stopped,
 yellow connecting, green running, amber offline after it had been working, red

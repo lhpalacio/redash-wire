@@ -31,7 +31,7 @@ struct WireCLI {
     /// `-read-only` is the menu's lock. The daemon ORs it with the profile's own
     /// `read_only`, so passing it for a profile the config already locks is
     /// harmless, and leaving it off never unlocks one.
-    func serveArguments(profile: String, readOnly: Bool) -> [String] {
+    func serveArguments(profile: String, readOnly: Bool, verbose: Bool = false) -> [String] {
         var arguments = [
             "-config", configPath,
             "-profile", profile,
@@ -42,7 +42,18 @@ struct WireCLI {
         if readOnly {
             arguments.append("-read-only")
         }
+        if verbose {
+            arguments.append("-debug")
+        }
         return arguments
+    }
+
+    /// What `-version` prints after the program name, or nil when the binary
+    /// will not run.
+    func version() async -> String? {
+        guard let result = try? await run(["-version"], stdin: nil), result.status == 0 else { return nil }
+        let line = String(decoding: result.stdout, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return line.split(separator: " ").last.map(String.init)
     }
 
 

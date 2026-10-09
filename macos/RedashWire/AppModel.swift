@@ -19,6 +19,18 @@ final class AppModel: ObservableObject {
     @Published private(set) var readOnlyPreferences: [String: Bool]
 
     private static let readOnlyPreferencesKey = "readOnlyProfiles"
+    private static let verboseLoggingKey = "verboseLogging"
+
+    /// Debug-level lines in the log, from the next start on.
+    @Published var verboseLogging: Bool {
+        didSet {
+            UserDefaults.standard.set(verboseLogging, forKey: Self.verboseLoggingKey)
+            supervisor.verboseLogging = verboseLogging
+        }
+    }
+
+    /// The bundled binary's own version, which can trail the app's in a local build.
+    @Published private(set) var binaryVersion: String?
 
     let cli: WireCLI
     let supervisor: ProxySupervisor
@@ -32,6 +44,8 @@ final class AppModel: ObservableObject {
         self.cli = cli
         self.supervisor = ProxySupervisor(cli: cli)
         self.readOnlyPreferences = UserDefaults.standard.dictionary(forKey: Self.readOnlyPreferencesKey) as? [String: Bool] ?? [:]
+        self.verboseLogging = UserDefaults.standard.bool(forKey: Self.verboseLoggingKey)
+        supervisor.verboseLogging = verboseLogging
     }
 
 
@@ -195,6 +209,7 @@ final class AppModel: ObservableObject {
         didStart = true
 
         await reloadConfig()
+        binaryVersion = await cli.version()
 
         // A menu bar app launched at login exists to have the proxy up. Under
         // -wait-for-redash a missing VPN is a state the menu shows, not a reason
@@ -391,6 +406,15 @@ final class AppModel: ObservableObject {
             launchAtLoginError = error.localizedDescription
         }
         objectWillChange.send()
+    }
+
+    func revealConfigInFinder() {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: cli.configPath)])
+    }
+
+    /// Applies settings that only take effect at launch, such as verbose logging.
+    func restartProxy() async {
+        await supervisor.restart()
     }
 
     func openLoginItemsSettings() {

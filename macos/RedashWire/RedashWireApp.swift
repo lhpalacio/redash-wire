@@ -21,6 +21,18 @@ struct RedashWireApp: App {
             OnboardingView(model: delegate.model)
         }
         .windowResizability(.contentSize)
+
+        Window("redash-wire Settings", id: "settings") {
+            SettingsView(model: delegate.model, supervisor: delegate.model.supervisor, updates: delegate.model.updates)
+        }
+        .windowResizability(.contentSize)
+        .commands {
+            // The app menu exists while a window gives the app a Dock icon.
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") { WindowPresenter.shared.show("settings") }
+                    .keyboardShortcut(",")
+            }
+        }
     }
 }
 
@@ -57,7 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// than nothing at all when the menu bar has no room for the icon.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
-            WindowPresenter.shared.show(model.needsOnboarding ? "onboarding" : "logs")
+            WindowPresenter.shared.show(model.needsOnboarding ? "onboarding" : "settings")
         }
         return false
     }

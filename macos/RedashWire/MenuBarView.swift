@@ -84,7 +84,7 @@ struct MenuBarView: View {
             }
         case .editConfiguration:
             Button {
-                openSettings()
+                editConfiguration()
             } label: {
                 Label("Edit Configuration…", systemImage: "doc.text")
             }
@@ -345,27 +345,10 @@ struct MenuBarView: View {
             Label("Show Logs", systemImage: "list.bullet.rectangle")
         }
 
-        Toggle(isOn: Binding(
-            get: { model.launchesAtLogin },
-            set: { enabled in model.setLaunchAtLogin(enabled) }
-        )) {
-            Label("Launch at Login", systemImage: "power")
-        }
-
-        // Registered, but macOS holds it until you approve it. It used to read
-        // as plain "off", with the toggle refusing to stay on.
-        if model.launchAtLoginStatus == .requiresApproval {
-            Text("Waiting for approval in System Settings › Login Items")
-            Button("Open Login Items Settings…") { model.openLoginItemsSettings() }
-        }
-        if let error = model.launchAtLoginError {
-            Text("Launch at Login failed: \(error)".fittedToMenu(limit: 80))
-        }
-
         // The shortcuts only fire while the menu is open: LSUIElement leaves no app
         // menu to register a key equivalent with.
         Button {
-            openSettings()
+            openWindow("settings")
         } label: {
             Label("Settings…", systemImage: "gearshape")
         }
@@ -389,7 +372,7 @@ struct MenuBarView: View {
 
 
     /// Config deleted out from under us means there is nothing to edit yet.
-    private func openSettings() {
+    private func editConfiguration() {
         if !model.openConfigInEditor() {
             openWindow("onboarding")
         }
@@ -408,13 +391,6 @@ struct MenuBarView: View {
                 Label("Update available — \(release.version)", systemImage: "arrow.down.circle")
             }
         }
-
-        Button {
-            Task { await updates.checkNow() }
-        } label: {
-            Label("Check for Updates…", systemImage: "arrow.triangle.2.circlepath")
-        }
-        .disabled(updates.isChecking)
 
         Button {
             WindowPresenter.activate()

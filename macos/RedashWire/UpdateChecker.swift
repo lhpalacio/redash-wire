@@ -21,10 +21,15 @@ final class UpdateChecker: ObservableObject {
     @Published private(set) var available: Release?
     @Published private(set) var isChecking = false
 
+    @Published var checksAutomatically: Bool {
+        didSet { UserDefaults.standard.set(checksAutomatically, forKey: Self.automaticKey) }
+    }
+
     private static let latestRelease = URL(string: "https://api.github.com/repos/lhpalacio/redash-wire/releases/latest")!
     private static let releasesPage = URL(string: "https://github.com/lhpalacio/redash-wire/releases")!
     private static let lastCheckKey = "lastUpdateCheck"
     private static let knownReleaseKey = "lastKnownRelease"
+    private static let automaticKey = "checksForUpdatesAutomatically"
     private static let interval: TimeInterval = 24 * 60 * 60
 
     /// Set from the tag by release.yml. A locally built app reports whatever
@@ -39,6 +44,7 @@ final class UpdateChecker: ObservableObject {
     /// release it found is still sitting there. Re-tested against the running
     /// version, so the row also clears itself once you install the update.
     init() {
+        checksAutomatically = UserDefaults.standard.object(forKey: Self.automaticKey) as? Bool ?? true
         guard
             let stored = UserDefaults.standard.data(forKey: Self.knownReleaseKey),
             let release = try? JSONDecoder().decode(Release.self, from: stored),
@@ -73,10 +79,13 @@ final class UpdateChecker: ObservableObject {
     /// the menu and nothing else — no banner, no download, no prompt. A failure
     /// leaves the timestamp alone so the next launch tries again.
     func checkInBackground() async {
+        guard checksAutomatically, !isChecking else { return }
         if let last = UserDefaults.standard.object(forKey: Self.lastCheckKey) as? Date,
            Date().timeIntervalSince(last) < Self.interval {
             return
         }
+        isChecking = true
+        defer { isChecking = false }
         guard let release = try? await fetchLatest() else { return }
 
         remember(Self.isNewer(release.version, than: Self.currentVersion) ? release : nil)

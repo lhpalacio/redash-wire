@@ -49,6 +49,9 @@ final class ProxySupervisor: ObservableObject {
     /// view that re-renders per line.
     let log = LogStore()
 
+    /// Passes -debug from the next spawn on.
+    var verboseLogging = false
+
     private let cli: WireCLI
     private var tracker = ProxyTracker()
     private var process: Process?
@@ -240,7 +243,7 @@ final class ProxySupervisor: ObservableObject {
 
         let process = Process()
         process.executableURL = cli.binaryURL
-        process.arguments = cli.serveArguments(profile: profile.name, readOnly: readOnly)
+        process.arguments = cli.serveArguments(profile: profile.name, readOnly: readOnly, verbose: verboseLogging)
 
         let stdin = Pipe()
         let stderr = Pipe()
