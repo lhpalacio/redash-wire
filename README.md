@@ -163,8 +163,8 @@ for your Redash URL and API key, and whether to start read-only. From the menu
 you can:
 
 - Pick a profile and start or stop the proxy. `default_profile` starts at launch.
-- Lock the selected profile to read-only. The choice is remembered per profile
-  and the proxy restarts with it; a profile whose config says `read_only: true`
+- Lock the selected profile to read-only. The choice is remembered per Redash
+  URL, so renaming the profile keeps it, and the proxy restarts with it; a profile whose config says `read_only: true`
   shows as locked and can't be unlocked from the menu. The status line and the
   profile list say which profiles are read-only.
 - Browse the proxy's data sources and copy a `psql` or `mysql` command or a

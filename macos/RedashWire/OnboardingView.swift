@@ -51,28 +51,35 @@ struct OnboardingView: View {
         }
     }
 
+    /// The labels are the fields' own, so VoiceOver reads "Redash URL" rather
+    /// than the placeholder.
     private var form: some View {
-        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
-            GridRow {
-                Text("Redash URL")
-                TextField("https://redash.example.com", text: $redashURL)
+        Form {
+            TextField("Redash URL", text: $redashURL, prompt: Text("https://redash.example.com"))
+            SecureField("API key", text: $apiKey, prompt: Text("Your Redash user API key"))
+            if let profilePage {
+                Link("Find your API key in Redash", destination: profilePage)
+                    .font(.callout)
             }
-            GridRow {
-                Text("API key")
-                SecureField("Your Redash user API key", text: $apiKey)
-            }
-            GridRow {
-                Text("Profile")
-                TextField("default", text: $profileName)
-            }
-            GridRow {
-                Text("")
-                Toggle("Read-only: refuse writes and schema changes", isOn: $readOnly)
-                    .toggleStyle(.checkbox)
-            }
+            TextField("Profile", text: $profileName, prompt: Text("default"))
+            Toggle("Read-only: refuse writes and schema changes", isOn: $readOnly)
+                .toggleStyle(.checkbox)
         }
         .textFieldStyle(.roundedBorder)
         .disabled(isWorking)
+    }
+
+    /// Redash shows your API key on your own profile page.
+    private var profilePage: URL? {
+        guard let base = URL(string: normalizedURL), base.host != nil else { return nil }
+        return base.appendingPathComponent("users/me")
+    }
+
+    /// A bare host is the usual thing to paste.
+    private var normalizedURL: String {
+        let trimmed = redashURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.contains("://") else { return trimmed }
+        return "https://" + trimmed
     }
 
     private func failure(_ message: String) -> some View {
@@ -118,6 +125,7 @@ struct OnboardingView: View {
             }
             Spacer()
             Button("Cancel") { dismiss() }
+                .keyboardShortcut(.cancelAction)
                 .disabled(isWorking)
             Button("Test & Save") { submit() }
                 .keyboardShortcut(.defaultAction)
@@ -134,7 +142,7 @@ struct OnboardingView: View {
             defer { isWorking = false }
             do {
                 result = try await model.runOnboarding(
-                    redashURL: redashURL.trimmingCharacters(in: .whitespacesAndNewlines),
+                    redashURL: normalizedURL,
                     profile: profileName.trimmingCharacters(in: .whitespacesAndNewlines),
                     apiKey: apiKey.trimmingCharacters(in: .whitespacesAndNewlines),
                     readOnly: readOnly

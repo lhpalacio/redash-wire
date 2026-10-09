@@ -234,7 +234,7 @@ final class UpdateChecker: ObservableObject {
     /// LSUIElement leaves the app inactive, so an alert would otherwise open
     /// behind whatever you were looking at.
     private func runModal(_ alert: NSAlert) -> NSApplication.ModalResponse {
-        NSApplication.shared.activate(ignoringOtherApps: true)
+        WindowPresenter.activate()
         return alert.runModal()
     }
 }

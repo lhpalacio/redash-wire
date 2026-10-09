@@ -378,7 +378,7 @@ struct MenuBarView: View {
         }
         .keyboardShortcut(",", modifiers: [.command, .shift])
 
-        if !model.isConfigured {
+        if model.needsOnboarding {
             Button {
                 openWindow("onboarding")
             } label: {
@@ -417,7 +417,7 @@ struct MenuBarView: View {
         .disabled(updates.isChecking)
 
         Button {
-            NSApplication.shared.activate(ignoringOtherApps: true)
+            WindowPresenter.activate()
             NSApplication.shared.orderFrontStandardAboutPanel(nil)
         } label: {
             Label("About redash-wire", systemImage: "info.circle")

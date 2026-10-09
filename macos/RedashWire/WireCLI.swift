@@ -82,6 +82,9 @@ struct WireCLI {
         process.standardError = errPipe
         process.standardInput = inPipe
 
+        let exit = ExitStatus()
+        process.terminationHandler = { exit.finish($0.terminationStatus) }
+
         do {
             try process.run()
         } catch {
@@ -112,8 +115,7 @@ struct WireCLI {
         async let err = Self.readToEnd(errPipe.fileHandleForReading)
         let (stdoutData, stderrData) = await (out, err)
 
-        process.waitUntilExit()
-        let result = ProcessResult(stdout: stdoutData, stderr: stderrData, status: process.terminationStatus)
+        let result = ProcessResult(stdout: stdoutData, stderr: stderrData, status: await exit.status())
 
         // A child that stopped reading has usually exited, and its own error
         // says more than a broken pipe does; that goes through the status.
@@ -147,6 +149,36 @@ struct WireCLI {
             code: .unknown,
             message: text.isEmpty ? "redash-wire exited with status \(result.status)" : text
         )
+    }
+}
+
+/// A child's exit status, awaited. `waitUntilExit` blocks the thread it runs
+/// on, and spins the run loop when that is the main one.
+private final class ExitStatus: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Int32?
+    private var waiter: CheckedContinuation<Int32, Never>?
+
+    func finish(_ status: Int32) {
+        lock.lock()
+        let waiter = self.waiter
+        self.waiter = nil
+        value = status
+        lock.unlock()
+        waiter?.resume(returning: status)
+    }
+
+    func status() async -> Int32 {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if let value {
+                lock.unlock()
+                continuation.resume(returning: value)
+                return
+            }
+            waiter = continuation
+            lock.unlock()
+        }
     }
 }
 

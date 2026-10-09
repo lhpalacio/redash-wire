@@ -12,9 +12,9 @@ enum ClientApp {
     }
 
     /// Looked up once per scheme. Launch Services is quick, but the menu asks
-    /// once per data source every time it opens, and the answer only changes
-    /// when an app is installed or removed.
-    private static var cache: [String: Handler?] = [:]
+    /// once per data source every time it opens. Only a find is kept: caching
+    /// "none" hid the button from a client installed after launch.
+    private static var cache: [String: Handler] = [:]
 
     static func handler(for uri: String) -> Handler? {
         guard let url = URL(string: uri), let scheme = url.scheme else { return nil }
@@ -50,18 +50,39 @@ enum Clipboard {
         pasteboard.setString(value, forType: .string)
     }
 
+    /// The change count of a credential still waiting to be cleared.
+    private static var pendingSecret: Int?
+
     /// Clears the credential later, but only if nothing else was copied since.
-    /// Without the changeCount check this would wipe whatever came next.
+    /// Without the changeCount check this would wipe whatever came next. It
+    /// stays on this Mac: Universal Clipboard would hand it to every device
+    /// signed in to the same account.
     static func copySecret(_ value: String, clearAfter seconds: TimeInterval = 60) {
         let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
+        pasteboard.prepareForNewContents(with: .currentHostOnly)
         pasteboard.setString(value, forType: .string)
         pasteboard.setString(value, forType: concealedType)
         let stamp = pasteboard.changeCount
+        pendingSecret = stamp
 
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
-            guard NSPasteboard.general.changeCount == stamp else { return }
-            NSPasteboard.general.clearContents()
+            clearSecret(stamp)
         }
+    }
+
+    /// The timer dies with the app, so quitting inside the minute used to leave
+    /// the credential behind.
+    static func clearSecretOnQuit() {
+        if let pendingSecret {
+            clearSecret(pendingSecret)
+        }
+    }
+
+    private static func clearSecret(_ stamp: Int) {
+        if pendingSecret == stamp {
+            pendingSecret = nil
+        }
+        guard NSPasteboard.general.changeCount == stamp else { return }
+        NSPasteboard.general.clearContents()
     }
 }
