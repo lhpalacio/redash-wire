@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The proxy's log stream, kept apart from the object the menu observes. The
@@ -10,9 +11,11 @@ final class LogStore: ObservableObject {
 
     @Published private(set) var events: [LogEvent] = []
 
+    /// Trimmed in batches: shifting all five thousand rows on every line, once
+    /// the store was full, was most of the cost of a busy log.
     func append(_ event: LogEvent) {
         events.append(event)
-        if events.count > Self.maxEvents {
+        if events.count > Self.maxEvents + Self.maxEvents / 10 {
             events.removeFirst(events.count - Self.maxEvents)
         }
     }
@@ -24,10 +27,13 @@ final class LogStore: ObservableObject {
 
 struct LogWindow: View {
     @ObservedObject var log: LogStore
+    let diagnostics: @MainActor () -> String
     @State private var minimumLevel: LogEvent.Level = .debug
     @State private var searchText = ""
+    /// Off lets you read back while lines keep arriving.
+    @State private var follows = true
 
-    private var visibleEvents: [LogEvent] {
+    private func visibleEvents() -> [LogEvent] {
         log.events.filter { event in
             guard event.level >= minimumLevel else { return false }
             guard !searchText.isEmpty else { return true }
@@ -38,13 +44,15 @@ struct LogWindow: View {
 
     /// `safeAreaInset` rather than a VStack: it reserves the toolbar's height so no
     /// row starts out hidden, while still letting the list scroll under the glass.
+    /// The filter runs once per render; it used to run once per use.
     var body: some View {
-        eventList
-            .safeAreaInset(edge: .top, spacing: 0) { toolbar }
-            .frame(minWidth: 620, minHeight: 320)
+        let visible = visibleEvents()
+        eventList(visible)
+            .safeAreaInset(edge: .top, spacing: 0) { toolbar(visible) }
+            .frame(minWidth: 680, minHeight: 320)
     }
 
-    private var toolbar: some View {
+    private func toolbar(_ visibleEvents: [LogEvent]) -> some View {
         HStack(spacing: 12) {
             Picker("Level", selection: $minimumLevel) {
                 Text("All").tag(LogEvent.Level.debug)
@@ -65,17 +73,29 @@ struct LogWindow: View {
                 .foregroundStyle(.secondary)
                 .font(.callout)
 
-            Button("Copy") { Clipboard.copy(plainText) }
-                .disabled(visibleEvents.isEmpty)
-            Button("Clear") { log.clear() }
-                .disabled(log.events.isEmpty)
+            Toggle("Follow", isOn: $follows)
+                .toggleStyle(.checkbox)
+
+            Menu("More") {
+                Button("Copy Shown Lines") { Clipboard.copy(visibleEvents.map(\.plainLine).joined(separator: "\n")) }
+                    .disabled(visibleEvents.isEmpty)
+                Button("Copy Diagnostics") { Clipboard.copy(diagnostics()) }
+                Divider()
+                Button("Show Log File in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([LogFile.url])
+                }
+                Divider()
+                Button("Clear") { log.clear() }
+                    .disabled(log.events.isEmpty)
+            }
+            .fixedSize()
         }
         .padding(10)
         .glassBar()
     }
 
     @ViewBuilder
-    private var eventList: some View {
+    private func eventList(_ visibleEvents: [LogEvent]) -> some View {
         if log.events.isEmpty {
             VStack {
                 Spacer()
@@ -99,8 +119,8 @@ struct LogWindow: View {
                 // at its cap the count never moves again, and the window stopped
                 // following the log exactly when it had the most in it.
                 .onChange(of: log.events.last?.id) { _ in
-                    guard let last = visibleEvents.last else { return }
-                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    guard follows, let last = visibleEvents.last else { return }
+                    proxy.scrollTo(last.id, anchor: .bottom)
                 }
             }
         }
@@ -108,14 +128,14 @@ struct LogWindow: View {
 
     private func row(_ event: LogEvent) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(Self.timeFormatter.string(from: event.time))
+            Text(LogEvent.lineTimeFormatter.string(from: event.time))
                 .foregroundStyle(.secondary)
             Text(event.level.rawValue.uppercased())
                 .foregroundStyle(color(for: event.level))
                 .frame(width: 52, alignment: .leading)
             VStack(alignment: .leading, spacing: 2) {
                 Text(event.message)
-                if !event.fields.isEmpty {
+                if !event.fieldSummary.isEmpty {
                     Text(event.fieldSummary)
                         .foregroundStyle(.secondary)
                         .font(.system(.callout, design: .monospaced))
@@ -135,19 +155,4 @@ struct LogWindow: View {
         case .error, .fatal: return .red
         }
     }
-
-    private var plainText: String {
-        visibleEvents.map { event in
-            let stamp = Self.timeFormatter.string(from: event.time)
-            let fields = event.fields.isEmpty ? "" : "  " + event.fieldSummary
-            return "\(stamp) \(event.level.rawValue.uppercased()) \(event.message)\(fields)"
-        }
-        .joined(separator: "\n")
-    }
-
-    private static let timeFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
-        return formatter
-    }()
 }

@@ -31,7 +31,7 @@ struct WireCLI {
     /// `-read-only` is the menu's lock. The daemon ORs it with the profile's own
     /// `read_only`, so passing it for a profile the config already locks is
     /// harmless, and leaving it off never unlocks one.
-    func serveArguments(profile: String, readOnly: Bool) -> [String] {
+    func serveArguments(profile: String, readOnly: Bool, verbose: Bool = false) -> [String] {
         var arguments = [
             "-config", configPath,
             "-profile", profile,
@@ -42,7 +42,18 @@ struct WireCLI {
         if readOnly {
             arguments.append("-read-only")
         }
+        if verbose {
+            arguments.append("-debug")
+        }
         return arguments
+    }
+
+    /// What `-version` prints after the program name, or nil when the binary
+    /// will not run.
+    func version() async -> String? {
+        guard let result = try? await run(["-version"], stdin: nil), result.status == 0 else { return nil }
+        let line = String(decoding: result.stdout, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return line.split(separator: " ").last.map(String.init)
     }
 
 
@@ -82,6 +93,9 @@ struct WireCLI {
         process.standardError = errPipe
         process.standardInput = inPipe
 
+        let exit = ExitStatus()
+        process.terminationHandler = { exit.finish($0.terminationStatus) }
+
         do {
             try process.run()
         } catch {
@@ -112,8 +126,7 @@ struct WireCLI {
         async let err = Self.readToEnd(errPipe.fileHandleForReading)
         let (stdoutData, stderrData) = await (out, err)
 
-        process.waitUntilExit()
-        let result = ProcessResult(stdout: stdoutData, stderr: stderrData, status: process.terminationStatus)
+        let result = ProcessResult(stdout: stdoutData, stderr: stderrData, status: await exit.status())
 
         // A child that stopped reading has usually exited, and its own error
         // says more than a broken pipe does; that goes through the status.
@@ -150,6 +163,36 @@ struct WireCLI {
     }
 }
 
+/// A child's exit status, awaited. `waitUntilExit` blocks the thread it runs
+/// on, and spins the run loop when that is the main one.
+private final class ExitStatus: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Int32?
+    private var waiter: CheckedContinuation<Int32, Never>?
+
+    func finish(_ status: Int32) {
+        lock.lock()
+        let waiter = self.waiter
+        self.waiter = nil
+        value = status
+        lock.unlock()
+        waiter?.resume(returning: status)
+    }
+
+    func status() async -> Int32 {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if let value {
+                lock.unlock()
+                continuation.resume(returning: value)
+                return
+            }
+            waiter = continuation
+            lock.unlock()
+        }
+    }
+}
+
 extension WireCLI {
     static var defaultConfigPath: String {
         FileManager.default.homeDirectoryForCurrentUser
@@ -158,9 +201,11 @@ extension WireCLI {
     }
 
     /// The bundled binary, so the app and the proxy cannot disagree on the contract.
-    /// REDASH_WIRE_BINARY overrides it during development.
-    static func standard(configPath: String = defaultConfigPath) -> WireCLI {
-        WireCLI(binaryURL: bundledBinaryURL(), configPath: configPath)
+    /// REDASH_WIRE_BINARY and REDASH_WIRE_CONFIG override the binary and the
+    /// config during development.
+    static func standard() -> WireCLI {
+        let configPath = ProcessInfo.processInfo.environment["REDASH_WIRE_CONFIG"] ?? defaultConfigPath
+        return WireCLI(binaryURL: bundledBinaryURL(), configPath: configPath)
     }
 
     static func bundledBinaryURL() -> URL {

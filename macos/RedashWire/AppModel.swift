@@ -12,15 +12,31 @@ final class AppModel: ObservableObject {
     /// restarting it. Shown while it stays stopped.
     @Published private(set) var reloadNotice: String?
     @Published private(set) var launchAtLoginError: String?
-    /// Profiles the menu has locked to read-only, by name. The config's own
-    /// `read_only` is separate and stronger: it cannot be unlocked from here.
+    /// Profiles the menu has locked to read-only, under both the profile name
+    /// and the Redash URL. Either one locks, so renaming the profile or editing
+    /// its URL cannot bring the proxy back writable; keyed by name alone, a
+    /// rename did. The config's own `read_only` is separate and stronger: it
+    /// cannot be unlocked from here.
     @Published private(set) var readOnlyPreferences: [String: Bool]
 
     private static let readOnlyPreferencesKey = "readOnlyProfiles"
+    private static let verboseLoggingKey = "verboseLogging"
+
+    /// Debug-level lines in the log, from the next start on.
+    @Published var verboseLogging: Bool {
+        didSet {
+            UserDefaults.standard.set(verboseLogging, forKey: Self.verboseLoggingKey)
+            supervisor.verboseLogging = verboseLogging
+        }
+    }
+
+    /// The bundled binary's own version, which can trail the app's in a local build.
+    @Published private(set) var binaryVersion: String?
 
     let cli: WireCLI
     let supervisor: ProxySupervisor
     let updates = UpdateChecker()
+    let notifier: Notifier
 
     private var watcher: ConfigWatcher?
     private var updateTask: Task<Void, Never>?
@@ -29,7 +45,11 @@ final class AppModel: ObservableObject {
     init(cli: WireCLI = .standard()) {
         self.cli = cli
         self.supervisor = ProxySupervisor(cli: cli)
+        self.notifier = Notifier(supervisor: supervisor)
         self.readOnlyPreferences = UserDefaults.standard.dictionary(forKey: Self.readOnlyPreferencesKey) as? [String: Bool] ?? [:]
+        self.verboseLogging = UserDefaults.standard.bool(forKey: Self.verboseLoggingKey)
+        supervisor.verboseLogging = verboseLogging
+        supervisor.retryAfterGivingUp = { [weak self] in await self?.retry() }
     }
 
 
@@ -71,7 +91,16 @@ final class AppModel: ObservableObject {
 
     /// Whether the menu has locked this profile, whatever its config says.
     func prefersReadOnly(_ profile: Profile) -> Bool {
-        readOnlyPreferences[profile.name] ?? false
+        Self.lockKeys(profile).contains { readOnlyPreferences[$0] == true }
+    }
+
+    /// The name, as locks were always keyed, and the URL when it resolved.
+    private static func lockKeys(_ profile: Profile) -> [String] {
+        var url = profile.redashURL.trimmingCharacters(in: .whitespaces).lowercased()
+        while url.hasSuffix("/") {
+            url.removeLast()
+        }
+        return url.isEmpty ? [profile.name] : [profile.name, url]
     }
 
     /// What a start of this profile would run as: locked by the config or by
@@ -164,13 +193,14 @@ final class AppModel: ObservableObject {
 
 
     func start() async {
-        // The menu bar label's .task drives this. It runs once today, but a second
-        // run would leave the first update loop running forever with nothing able
-        // to reach it.
+        // A second run would leave the first update loop running forever with
+        // nothing able to reach it.
         guard !didStart else { return }
         didStart = true
 
         await reloadConfig()
+        binaryVersion = await cli.version()
+        notifier.requestAuthorization()
 
         // A menu bar app launched at login exists to have the proxy up. Under
         // -wait-for-redash a missing VPN is a state the menu shows, not a reason
@@ -202,7 +232,7 @@ final class AppModel: ObservableObject {
         // A failed proxy is the one whose config you were editing to fix, and
         // reloading is the moment to find out whether it worked. A stopped one
         // stays stopped: that was a choice, not a failure.
-        if case .failed = supervisor.state, let profile = selectedProfile {
+        if supervisor.state.isAwaitingRetry, let profile = selectedProfile {
             await supervisor.start(profile: profile, readOnly: isReadOnly(profile))
             return
         }
@@ -270,10 +300,13 @@ final class AppModel: ObservableObject {
     /// process is not in. On a stopped proxy it simply applies at the next
     /// start.
     func setReadOnly(_ locked: Bool, for profile: Profile) async {
-        readOnlyPreferences[profile.name] = locked
+        for key in Self.lockKeys(profile) {
+            readOnlyPreferences[key] = locked
+        }
         UserDefaults.standard.set(readOnlyPreferences, forKey: Self.readOnlyPreferencesKey)
 
-        guard supervisor.state.isActive, let running = supervisor.activeProfile, running.name == profile.name else { return }
+        guard supervisor.state.isActive, let running = supervisor.activeProfile,
+              !Set(Self.lockKeys(running)).isDisjoint(with: Self.lockKeys(profile)) else { return }
         await supervisor.restart(profile: running, readOnly: running.readOnly || locked)
     }
 
@@ -366,6 +399,38 @@ final class AppModel: ObservableObject {
             launchAtLoginError = error.localizedDescription
         }
         objectWillChange.send()
+    }
+
+    /// For a bug report: versions, what the menu says, the profile without its
+    /// credentials, and the end of the log.
+    func diagnostics() -> String {
+        let summary = supervisor.statusSummary()
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        var lines = [
+            "redash-wire diagnostics, \(ISO8601DateFormatter().string(from: Date()))",
+            "App \(UpdateChecker.currentVersion) (\(build)), binary \(binaryVersion ?? "not found")",
+            "macOS \(ProcessInfo.processInfo.operatingSystemVersionString)",
+            "Status: \(([summary.headline] + summary.details).joined(separator: " / "))",
+        ]
+        if let profile = connectionProfile {
+            lines.append("Profile \(profile.name): \(profile.redashURL), PostgreSQL \(profile.postgresListenAddr.isEmpty ? "off" : profile.postgresListenAddr), MySQL \(profile.mysqlListenAddr.isEmpty ? "off" : profile.mysqlListenAddr), read-only \(isReadOnly(profile)), API key \(profile.apiKeySet ? "set" : "missing")")
+        }
+        if let configError {
+            lines.append("Config error: \(configError.message)")
+        }
+        lines.append("")
+        lines.append("Last log lines:")
+        lines += supervisor.log.events.suffix(200).map(\.plainLine)
+        return lines.joined(separator: "\n")
+    }
+
+    func revealConfigInFinder() {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: cli.configPath)])
+    }
+
+    /// Applies settings that only take effect at launch, such as verbose logging.
+    func restartProxy() async {
+        await supervisor.restart()
     }
 
     func openLoginItemsSettings() {

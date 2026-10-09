@@ -39,13 +39,18 @@ final class ProxySupervisor: ObservableObject {
     var dataSources: [DataSource] { snapshot.dataSources }
     var pendingRestart: PendingRestart? { snapshot.pendingRestart }
 
-    /// Not published: see `ProxyTracker.nextProbeAt`. The menu reads it when it
-    /// opens.
-    private(set) var nextProbeAt: Date?
+    /// Read when the menu opens, like `ProxyTracker.nextProbeAt`, which it
+    /// counts down to.
+    func statusSummary(now: Date = Date()) -> StatusSummary {
+        StatusSummary(tracker, now: now)
+    }
 
     /// Every line the child wrote. Its own object, so the log window is the only
     /// view that re-renders per line.
     let log = LogStore()
+
+    /// Passes -debug from the next spawn on.
+    var verboseLogging = false
 
     private let cli: WireCLI
     private var tracker = ProxyTracker()
@@ -55,6 +60,17 @@ final class ProxySupervisor: ObservableObject {
     private var lineBuffer = Data()
     private var stopRequested = false
     private var restartTask: Task<Void, Never>?
+    private var giveUpTask: Task<Void, Never>?
+    private var scheduledGiveUp: Date?
+    /// Set while a give-up's stop is in flight, so the exit lands straight in
+    /// gaveUp. Passing through stopped published a state of its own, and a
+    /// rejected key was notified twice.
+    private var pendingGiveUp: RedashHealth?
+
+    /// Brings back a start that gave up, when the network changes. The model
+    /// supplies it because the restart needs the profile and lock as they are
+    /// now, not as they were at the launch that gave up.
+    var retryAfterGivingUp: (() async -> Void)?
     private var pathWatcher: NetworkPathWatcher?
 
     /// Bumped per spawn and carried by everything a process reports back. stderr
@@ -113,6 +129,12 @@ final class ProxySupervisor: ObservableObject {
             await self.stopNow()
             self.startNow(target, readOnly: lock)
         }
+    }
+
+    /// Asks the running proxy to probe Redash now, for the menu's Check Now.
+    func checkNow() {
+        guard tracker.reachedReady, let process, process.isRunning else { return }
+        kill(process.processIdentifier, SIGUSR1)
     }
 
     /// One profile at a time. Two would usually collide on the same ports.
@@ -178,14 +200,51 @@ final class ProxySupervisor: ObservableObject {
     /// Only a proxy that has bound its listeners gets the signal. The daemon
     /// registers its SIGUSR1 handler before it binds, and an unhandled SIGUSR1
     /// kills a process.
+    ///
+    /// A start that gave up is tried again: the VPN it was waiting for may be
+    /// what just came up. That includes a rejection, since a firewall that
+    /// only admits the VPN answers 403 until it is up.
     private func networkPathChanged() {
-        guard tracker.reachedReady, let process, process.isRunning else { return }
-        kill(process.processIdentifier, SIGUSR1)
+        if case .gaveUp = state, let retry = retryAfterGivingUp {
+            Task { await retry() }
+            return
+        }
+        checkNow()
+    }
+
+    /// Stops a start that has spent its time trying to reach Redash. Checked on
+    /// every line and at the deadline itself, since a probe that hangs writes
+    /// nothing.
+    private func giveUpIfDue() {
+        guard tracker.giveUpReason(now: Date()) != nil else { return }
+        let generation = self.generation
+        Task {
+            await enqueue {
+                // Asked again: Redash may have answered while this waited its turn.
+                guard generation == self.generation, self.process != nil,
+                      let health = self.tracker.giveUpReason(now: Date()) else { return }
+                self.pendingGiveUp = health
+                await self.stopNow()
+            }
+        }
+    }
+
+    private func scheduleGiveUp() {
+        guard tracker.giveUpAt != scheduledGiveUp else { return }
+        scheduledGiveUp = tracker.giveUpAt
+        giveUpTask?.cancel()
+        guard let at = scheduledGiveUp else { return }
+        giveUpTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(max(0, at.timeIntervalSinceNow)))
+            guard !Task.isCancelled else { return }
+            self?.giveUpIfDue()
+        }
     }
 
 
     private func spawn(_ profile: Profile, readOnly: Bool) {
         stopRequested = false
+        pendingGiveUp = nil
         lineBuffer.removeAll()
         exitStatus = nil
         stderrDrained = false
@@ -193,9 +252,11 @@ final class ProxySupervisor: ObservableObject {
         let generation = self.generation
         publish()
 
+        LogFile.shared.mark("starting profile \(profile.name)")
+
         let process = Process()
         process.executableURL = cli.binaryURL
-        process.arguments = cli.serveArguments(profile: profile.name, readOnly: readOnly)
+        process.arguments = cli.serveArguments(profile: profile.name, readOnly: readOnly, verbose: verboseLogging)
 
         let stdin = Pipe()
         let stderr = Pipe()
@@ -227,6 +288,7 @@ final class ProxySupervisor: ObservableObject {
         do {
             try process.run()
         } catch {
+            stderr.fileHandleForReading.readabilityHandler = nil
             tracker.launchFailed("could not start \(cli.binaryURL.lastPathComponent): \(error.localizedDescription)")
             publish()
             return
@@ -245,6 +307,7 @@ final class ProxySupervisor: ObservableObject {
             let line = lineBuffer[lineBuffer.startIndex..<newline]
             lineBuffer.removeSubrange(lineBuffer.startIndex...newline)
             guard !line.isEmpty else { continue }
+            LogFile.shared.append(Data(line))
             // A Go panic is not JSON, and dropping it left a crash with no
             // trace anywhere.
             let event = LogEvent.parse(line: Data(line))
@@ -253,6 +316,7 @@ final class ProxySupervisor: ObservableObject {
             tracker.record(event, now: Date())
             publish()
         }
+        giveUpIfDue()
     }
 
     private func stderrClosed(generation: Int) {
@@ -283,7 +347,14 @@ final class ProxySupervisor: ObservableObject {
         process = nil
         stdinPipe = nil
 
-        let outcome = tracker.exit(status: status, stopRequested: stopRequested, now: Date())
+        let outcome: ProxyTracker.Exit
+        if let health = pendingGiveUp {
+            pendingGiveUp = nil
+            tracker.gaveUp(health)
+            outcome = .stopped
+        } else {
+            outcome = tracker.exit(status: status, stopRequested: stopRequested, now: Date())
+        }
         stopRequested = false
         publish()
 
@@ -303,7 +374,7 @@ final class ProxySupervisor: ObservableObject {
     }
 
     private func publish() {
-        nextProbeAt = tracker.nextProbeAt
+        scheduleGiveUp()
         if tracker.snapshot != snapshot {
             snapshot = tracker.snapshot
         }

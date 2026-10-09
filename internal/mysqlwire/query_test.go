@@ -855,6 +855,28 @@ func TestHandleInfoSchemaColumns(t *testing.T) {
 			t.Errorf("rows = %v, want none", rows)
 		}
 	})
+
+	t.Run("TablePlus enum lookup finds only the enum columns", func(t *testing.T) {
+		withEnum := localSession{dbName: "Analytics MySQL", schema: []redash.SchemaTable{
+			{Name: "users", Columns: []redash.SchemaColumn{
+				{Name: "id", Type: "int"},
+				{Name: "name", Type: "varchar"},
+				{Name: "status", Type: "enum"},
+				{Name: "notes"},
+			}},
+		}}
+		_, rows := run(t, withEnum, "SELECT table_name as table_name,column_name as column_name,column_type as column_type FROM information_schema.columns WHERE table_schema='Analytics MySQL' AND table_name='users' AND data_type='enum';")
+		if len(rows) != 1 || rows[0][1] != "status" {
+			t.Errorf("rows = %v, want only status", rows)
+		}
+	})
+
+	t.Run("a filter on a field reported as NULL admits nothing", func(t *testing.T) {
+		_, rows := run(t, sess, "SELECT column_name FROM information_schema.columns WHERE table_name = 'users' AND column_key = 'PRI'")
+		if len(rows) != 0 {
+			t.Errorf("rows = %v, want none", rows)
+		}
+	})
 }
 
 // TestEmptyStringIsNotNull: go-mysql sends a Go "" as SQL NULL, so an empty

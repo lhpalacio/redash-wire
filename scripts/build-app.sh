@@ -54,6 +54,11 @@ xcodebuild_args=(
 case "$VERSION" in
   [0-9]*.[0-9]*|v[0-9]*.[0-9]*) xcodebuild_args+=("MARKETING_VERSION=${VERSION#v}") ;;
 esac
+# CFBundleVersion has to grow with every build for macOS to tell two builds of
+# the same version apart; the commit count does, given a full clone.
+if BUILD_NUMBER="$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null)"; then
+  xcodebuild_args+=("CURRENT_PROJECT_VERSION=$BUILD_NUMBER")
+fi
 xcodebuild "${xcodebuild_args[@]}" build
 
 cp -R "$DERIVED/Build/Products/Release/RedashWire.app" "$APP"

@@ -277,17 +277,6 @@ enum RedashHealth: Equatable {
         let digits = reason[marker.upperBound...].prefix(while: \.isNumber)
         return digits.isEmpty ? nil : Int(digits)
     }
-
-    var remedy: String? {
-        switch self {
-        case .checking, .ok:
-            return nil
-        case .unreachable:
-            return "Check your VPN or network. Retrying automatically."
-        case .rejected:
-            return "Check the profile's API key and URL."
-        }
-    }
 }
 
 struct LogEvent: Identifiable, Equatable {
@@ -319,6 +308,9 @@ struct LogEvent: Identifiable, Equatable {
     /// since it is usually the whole explanation of an exit, but it is not the
     /// daemon reporting on itself and the tracker weighs it differently.
     let isRaw: Bool
+    /// The fields as one line, worked out once: the log window filters and
+    /// draws thousands of rows from it.
+    let fieldSummary: String
 
     init(time: Date, level: Level, event: String?, message: String, fields: [String: String], isRaw: Bool = false) {
         self.time = time
@@ -327,6 +319,10 @@ struct LogEvent: Identifiable, Equatable {
         self.message = message
         self.fields = fields
         self.isRaw = isRaw
+        self.fieldSummary = fields.filter { !Self.bulkFields.contains($0.key) }
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: " ")
     }
 
     /// A line that was not JSON. Error level, because the only things that write
@@ -340,12 +336,18 @@ struct LogEvent: Identifiable, Equatable {
     /// a one-line log column has no room for.
     private static let bulkFields: Set<String> = ["sources"]
 
-    var fieldSummary: String {
-        fields.filter { !Self.bulkFields.contains($0.key) }
-            .sorted { $0.key < $1.key }
-            .map { "\($0.key)=\($0.value)" }
-            .joined(separator: " ")
+    /// The line as the log window's Copy writes it.
+    var plainLine: String {
+        let stamp = Self.lineTimeFormatter.string(from: time)
+        let fields = fieldSummary.isEmpty ? "" : "  " + fieldSummary
+        return "\(stamp) \(level.rawValue.uppercased()) \(message)\(fields)"
     }
+
+    static let lineTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
 
     /// One line of the daemon's `-log-format json` stream. Nil for anything that
     /// is not a JSON object, which the supervisor then keeps as `raw`.

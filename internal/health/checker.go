@@ -47,6 +47,12 @@ const (
 	// wall every ten seconds for the rest of the session.
 	DefaultRejectedInterval = 5 * time.Minute
 
+	// A Redash that answered before and has since gone away is probed at the
+	// interval, then twice as long after each failure, up to this. A network
+	// change still probes at once (SIGUSR1), so the long gaps only apply to a
+	// Mac that sits off the VPN.
+	DefaultMaxOfflineInterval = 2 * time.Minute
+
 	// Two failures to trip, one success to clear. The asymmetry is deliberate:
 	// being wrong about "up" costs one query, being wrong about "down" costs every
 	// live session. Two also absorbs the 403-serving captive portals and proxies
@@ -79,6 +85,7 @@ type Checker struct {
 	interval          time.Duration
 	confirmDelay      time.Duration
 	rejectedInterval  time.Duration
+	maxOffline        time.Duration
 	timeout           time.Duration
 	startupTimeout    time.Duration
 	threshold         int
@@ -100,6 +107,9 @@ func WithFailureThreshold(n int) Option   { return func(c *Checker) { c.threshol
 func WithRejectedInterval(d time.Duration) Option {
 	return func(c *Checker) { c.rejectedInterval = d }
 }
+func WithMaxOfflineInterval(d time.Duration) Option {
+	return func(c *Checker) { c.maxOffline = d }
+}
 func WithRejectedThreshold(n int) Option        { return func(c *Checker) { c.rejectedThreshold = n } }
 func WithConfirmDelay(d time.Duration) Option   { return func(c *Checker) { c.confirmDelay = d } }
 func WithStartupTimeout(d time.Duration) Option { return func(c *Checker) { c.startupTimeout = d } }
@@ -113,6 +123,7 @@ func NewChecker(lister redash.DataSourceLister, registry *redash.SwappableRegist
 		interval:          DefaultInterval,
 		confirmDelay:      DefaultConfirmDelay,
 		rejectedInterval:  DefaultRejectedInterval,
+		maxOffline:        DefaultMaxOfflineInterval,
 		timeout:           DefaultTimeout,
 		startupTimeout:    DefaultStartupTimeout,
 		threshold:         DefaultFailureThreshold,
@@ -260,6 +271,14 @@ func (c *Checker) nextInterval() time.Duration {
 	// now rather than at the next tick.
 	if s.Up && c.failures > 0 {
 		return c.confirmDelay
+	}
+	if !s.Up && c.everUp {
+		limit := max(c.maxOffline, c.interval)
+		d := c.interval
+		for i := c.threshold; i < c.failures && d < limit; i++ {
+			d *= 2
+		}
+		return min(d, limit)
 	}
 	return c.interval
 }
