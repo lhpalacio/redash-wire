@@ -73,6 +73,10 @@ Keep anything that needs AppKit, a `Process`, or SwiftUI out of `Core/`, or
 the package stops building. That constraint is the point: it is what makes
 the state machine testable without a running proxy.
 
+The app icon is drawn by `swift scripts/make-app-icon.swift`, which rewrites
+`macos/RedashWire/Assets.xcassets/AppIcon.appiconset`; change the script, not
+the PNGs.
+
 The app runs the copy of `redash-wire` inside its bundle. To point it at a
 local build instead, set `REDASH_WIRE_BINARY` and launch the executable directly
 so it inherits the variable:
