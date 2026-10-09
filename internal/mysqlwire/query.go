@@ -705,25 +705,21 @@ var (
 // lengths and the rest are NULL rather than guessed.
 func handleInfoSchemaColumns(sql string, sess localSession) (*mysql.Result, error) {
 	items := selectItems(sql, infoSchemaColumnsStar)
-	admit := infoSchemaFilter(sql)
+	admit := infoSchemaFilter(sql, infoSchemaColumnsStar)
 	var rows [][]any
-	if admit("table_schema", sess.dbName) {
-		for _, t := range sess.schema {
-			if !admit("table_name", t.Name) {
+	for _, t := range sess.schema {
+		for ord, col := range t.Columns {
+			get := func(field string) any {
+				return infoSchemaColumnValue(field, sess.dbName, t.Name, ord+1, col)
+			}
+			if !admit(get) {
 				continue
 			}
-			for ord, col := range t.Columns {
-				if !admit("column_name", col.Name) {
-					continue
-				}
-				row := make([]any, len(items))
-				for j, it := range items {
-					row[j] = it.eval(func(field string) any {
-						return infoSchemaColumnValue(field, sess.dbName, t.Name, ord+1, col)
-					})
-				}
-				rows = append(rows, row)
+			row := make([]any, len(items))
+			for j, it := range items {
+				row[j] = it.eval(get)
 			}
+			rows = append(rows, row)
 		}
 	}
 	return resultOf(itemNames(items), rows)
@@ -825,15 +821,14 @@ func (it selectItem) eval(get func(field string) any) any {
 }
 
 // infoSchemaFilter compiles the WHERE clause of a catalog query into a
-// predicate saying whether a row whose field has the given value is admitted.
-// It understands `field = 'v'`, `field IN ('v', ...)` and `field LIKE 'p'` on
-// table_schema, table_name and column_name, bare or qualified, joined by AND:
-// the forms TablePlus, DBeaver and Connector/J use. Comparisons are
-// case-insensitive like the real server's. Any other condition is ignored,
-// and a clause with an OR admits everything, so a client is never answered
-// with fewer rows than it asked for.
-func infoSchemaFilter(sql string) func(field, value string) bool {
-	accept := func(string, string) bool { return true }
+// predicate saying whether a row is admitted. It understands `field = 'v'`,
+// `field IN ('v', ...)` and `field LIKE 'p'` on any of the given columns, bare
+// or qualified, joined by AND: the forms TablePlus, DBeaver and Connector/J
+// use. Comparisons are case-insensitive like the real server's, and a NULL
+// field satisfies none of them. Any other condition is ignored, and a clause
+// with an OR admits everything.
+func infoSchemaFilter(sql string, columns []string) func(get func(field string) any) bool {
+	accept := func(func(string) any) bool { return true }
 	red := strings.ToLower(sqltext.MySQL.Redact(sql))
 	at := -1
 	for i, depth := 0, 0; i < len(red) && at < 0; i++ {
@@ -852,7 +847,11 @@ func infoSchemaFilter(sql string) func(field, value string) bool {
 		return accept
 	}
 
-	conds := map[string][]func(string) bool{}
+	type cond struct {
+		field string
+		test  func(string) bool
+	}
+	var conds []cond
 	toks := lexTokens(sql[at:])
 	isIdent := func(t token) bool { return t.kind == tokWord || t.kind == tokQuoted }
 	for i := 0; i < len(toks); i++ {
@@ -871,9 +870,7 @@ func infoSchemaFilter(sql string) func(field, value string) bool {
 		if j >= len(toks) {
 			break
 		}
-		switch field {
-		case "table_schema", "table_name", "column_name":
-		default:
+		if !slices.ContainsFunc(columns, func(c string) bool { return strings.EqualFold(c, field) }) {
 			continue
 		}
 		var test func(string) bool
@@ -905,11 +902,12 @@ func infoSchemaFilter(sql string) func(field, value string) bool {
 		default:
 			continue
 		}
-		conds[field] = append(conds[field], test)
+		conds = append(conds, cond{field, test})
 	}
-	return func(field, value string) bool {
-		for _, test := range conds[field] {
-			if !test(value) {
+	return func(get func(field string) any) bool {
+		for _, c := range conds {
+			v := get(c.field)
+			if v == nil || !c.test(fmt.Sprint(v)) {
 				return false
 			}
 		}

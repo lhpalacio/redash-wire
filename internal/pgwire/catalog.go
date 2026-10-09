@@ -35,12 +35,13 @@ func HandleCatalogQuery(conn io.Writer, sql string, schema []redash.SchemaTable,
 		return handlePgAttribute(conn, sql, schema)
 	case sqltext.ContainsToken(lower, "pg_class"):
 		return handlePgClassQuery(conn, sql, schema)
+	// Ahead of pg_namespace, which type and function listings join.
+	case sqltext.ContainsToken(lower, "pg_type"), sqltext.ContainsToken(lower, "pg_enum"):
+		return SendEmptyResult(conn, outputNames(requestedColumns(sql, []selCol{{output: "oid"}, {output: "typname"}})))
+	case sqltext.ContainsToken(lower, "pg_proc"):
+		return SendEmptyResult(conn, outputNames(requestedColumns(sql, []selCol{{output: "oid"}, {output: "proname"}})))
 	case sqltext.ContainsToken(lower, "pg_namespace"):
 		return handlePgNamespaceQuery(conn)
-	case sqltext.ContainsToken(lower, "pg_type"):
-		return SendEmptyResult(conn, []string{"oid", "typname"})
-	case sqltext.ContainsToken(lower, "pg_proc"):
-		return SendEmptyResult(conn, []string{"oid", "proname"})
 	case !sqltext.ContainsToken(lower, "from"):
 		// A FROM-less SELECT of catalog functions (psql fetches a table's comment
 		// this way) always yields exactly one row; an empty result would make a

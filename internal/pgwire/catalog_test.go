@@ -142,6 +142,41 @@ func TestHandleCatalogQuery(t *testing.T) {
 	}
 }
 
+func TestHandleCatalogQuery_TypesAndFunctionsJoinedToNamespace(t *testing.T) {
+	schema := []redash.SchemaTable{{Name: "users", Columns: []redash.SchemaColumn{{Name: "id"}}}}
+	tests := []struct {
+		name     string
+		sql      string
+		wantCols []string
+	}{
+		{
+			name:     "TablePlus enum labels",
+			sql:      "SELECT t.oid AS type_oid,n.nspname AS schema_name, t.typname AS type_name,e.enumlabel AS type_define FROM pg_type t JOIN pg_enum e ON e.enumtypid=t.oid JOIN pg_namespace n ON t.typnamespace = n.oid ORDER BY e.enumsortorder;",
+			wantCols: []string{"type_oid", "schema_name", "type_name", "type_define"},
+		},
+		{
+			name:     "TablePlus functions",
+			sql:      "SELECT pg_catalog.pg_get_userbyid(p.proowner) as owner,p.oid AS oid,n.nspname AS function_schema,p.proname AS function_name,CASE WHEN p.proisagg THEN'aggregate'WHEN p.prorettype='pg_catalog.trigger'::pg_catalog.regtype THEN'trigger'ELSE'function'END AS function_type FROM pg_catalog.pg_proc p LEFT JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace;",
+			wantCols: []string{"owner", "oid", "function_schema", "function_name", "function_type"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := HandleCatalogQuery(&buf, tt.sql, schema, nil); err != nil {
+				t.Fatal(err)
+			}
+			cols, rows := collectResult(t, &buf)
+			if !reflect.DeepEqual(cols, tt.wantCols) {
+				t.Errorf("columns = %v, want %v", cols, tt.wantCols)
+			}
+			if len(rows) != 0 {
+				t.Errorf("rows = %v, want none", rows)
+			}
+		})
+	}
+}
+
 func collectResult(t *testing.T, buf *bytes.Buffer) (cols []string, rows [][]string) {
 	t.Helper()
 	fe := pgproto3.NewFrontend(buf, nil)
