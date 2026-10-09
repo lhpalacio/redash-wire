@@ -277,17 +277,6 @@ enum RedashHealth: Equatable {
         let digits = reason[marker.upperBound...].prefix(while: \.isNumber)
         return digits.isEmpty ? nil : Int(digits)
     }
-
-    var remedy: String? {
-        switch self {
-        case .checking, .ok:
-            return nil
-        case .unreachable:
-            return "Check your VPN or network. Retrying automatically."
-        case .rejected:
-            return "Check the profile's API key and URL."
-        }
-    }
 }
 
 struct LogEvent: Identifiable, Equatable {

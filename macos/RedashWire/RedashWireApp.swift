@@ -43,7 +43,9 @@ private struct MenuBarLabel: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Image(systemName: symbolName)
+        let summary = supervisor.statusSummary()
+        Image(systemName: Self.symbolName(for: summary.tone, state: supervisor.state))
+            .accessibilityLabel("redash-wire: \(summary.headline)")
             .task {
                 await model.start()
                 // Only for a missing file. A config that will not parse, or a
@@ -60,20 +62,21 @@ private struct MenuBarLabel: View {
     /// difference — the symbol has to. A proxy that is up but cut off from Redash
     /// gets its own, because leaving it looking healthy is the thing that made a
     /// disconnected VPN invisible until a query failed.
-    private var symbolName: String {
-        switch supervisor.state {
-        case .running(_, .ok):
+    private static func symbolName(for tone: StatusSummary.Tone, state: ProxySupervisor.State) -> String {
+        switch tone {
+        case .ok:
             return "bolt.horizontal.circle.fill"
-        case .running(_, .unreachable):
+        case .idle:
+            return "bolt.horizontal.circle"
+        case .busy:
+            return "arrow.triangle.2.circlepath.circle"
+        case .warning:
             return "bolt.slash.circle.fill"
-        case .running(_, .rejected):
+        case .error:
+            if case .gaveUp(.unreachable) = state {
+                return "bolt.slash.circle"
+            }
             return "exclamationmark.triangle.fill"
-        case .starting, .running(_, .checking):
-            return "bolt.horizontal.circle"
-        case .failed:
-            return "exclamationmark.triangle.fill"
-        case .stopped:
-            return "bolt.horizontal.circle"
         }
     }
 }

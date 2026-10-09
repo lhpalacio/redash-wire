@@ -1,16 +1,6 @@
 import AppKit
 import SwiftUI
 
-extension String {
-    /// An NSMenu item is a single line that never wraps: the menu widens to fit
-    /// the longest one, so anything that came from an error or from the config
-    /// has to be bounded before it gets here.
-    func fittedToMenu(limit: Int = 64) -> String {
-        guard count > limit else { return self }
-        return prefix(limit - 1).trimmingCharacters(in: .whitespaces) + "…"
-    }
-}
-
 /// The `.menu` style renders a real NSMenu, so this is limited to Text, Button,
 /// Toggle, Divider and nested Menu.
 ///
@@ -47,39 +37,18 @@ struct MenuBarView: View {
 
     @ViewBuilder
     private var statusSection: some View {
+        let summary = supervisor.statusSummary()
         Label {
-            Text(statusLine)
+            Text(headline(for: summary))
         } icon: {
-            Image(nsImage: Self.dot(Self.statusColor(for: supervisor.state)))
+            Image(nsImage: Self.dot(Self.color(for: summary.tone)))
                 .renderingMode(.original)
         }
-
-        if case .failed(let reason) = supervisor.state {
-            Text(reason.fittedToMenu())
-            showLogsButton
-        } else if case .running(_, .checking) = supervisor.state {
-            Text("Waiting for the first answer from Redash…")
-        } else if let health = supervisor.state.health, !health.isOK {
-            // The listeners are bound but nothing behind them can be served, so
-            // the addresses would be a lie. Show the cause and the fix instead.
-            if let summary = health.summary {
-                Text(summary)
-            }
-            if let remedy = health.remedy {
-                Text(remedy)
-            }
-            if let line = retryLine {
-                Text(line)
-            }
-            showLogsButton
-        } else if supervisor.state.isRunning, let profile = supervisor.activeProfile {
-            // The process's own copy of the profile: the one on disk may say
-            // something else by now, and these ports are the ones that answer.
-            ForEach(listenerLines(for: profile), id: \.self) { line in
-                Text(line)
-            }
-        } else if supervisor.state.isBusy, let restart = supervisor.pendingRestart {
-            Text("Restarting in \(Self.countdown(to: restart.at)) (attempt \(restart.attempt) of \(restart.limit))")
+        ForEach(summary.details, id: \.self) { line in
+            Text(line)
+        }
+        ForEach(summary.actions, id: \.self) { action in
+            button(for: action)
         }
 
         if let hint = model.runningProfileDrift.flatMap(driftHint) {
@@ -92,14 +61,35 @@ struct MenuBarView: View {
 
         if let error = model.configError {
             Text(error.message.fittedToMenu())
-            if let remedy = error.remedy {
-                Text(remedy)
+            if !summary.actions.contains(.editConfiguration) {
+                button(for: .editConfiguration)
             }
+        }
+    }
+
+    @ViewBuilder
+    private func button(for action: StatusSummary.Action) -> some View {
+        switch action {
+        case .retry:
+            Button {
+                Task { await model.retry() }
+            } label: {
+                Label("Retry", systemImage: "arrow.clockwise")
+            }
+        case .checkNow:
+            Button {
+                supervisor.checkNow()
+            } label: {
+                Label("Check Now", systemImage: "arrow.clockwise")
+            }
+        case .editConfiguration:
             Button {
                 openSettings()
             } label: {
-                Label("Edit Configuration…", systemImage: "gearshape")
+                Label("Edit Configuration…", systemImage: "doc.text")
             }
+        case .showLogs:
+            showLogsButton
         }
     }
 
@@ -130,40 +120,25 @@ struct MenuBarView: View {
         }
     }
 
-    private var statusLine: String {
-        var name = (model.describedProfileName ?? "no profile").fittedToMenu(limit: 24)
+    private func headline(for summary: StatusSummary) -> String {
+        guard let name = model.describedProfileName else { return summary.headline }
+        var line = "\(summary.headline) · \(name.fittedToMenu(limit: 24))"
         if model.describedReadOnly {
-            name += " · read-only"
+            line += " · read-only"
         }
-        switch supervisor.state {
-        case .stopped:
-            return "Stopped — \(name)"
-        case .starting:
-            return "Starting — \(name)"
-        case .running(let since, .ok):
-            return "Running — \(name) (\(Self.uptime(since: since)))"
-        case .running(_, .checking):
-            return "Checking Redash — \(name)"
-        case .running(_, .unreachable):
-            return "Redash unreachable — \(name)"
-        case .running(_, .rejected):
-            return "Redash rejected the API key — \(name)"
-        case .failed:
-            return "Failed — \(name)"
-        }
+        return line
     }
 
     /// Stopped is grey, not red: you stopped it on purpose. Amber separates a
     /// Redash that should come back on its own from a red one that needs you to
     /// go and change something.
-    private static func statusColor(for state: ProxySupervisor.State) -> NSColor {
-        switch state {
-        case .stopped: return .systemGray
-        case .starting, .running(_, .checking): return .systemYellow
-        case .running(_, .ok): return .systemGreen
-        case .running(_, .unreachable): return .systemOrange
-        case .running(_, .rejected): return .systemRed
-        case .failed: return .systemRed
+    private static func color(for tone: StatusSummary.Tone) -> NSColor {
+        switch tone {
+        case .idle: return .systemGray
+        case .busy: return .systemYellow
+        case .ok: return .systemGreen
+        case .warning: return .systemOrange
+        case .error: return .systemRed
         }
     }
 
@@ -181,38 +156,6 @@ struct MenuBarView: View {
         return image
     }
 
-    private func listenerLines(for profile: Profile) -> [String] {
-        var lines: [String] = []
-        if !profile.postgresListenAddr.isEmpty {
-            lines.append("PostgreSQL  \(profile.postgresListenAddr)")
-        }
-        if !profile.mysqlListenAddr.isEmpty {
-            lines.append("MySQL  \(profile.mysqlListenAddr)")
-        }
-        return lines
-    }
-
-    /// Computed when the menu opens, like the uptime above it; see `nextProbeAt`
-    /// for why it does not tick. Once the count reaches zero the probe is in
-    /// flight for up to its timeout, which is not a number.
-    private var retryLine: String? {
-        guard let at = supervisor.nextProbeAt else { return nil }
-        return at.timeIntervalSinceNow > 0.5 ? "Retrying in \(Self.countdown(to: at))" : "Retrying now…"
-    }
-
-    private static func countdown(to date: Date) -> String {
-        let seconds = max(0, Int(date.timeIntervalSinceNow.rounded(.up)))
-        if seconds < 60 { return "\(seconds)s" }
-        return "\(seconds / 60)m \(seconds % 60)s"
-    }
-
-    private static func uptime(since: Date) -> String {
-        let seconds = Int(Date().timeIntervalSince(since))
-        if seconds < 60 { return "\(seconds)s" }
-        if seconds < 3600 { return "\(seconds / 60)m" }
-        return "\(seconds / 3600)h \((seconds % 3600) / 60)m"
-    }
-
 
     @ViewBuilder
     private var controlSection: some View {
@@ -226,14 +169,6 @@ struct MenuBarView: View {
             Label(stopping ? "Stop" : "Start", systemImage: stopping ? "stop.fill" : "play.fill")
         }
         .disabled(!stopping && model.selectedProfile == nil)
-
-        if case .failed = supervisor.state {
-            Button {
-                Task { await model.retry() }
-            } label: {
-                Label("Retry", systemImage: "arrow.clockwise")
-            }
-        }
 
         // The lock for the selected profile. One the config already locks shows
         // checked and greyed: the menu can add a lock, never remove the file's.

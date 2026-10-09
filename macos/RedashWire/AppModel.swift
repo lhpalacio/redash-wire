@@ -202,7 +202,7 @@ final class AppModel: ObservableObject {
         // A failed proxy is the one whose config you were editing to fix, and
         // reloading is the moment to find out whether it worked. A stopped one
         // stays stopped: that was a choice, not a failure.
-        if case .failed = supervisor.state, let profile = selectedProfile {
+        if supervisor.state.isAwaitingRetry, let profile = selectedProfile {
             await supervisor.start(profile: profile, readOnly: isReadOnly(profile))
             return
         }

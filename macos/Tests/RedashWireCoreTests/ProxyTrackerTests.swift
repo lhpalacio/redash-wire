@@ -233,6 +233,57 @@ final class ProxyTrackerTests: XCTestCase {
         XCTAssertEqual(tracker.state, .failed("loading config: no such profile"),
                        "a structured error outranks plain text that is not a crash")
     }
+
+    func testAStartThatNeverReachesRedashGivesUpAfterItsWindow() {
+        var tracker = ProxyTracker()
+        tracker.start(profile())
+        tracker.record(event(WireEvent.listenerReady), now: t0)
+        tracker.record(event(WireEvent.redashDown, level: .error, fields: ["kind": "unreachable", "error": "dial tcp: i/o timeout", "retry_in_seconds": "10"]), now: t0)
+
+        XCTAssertNil(tracker.giveUpReason(now: t0.addingTimeInterval(ProxyTracker.giveUpAfter - 1)))
+        let reason = tracker.giveUpReason(now: t0.addingTimeInterval(ProxyTracker.giveUpAfter))
+        XCTAssertEqual(reason, .unreachable("dial tcp: i/o timeout"))
+
+        tracker.gaveUp(reason!)
+        XCTAssertEqual(tracker.state, .gaveUp(.unreachable("dial tcp: i/o timeout")))
+        XCTAssertFalse(tracker.state.isActive, "a proxy that gave up has nothing for Stop to act on")
+        XCTAssertTrue(tracker.state.isAwaitingRetry)
+    }
+
+    func testARejectedKeyGivesUpWithoutWaiting() {
+        var tracker = ProxyTracker()
+        tracker.start(profile())
+        tracker.record(event(WireEvent.listenerReady), now: t0)
+        tracker.record(event(WireEvent.redashDown, level: .error, fields: ["kind": "rejected", "error": "status 401", "retry_in_seconds": "300"]), now: t0)
+
+        XCTAssertEqual(tracker.giveUpReason(now: t0), .rejected("status 401"))
+    }
+
+    func testAnOutageAfterRedashAnsweredIsWaitedOutEvenAcrossACrash() {
+        // Open sessions survive an outage only while the proxy stays up.
+        var tracker = running()
+        let down = event(WireEvent.redashDown, level: .error, fields: ["kind": "unreachable", "error": "down", "retry_in_seconds": "10"])
+        tracker.record(down, now: t0)
+        XCTAssertNil(tracker.giveUpReason(now: t0.addingTimeInterval(3600)))
+
+        _ = tracker.exit(status: 2, stopRequested: false, now: t0)
+        tracker.launch(profile())
+        tracker.record(event(WireEvent.listenerReady), now: t0)
+        tracker.record(down, now: t0)
+        XCTAssertNil(tracker.giveUpReason(now: t0.addingTimeInterval(3600)), "a crash restart is not a fresh start")
+    }
+
+    func testAManualStartGetsAFreshWindow() {
+        var tracker = ProxyTracker()
+        tracker.start(profile())
+        tracker.record(event(WireEvent.listenerReady), now: t0)
+        tracker.gaveUp(.unreachable("down"))
+
+        let t1 = t0.addingTimeInterval(600)
+        tracker.start(profile())
+        tracker.record(event(WireEvent.listenerReady), now: t1)
+        XCTAssertNil(tracker.giveUpReason(now: t1.addingTimeInterval(ProxyTracker.giveUpAfter - 1)))
+    }
 }
 
 final class LogEventTests: XCTestCase {
@@ -287,10 +338,9 @@ final class RedashHealthTests: XCTestCase {
         XCTAssertTrue(summary?.localizedCaseInsensitiveContains("timed out") ?? false)
     }
 
-    func testARejectionNamesTheStatusAndPointsAtTheKey() {
+    func testARejectionNamesTheStatus() {
         let health = RedashHealth(kind: "rejected", reason: "data sources request failed (status 401)")
         XCTAssertTrue(health.summary?.contains("401") ?? false)
-        XCTAssertTrue(health.remedy?.localizedCaseInsensitiveContains("key") ?? false)
     }
 
     func testAnUnrecognisedReasonSaysOnlyWhatIsCertain() {

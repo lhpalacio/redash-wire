@@ -12,6 +12,9 @@ struct ProxyTracker: Equatable {
         /// behind them can be served. The two are separate facts, and conflating
         /// them is what let the menu show green while every query failed.
         case running(since: Date, redash: RedashHealth)
+        /// Stopped by the app after a start that never reached Redash: the
+        /// listeners are closed, and the reason is the last thing Redash said.
+        case gaveUp(RedashHealth)
         case failed(String)
 
         var isRunning: Bool {
@@ -20,6 +23,15 @@ struct ProxyTracker: Equatable {
         }
 
         var isBusy: Bool { self == .starting }
+
+        /// Stopped by a problem rather than by you, so a reload or Retry is
+        /// what brings it back.
+        var isAwaitingRetry: Bool {
+            switch self {
+            case .failed, .gaveUp: return true
+            default: return false
+            }
+        }
 
         /// Up, or on its way up: there is a process, or a restart timer about
         /// to spawn one. What Stop has to act on, whatever the config says.
@@ -62,6 +74,11 @@ struct ProxyTracker: Equatable {
     /// Its length is also the attempt limit.
     static let backoffDelays: [Duration] = [.seconds(1), .seconds(2), .seconds(4)]
 
+    /// How long a start keeps trying to reach Redash before the app stops it.
+    /// Once Redash has answered, an outage is waited out instead: the proxy
+    /// stays up so open sessions survive, and the daemon slows its probes.
+    static let giveUpAfter: TimeInterval = 120
+
     /// A proxy that served this long before dying has proved the last restart
     /// worked, so its next crash starts a new streak. The budget used to reset
     /// the moment the listeners bound, which let a proxy that bound and died a
@@ -81,6 +98,19 @@ struct ProxyTracker: Equatable {
     /// Bound listeners are what make the proxy usable, and what make a later
     /// exit a crash rather than a failure to start.
     private(set) var reachedReady = false
+
+    /// Whether Redash has answered since the last manual start. A crash restart
+    /// keeps it, so a proxy that served all day is not given up on as if it
+    /// had just been launched.
+    private(set) var everConnected = false
+
+    /// When a start that has not reached Redash stops trying, counted from the
+    /// moment the listeners bind. Nil once Redash has answered.
+    private(set) var giveUpAt: Date?
+
+    /// Probes that failed since Redash last answered, for the menu's "tried N
+    /// times". Outside the snapshot for the same reason as `nextProbeAt`.
+    private(set) var failedProbes = 0
 
     /// The latest health the daemon reported, held here because it can arrive
     /// before or after the listeners bind, and applied whenever the state is
@@ -109,6 +139,8 @@ struct ProxyTracker: Equatable {
     /// born exhausted.
     mutating func start(_ profile: Profile, readOnly: Bool = false) {
         restartAttempts = 0
+        everConnected = false
+        giveUpAt = nil
         launch(profile, readOnly: readOnly)
     }
 
@@ -126,6 +158,7 @@ struct ProxyTracker: Equatable {
         firstRawLine = nil
         snapshot.dataSources = []
         nextProbeAt = nil
+        failedProbes = 0
         snapshot.pendingRestart = nil
         snapshot.state = .starting
     }
@@ -157,6 +190,9 @@ struct ProxyTracker: Equatable {
             if !reachedReady && seenListeners >= max(expectedListeners, 1) {
                 reachedReady = true
                 snapshot.state = .running(since: now, redash: reportedHealth)
+                if !everConnected && giveUpAt == nil {
+                    giveUpAt = now.addingTimeInterval(Self.giveUpAfter)
+                }
             }
 
         case WireEvent.redashDown:
@@ -165,14 +201,19 @@ struct ProxyTracker: Equatable {
                 reason: event.fields["error"] ?? event.message
             )
             nextProbeAt = Self.retryDate(from: event, now: now)
+            failedProbes += 1
             applyHealth()
 
         case WireEvent.redashRetry:
             nextProbeAt = Self.retryDate(from: event, now: now)
+            failedProbes += 1
 
         case WireEvent.redashUp:
             reportedHealth = .ok
             nextProbeAt = nil
+            failedProbes = 0
+            everConnected = true
+            giveUpAt = nil
             applyHealth()
 
         case WireEvent.dataSources:
@@ -232,12 +273,36 @@ struct ProxyTracker: Equatable {
         return .restart(profile, readOnly: snapshot.activeReadOnly, after: delay)
     }
 
+    /// Why the app should stop this start, or nil to keep going. A rejected key
+    /// will not fix itself, so there is no point waiting it out; anything else
+    /// gets until `giveUpAt`. Never once Redash has answered.
+    func giveUpReason(now: Date) -> RedashHealth? {
+        guard !everConnected, case .running(_, let health) = snapshot.state else { return nil }
+        switch health {
+        case .ok:
+            return nil
+        case .rejected:
+            return health
+        case .checking, .unreachable:
+            guard let giveUpAt, now >= giveUpAt else { return nil }
+            return health
+        }
+    }
+
+    /// The app stopped the process for `giveUpReason`. Called once the stop
+    /// has completed, so the exit is not mistaken for a crash.
+    mutating func gaveUp(_ health: RedashHealth) {
+        stopped()
+        snapshot.state = .gaveUp(health)
+    }
+
     /// A requested stop has completed, or there was nothing running to stop.
     mutating func stopped() {
         reachedReady = false
         seenListeners = 0
         snapshot.dataSources = []
         nextProbeAt = nil
+        giveUpAt = nil
         snapshot.pendingRestart = nil
         snapshot.state = .stopped
     }

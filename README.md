@@ -172,14 +172,18 @@ you can:
   links, like TablePlus.
 - Copy the proxy username and password. A copied password leaves the clipboard
   after 60 seconds.
-- See whether Redash is answering. A dropped VPN shows within about fifteen
-  seconds.
+- See whether Redash is answering, in plain words with the fix next to it. A
+  dropped VPN shows within about fifteen seconds. A start that can't reach
+  Redash keeps trying for 2 minutes, then stops and tries again when the
+  network changes; a rejected API key stops it at once. Once Redash has
+  answered, an outage is waited out so open sessions survive.
 - Follow the proxy's log stream, filtered by level and text.
 - Turn on launch at login, check for a new release, edit `config.yaml`, and
   reload it.
 
 The status dot and the menu bar icon show the proxy's state: grey stopped,
-yellow starting, green running, amber cut off from Redash, red failed.
+yellow connecting, green running, amber offline after it had been working, red
+when something needs you.
 
 Build it with `make macos`, or `make macos-run` to build and open it. That
 needs full Xcode 16 or newer, not just the Command Line Tools. The app is
