@@ -35,6 +35,7 @@ final class AppModel: ObservableObject {
     let cli: WireCLI
     let supervisor: ProxySupervisor
     let updates = UpdateChecker()
+    let notifier: Notifier
 
     private var watcher: ConfigWatcher?
     private var updateTask: Task<Void, Never>?
@@ -43,6 +44,7 @@ final class AppModel: ObservableObject {
     init(cli: WireCLI = .standard()) {
         self.cli = cli
         self.supervisor = ProxySupervisor(cli: cli)
+        self.notifier = Notifier(supervisor: supervisor)
         self.readOnlyPreferences = UserDefaults.standard.dictionary(forKey: Self.readOnlyPreferencesKey) as? [String: Bool] ?? [:]
         self.verboseLogging = UserDefaults.standard.bool(forKey: Self.verboseLoggingKey)
         supervisor.verboseLogging = verboseLogging
@@ -210,6 +212,7 @@ final class AppModel: ObservableObject {
 
         await reloadConfig()
         binaryVersion = await cli.version()
+        notifier.requestAuthorization()
 
         // A menu bar app launched at login exists to have the proxy up. Under
         // -wait-for-redash a missing VPN is a state the menu shows, not a reason

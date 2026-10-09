@@ -23,7 +23,7 @@ struct RedashWireApp: App {
         .windowResizability(.contentSize)
 
         Window("redash-wire Settings", id: "settings") {
-            SettingsView(model: delegate.model, supervisor: delegate.model.supervisor, updates: delegate.model.updates)
+            SettingsView(model: delegate.model, supervisor: delegate.model.supervisor, updates: delegate.model.updates, notifier: delegate.model.notifier)
         }
         .windowResizability(.contentSize)
         .commands {

@@ -96,3 +96,32 @@ final class StatusSummaryTests: XCTestCase {
         XCTAssertTrue(summary.actions.contains(.showLogs), "the full trace is in the log")
     }
 }
+
+final class StatusAlertTests: XCTestCase {
+    private let running = StatusSummary(tone: .ok, headline: "Running")
+    private let offline = StatusSummary(tone: .warning, headline: "Redash offline")
+    private let connecting = StatusSummary(tone: .busy, headline: "Connecting to Redash…")
+    private let stopped = StatusSummary(tone: .idle, headline: "Stopped")
+    private let gaveUp = StatusSummary(tone: .error, headline: "Can't reach Redash")
+    private let portInUse = StatusSummary(tone: .error, headline: "Port 15432 is already in use")
+
+    func testGoingOfflineIsHeldBackAndCancelledByRecovery() {
+        XCTAssertEqual(StatusAlert.changes(from: running, to: offline), [.offline])
+        XCTAssertEqual(StatusAlert.changes(from: offline, to: running), [.backOnline])
+    }
+
+    func testStoppingWhileOfflineCancelsWithoutAWord() {
+        XCTAssertEqual(StatusAlert.changes(from: offline, to: stopped), [.cancelOffline])
+    }
+
+    func testAProblemThatNeedsYouIsAlertedOncePerProblem() {
+        XCTAssertEqual(StatusAlert.changes(from: connecting, to: gaveUp), [.needsAttention])
+        XCTAssertEqual(StatusAlert.changes(from: gaveUp, to: gaveUp), [])
+        XCTAssertEqual(StatusAlert.changes(from: gaveUp, to: portInUse), [.needsAttention])
+    }
+
+    func testAnOrdinaryStartIsSilent() {
+        XCTAssertEqual(StatusAlert.changes(from: stopped, to: connecting), [])
+        XCTAssertEqual(StatusAlert.changes(from: connecting, to: running), [])
+    }
+}

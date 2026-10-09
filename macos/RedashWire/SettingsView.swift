@@ -8,6 +8,7 @@ struct SettingsView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var supervisor: ProxySupervisor
     @ObservedObject var updates: UpdateChecker
+    @ObservedObject var notifier: Notifier
 
     var body: some View {
         TabView {
@@ -42,6 +43,18 @@ struct SettingsView: View {
                 if let error = model.launchAtLoginError {
                     Text(error)
                         .foregroundStyle(.red)
+                }
+            }
+
+            Section("Notifications") {
+                Toggle("Tell me when Redash goes offline or the proxy needs attention", isOn: $notifier.isEnabled)
+                if notifier.isEnabled && notifier.isDenied {
+                    HStack {
+                        Text("Notifications are off for redash-wire in System Settings.")
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Open…") { notifier.openSystemSettings() }
+                    }
                 }
             }
 

@@ -177,6 +177,9 @@ you can:
   Redash keeps trying for 2 minutes, then stops and tries again when the
   network changes; a rejected API key stops it at once. Once Redash has
   answered, an outage is waited out so open sessions survive.
+- Get a notification when Redash has been offline for 30 seconds (and when it
+  is back), or when the proxy gives up, is refused, or fails. Settings turns
+  them off.
 - Follow the proxy's log stream, filtered by level and text.
 - Open Settings (⌘,) to turn on launch at login and the daily update check,
   see every profile with its listeners, lock and any config error, open

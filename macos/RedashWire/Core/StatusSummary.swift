@@ -155,3 +155,34 @@ struct StatusSummary: Equatable {
         return "\(seconds / 60)m \(seconds % 60)s"
     }
 }
+
+/// Which status changes are worth a notification. Only the ones that need you
+/// or that you would want to know about while not looking at the menu, and not
+/// a blip: going offline is posted late, so a VPN that reconnects within the
+/// delay cancels it before it shows.
+enum StatusAlert: Equatable {
+    /// Posted after `offlineDelay` unless cancelled.
+    case offline
+    /// Cancels a pending `.offline`, and says so if it already showed.
+    case backOnline
+    /// Cancels a pending `.offline` without a word: you stopped it, or it
+    /// moved on to a problem that gets its own alert.
+    case cancelOffline
+    case needsAttention
+
+    static let offlineDelay: TimeInterval = 30
+
+    static func changes(from old: StatusSummary, to new: StatusSummary) -> [StatusAlert] {
+        var alerts: [StatusAlert] = []
+        if old.tone != .warning && new.tone == .warning {
+            alerts.append(.offline)
+        }
+        if old.tone == .warning && new.tone != .warning {
+            alerts.append(new.tone == .ok ? .backOnline : .cancelOffline)
+        }
+        if new.tone == .error && (old.tone != .error || old.headline != new.headline) {
+            alerts.append(.needsAttention)
+        }
+        return alerts
+    }
+}
