@@ -415,6 +415,26 @@ func TestFailedProbesSayWhenTheNextOneIs(t *testing.T) {
 	}
 }
 
+func TestAnOutageAfterServingBacksOff(t *testing.T) {
+	lister := &stubLister{results: []listResult{{sources: sources()}, {err: errors.New("dial tcp: i/o timeout")}}}
+	logger, log := newCapture()
+	checker := health.NewChecker(lister, redash.NewSwappableRegistry(nil), health.NewGate(), logger,
+		health.WithInterval(10*time.Second), health.WithMaxOfflineInterval(2*time.Minute))
+
+	for range 8 {
+		checker.Probe(context.Background())
+	}
+
+	var got []any
+	for _, e := range append(log.events(health.EventRedashDown), log.events(health.EventRedashRetry)...) {
+		got = append(got, e["retry_in_seconds"])
+	}
+	want := []any{float64(10), float64(20), float64(40), float64(80), float64(120), float64(120)}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("retry_in_seconds = %v, want %v", got, want)
+	}
+}
+
 func TestARejectedKeyCountsDownToTheLongBackoff(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)

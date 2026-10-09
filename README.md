@@ -114,7 +114,8 @@ whatever the profile says).
 The proxy checks Redash every 10 seconds, so a data source added while it runs
 shows up without a restart. When Redash stops answering, the proxy refuses new
 sessions and answers queries on open ones with the reason, then serves again
-once Redash is back. `kill -USR1 $(pgrep redash-wire)` forces a check.
+once Redash is back. While it stays away, the checks slow down, doubling up to
+one every 2 minutes. `kill -USR1 $(pgrep redash-wire)` forces a check.
 
 Subcommands answer a question and exit, for scripts and supervisors:
 
