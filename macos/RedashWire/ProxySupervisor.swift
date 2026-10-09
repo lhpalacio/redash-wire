@@ -62,6 +62,15 @@ final class ProxySupervisor: ObservableObject {
     private var restartTask: Task<Void, Never>?
     private var giveUpTask: Task<Void, Never>?
     private var scheduledGiveUp: Date?
+    /// Set while a give-up's stop is in flight, so the exit lands straight in
+    /// gaveUp. Passing through stopped published a state of its own, and a
+    /// rejected key was notified twice.
+    private var pendingGiveUp: RedashHealth?
+
+    /// Brings back a start that gave up, when the network changes. The model
+    /// supplies it because the restart needs the profile and lock as they are
+    /// now, not as they were at the launch that gave up.
+    var retryAfterGivingUp: (() async -> Void)?
     private var pathWatcher: NetworkPathWatcher?
 
     /// Bumped per spawn and carried by everything a process reports back. stderr
@@ -193,11 +202,11 @@ final class ProxySupervisor: ObservableObject {
     /// kills a process.
     ///
     /// A start that gave up is tried again: the VPN it was waiting for may be
-    /// what just came up.
+    /// what just came up. That includes a rejection, since a firewall that
+    /// only admits the VPN answers 403 until it is up.
     private func networkPathChanged() {
-        if case .gaveUp(.unreachable) = state, let profile = activeProfile {
-            let readOnly = activeReadOnly
-            Task { await start(profile: profile, readOnly: readOnly) }
+        if case .gaveUp = state, let retry = retryAfterGivingUp {
+            Task { await retry() }
             return
         }
         checkNow()
@@ -207,14 +216,15 @@ final class ProxySupervisor: ObservableObject {
     /// every line and at the deadline itself, since a probe that hangs writes
     /// nothing.
     private func giveUpIfDue() {
-        guard let health = tracker.giveUpReason(now: Date()) else { return }
+        guard tracker.giveUpReason(now: Date()) != nil else { return }
         let generation = self.generation
         Task {
             await enqueue {
-                guard generation == self.generation, self.process != nil else { return }
+                // Asked again: Redash may have answered while this waited its turn.
+                guard generation == self.generation, self.process != nil,
+                      let health = self.tracker.giveUpReason(now: Date()) else { return }
+                self.pendingGiveUp = health
                 await self.stopNow()
-                self.tracker.gaveUp(health)
-                self.publish()
             }
         }
     }
@@ -234,6 +244,7 @@ final class ProxySupervisor: ObservableObject {
 
     private func spawn(_ profile: Profile, readOnly: Bool) {
         stopRequested = false
+        pendingGiveUp = nil
         lineBuffer.removeAll()
         exitStatus = nil
         stderrDrained = false
@@ -336,7 +347,14 @@ final class ProxySupervisor: ObservableObject {
         process = nil
         stdinPipe = nil
 
-        let outcome = tracker.exit(status: status, stopRequested: stopRequested, now: Date())
+        let outcome: ProxyTracker.Exit
+        if let health = pendingGiveUp {
+            pendingGiveUp = nil
+            tracker.gaveUp(health)
+            outcome = .stopped
+        } else {
+            outcome = tracker.exit(status: status, stopRequested: stopRequested, now: Date())
+        }
         stopRequested = false
         publish()
 

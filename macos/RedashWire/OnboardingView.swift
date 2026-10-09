@@ -4,7 +4,6 @@ import SwiftUI
 /// that writes the config file.
 struct OnboardingView: View {
     @ObservedObject var model: AppModel
-    @Environment(\.dismiss) private var dismiss
 
     @State private var redashURL = ""
     @State private var profileName = "default"
@@ -109,7 +108,7 @@ struct OnboardingView: View {
             }
             HStack {
                 Spacer()
-                Button("Done") { dismiss() }
+                Button("Done") { WindowPresenter.shared.close("onboarding") }
                     .keyboardShortcut(.defaultAction)
             }
         }
@@ -124,7 +123,7 @@ struct OnboardingView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Button("Cancel") { dismiss() }
+            Button("Cancel") { WindowPresenter.shared.close("onboarding") }
                 .keyboardShortcut(.cancelAction)
                 .disabled(isWorking)
             Button("Test & Save") { submit() }

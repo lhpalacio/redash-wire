@@ -12,10 +12,11 @@ final class AppModel: ObservableObject {
     /// restarting it. Shown while it stays stopped.
     @Published private(set) var reloadNotice: String?
     @Published private(set) var launchAtLoginError: String?
-    /// Profiles the menu has locked to read-only, by Redash URL: the lock
-    /// protects the Redash, and keyed by profile name it was dropped by a
-    /// rename, bringing the proxy back writable. The config's own `read_only`
-    /// is separate and stronger: it cannot be unlocked from here.
+    /// Profiles the menu has locked to read-only, under both the profile name
+    /// and the Redash URL. Either one locks, so renaming the profile or editing
+    /// its URL cannot bring the proxy back writable; keyed by name alone, a
+    /// rename did. The config's own `read_only` is separate and stronger: it
+    /// cannot be unlocked from here.
     @Published private(set) var readOnlyPreferences: [String: Bool]
 
     private static let readOnlyPreferencesKey = "readOnlyProfiles"
@@ -48,6 +49,7 @@ final class AppModel: ObservableObject {
         self.readOnlyPreferences = UserDefaults.standard.dictionary(forKey: Self.readOnlyPreferencesKey) as? [String: Bool] ?? [:]
         self.verboseLogging = UserDefaults.standard.bool(forKey: Self.verboseLoggingKey)
         supervisor.verboseLogging = verboseLogging
+        supervisor.retryAfterGivingUp = { [weak self] in await self?.retry() }
     }
 
 
@@ -89,30 +91,16 @@ final class AppModel: ObservableObject {
 
     /// Whether the menu has locked this profile, whatever its config says.
     func prefersReadOnly(_ profile: Profile) -> Bool {
-        readOnlyPreferences[Self.lockKey(profile)] ?? false
+        Self.lockKeys(profile).contains { readOnlyPreferences[$0] == true }
     }
 
-    /// Falls back to the name for a URL that did not resolve, so such profiles
-    /// do not all share one lock.
-    private static func lockKey(_ profile: Profile) -> String {
+    /// The name, as locks were always keyed, and the URL when it resolved.
+    private static func lockKeys(_ profile: Profile) -> [String] {
         var url = profile.redashURL.trimmingCharacters(in: .whitespaces).lowercased()
         while url.hasSuffix("/") {
             url.removeLast()
         }
-        return url.isEmpty ? profile.name : url
-    }
-
-    /// Locks saved before they were keyed by URL were keyed by profile name.
-    private func migrateNameKeyedLocks(_ profiles: [Profile]) {
-        var migrated = readOnlyPreferences
-        for profile in profiles {
-            let key = Self.lockKey(profile)
-            guard key != profile.name, let locked = migrated.removeValue(forKey: profile.name) else { continue }
-            migrated[key] = (migrated[key] ?? false) || locked
-        }
-        guard migrated != readOnlyPreferences else { return }
-        readOnlyPreferences = migrated
-        UserDefaults.standard.set(migrated, forKey: Self.readOnlyPreferencesKey)
+        return url.isEmpty ? [profile.name] : [profile.name, url]
     }
 
     /// What a start of this profile would run as: locked by the config or by
@@ -269,7 +257,6 @@ final class AppModel: ObservableObject {
             let payload = try await cli.config()
             config = payload
             configError = nil
-            migrateNameKeyedLocks(payload.profiles)
 
             let names = payload.profiles.map(\.name)
             guard !names.isEmpty else {
@@ -313,10 +300,13 @@ final class AppModel: ObservableObject {
     /// process is not in. On a stopped proxy it simply applies at the next
     /// start.
     func setReadOnly(_ locked: Bool, for profile: Profile) async {
-        readOnlyPreferences[Self.lockKey(profile)] = locked
+        for key in Self.lockKeys(profile) {
+            readOnlyPreferences[key] = locked
+        }
         UserDefaults.standard.set(readOnlyPreferences, forKey: Self.readOnlyPreferencesKey)
 
-        guard supervisor.state.isActive, let running = supervisor.activeProfile, Self.lockKey(running) == Self.lockKey(profile) else { return }
+        guard supervisor.state.isActive, let running = supervisor.activeProfile,
+              !Set(Self.lockKeys(running)).isDisjoint(with: Self.lockKeys(profile)) else { return }
         await supervisor.restart(profile: running, readOnly: running.readOnly || locked)
     }
 

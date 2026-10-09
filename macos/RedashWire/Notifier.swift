@@ -23,6 +23,12 @@ final class Notifier: NSObject, ObservableObject {
     private static let enabledKey = "notificationsEnabled"
     private nonisolated static let offlineID = "offline"
 
+    /// A start that gave up is retried on every network change, sleep and wake
+    /// included, and gives up again two minutes later. The same problem is
+    /// posted once in this long.
+    private static let repeatAfter: TimeInterval = 30 * 60
+    private var lastAttention: (headline: String, at: Date)?
+
     private let supervisor: ProxySupervisor
     private let center = UNUserNotificationCenter.current()
     private var last: StatusSummary
@@ -49,6 +55,11 @@ final class Notifier: NSObject, ObservableObject {
         }
     }
 
+    /// A delayed "offline" would otherwise arrive after the app has quit.
+    func cancelPending() {
+        center.removeAllPendingNotificationRequests()
+    }
+
     func openSystemSettings() {
         let id = Bundle.main.bundleIdentifier ?? ""
         if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=\(id)") {
@@ -64,7 +75,9 @@ final class Notifier: NSObject, ObservableObject {
         for alert in StatusAlert.changes(from: last, to: current) {
             switch alert {
             case .offline:
-                post(current, id: Self.offlineID, after: StatusAlert.offlineDelay)
+                // Without the countdown, which is stale by the time it shows.
+                let summary = StatusSummary(tone: current.tone, headline: current.headline, details: Array(current.details.prefix(1)))
+                post(summary, id: Self.offlineID, after: StatusAlert.offlineDelay)
             case .backOnline:
                 center.removePendingNotificationRequests(withIdentifiers: [Self.offlineID])
                 center.getDeliveredNotifications { [weak self] delivered in
@@ -78,6 +91,10 @@ final class Notifier: NSObject, ObservableObject {
             case .cancelOffline:
                 center.removePendingNotificationRequests(withIdentifiers: [Self.offlineID])
             case .needsAttention:
+                if let last = lastAttention, last.headline == current.headline, Date().timeIntervalSince(last.at) < Self.repeatAfter {
+                    continue
+                }
+                lastAttention = (current.headline, Date())
                 post(current, id: "attention")
             }
         }

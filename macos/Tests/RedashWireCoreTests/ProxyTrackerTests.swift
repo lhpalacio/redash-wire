@@ -273,6 +273,20 @@ final class ProxyTrackerTests: XCTestCase {
         XCTAssertNil(tracker.giveUpReason(now: t0.addingTimeInterval(3600)), "a crash restart is not a fresh start")
     }
 
+    func testACrashRestartLateInTheWindowStillGetsToProbe() {
+        var tracker = ProxyTracker()
+        tracker.start(profile())
+        tracker.record(event(WireEvent.listenerReady), now: t0)
+
+        let late = t0.addingTimeInterval(ProxyTracker.giveUpAfter - 1)
+        _ = tracker.exit(status: 2, stopRequested: false, now: late)
+        tracker.launch(profile())
+        tracker.record(event(WireEvent.listenerReady), now: late)
+
+        XCTAssertNil(tracker.giveUpReason(now: late.addingTimeInterval(1)), "stopped before it asked Redash anything")
+        XCTAssertNotNil(tracker.giveUpReason(now: late.addingTimeInterval(ProxyTracker.giveUpGrace)))
+    }
+
     func testAManualStartGetsAFreshWindow() {
         var tracker = ProxyTracker()
         tracker.start(profile())

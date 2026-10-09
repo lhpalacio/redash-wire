@@ -79,6 +79,10 @@ struct ProxyTracker: Equatable {
     /// stays up so open sessions survive, and the daemon slows its probes.
     static let giveUpAfter: TimeInterval = 120
 
+    /// What a crash restart late in that window still gets: one probe and its
+    /// timeout. Without it a restart could be stopped before it asked Redash.
+    static let giveUpGrace: TimeInterval = 20
+
     /// A proxy that served this long before dying has proved the last restart
     /// worked, so its next crash starts a new streak. The budget used to reset
     /// the moment the listeners bound, which let a proxy that bound and died a
@@ -190,8 +194,9 @@ struct ProxyTracker: Equatable {
             if !reachedReady && seenListeners >= max(expectedListeners, 1) {
                 reachedReady = true
                 snapshot.state = .running(since: now, redash: reportedHealth)
-                if !everConnected && giveUpAt == nil {
-                    giveUpAt = now.addingTimeInterval(Self.giveUpAfter)
+                if !everConnected {
+                    let earliest = now.addingTimeInterval(giveUpAt == nil ? Self.giveUpAfter : Self.giveUpGrace)
+                    giveUpAt = max(giveUpAt ?? earliest, earliest)
                 }
             }
 

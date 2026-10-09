@@ -11,11 +11,19 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$HOME/.redash-wire-demo"
 DERIVED="$ROOT/build/ScreenshotsDerivedData"
 PORT=18080
+DOMAIN=com.lhpalacio.RedashWire
+# The one thing the demo cannot shadow: AppKit saves the Settings window's frame.
+SAVED_FRAME="$(defaults read "$DOMAIN" "NSWindow Frame settings" 2>/dev/null || true)"
 
 cleanup() {
   [[ -n "${APP_PID:-}" ]] && kill "$APP_PID" 2>/dev/null || true
   [[ -n "${REDASH_PID:-}" ]] && kill "$REDASH_PID" 2>/dev/null || true
   rm -rf "$WORK"
+  if [[ -n "$SAVED_FRAME" ]]; then
+    defaults write "$DOMAIN" "NSWindow Frame settings" "$SAVED_FRAME"
+  else
+    defaults delete "$DOMAIN" "NSWindow Frame settings" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 

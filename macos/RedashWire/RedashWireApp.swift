@@ -11,21 +11,6 @@ struct RedashWireApp: App {
             MenuBarLabel(model: delegate.model, supervisor: delegate.model.supervisor)
         }
         .menuBarExtraStyle(.menu)
-
-        Window("redash-wire Logs", id: "logs") {
-            LogWindow(log: delegate.model.supervisor.log, diagnostics: delegate.model.diagnostics)
-        }
-        .defaultSize(width: 760, height: 440)
-
-        Window("Set up redash-wire", id: "onboarding") {
-            OnboardingView(model: delegate.model)
-        }
-        .windowResizability(.contentSize)
-
-        Window("redash-wire Settings", id: "settings") {
-            SettingsView(model: delegate.model, supervisor: delegate.model.supervisor, updates: delegate.model.updates, notifier: delegate.model.notifier)
-        }
-        .windowResizability(.contentSize)
         .commands {
             // The app menu exists while a window gives the app a Dock icon.
             CommandGroup(replacing: .appSettings) {
@@ -53,6 +38,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        WindowPresenter.shared.content = { [model] id in
+            switch id {
+            case "logs":
+                return WindowSpec(title: "redash-wire Logs", resizable: true, size: NSSize(width: 760, height: 440),
+                                  view: LogWindow(log: model.supervisor.log, diagnostics: model.diagnostics))
+            case "onboarding":
+                return WindowSpec(title: "Set up redash-wire", view: OnboardingView(model: model))
+            case "settings":
+                return WindowSpec(title: "redash-wire Settings",
+                                  view: SettingsView(model: model, supervisor: model.supervisor, updates: model.updates, notifier: model.notifier))
+            default:
+                return nil
+            }
+        }
         WindowPresenter.shared.followWindows()
         Task {
             await model.start()
@@ -98,36 +97,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         Clipboard.clearSecretOnQuit()
+        model.notifier.cancelPending()
+    }
+}
+
+struct WindowSpec {
+    let title: String
+    var resizable = false
+    /// The first size, before the window has a saved frame. Nil fits the content.
+    var size: NSSize?
+    let view: AnyView
+
+    init<V: View>(title: String, resizable: Bool = false, size: NSSize? = nil, view: V) {
+        self.title = title
+        self.resizable = resizable
+        self.size = size
+        self.view = AnyView(view)
     }
 }
 
 /// Opens the app's windows in front, and gives the app a Dock icon while one is
-/// open so it can be found again with ⌘-Tab. `openWindow` only exists inside a
-/// view, so the menu bar label hands it over when it appears; a request made
-/// before that waits for it.
+/// open so it can be found again with ⌘-Tab. The windows are AppKit's, not
+/// SwiftUI scenes: a scene opens only through a view's `openWindow`, and with
+/// the status item hidden no view ever appears to hand it over.
 @MainActor
 final class WindowPresenter {
     static let shared = WindowPresenter()
 
-    private var open: ((String) -> Void)?
-    private var pending: String?
-
-    func register(_ open: @escaping (String) -> Void) {
-        self.open = open
-        if let pending {
-            self.pending = nil
-            show(pending)
-        }
-    }
+    var content: ((String) -> WindowSpec?)?
+    private var windows: [String: NSWindow] = [:]
 
     func show(_ id: String) {
-        guard let open else {
-            pending = id
-            return
-        }
+        guard let window = windows[id] ?? makeWindow(id) else { return }
         NSApp.setActivationPolicy(.regular)
         Self.activate()
-        open(id)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    func close(_ id: String) {
+        windows[id]?.close()
+    }
+
+    /// The autosave name is the id, which keeps the frames the SwiftUI scenes
+    /// saved under the same names.
+    private func makeWindow(_ id: String) -> NSWindow? {
+        guard let spec = content?(id) else { return nil }
+        let controller = NSHostingController(rootView: spec.view)
+        controller.sizingOptions = spec.resizable ? [.minSize] : [.preferredContentSize]
+        let window = NSWindow(contentViewController: controller)
+        window.title = spec.title
+        window.styleMask = [.titled, .closable, .miniaturizable]
+        if spec.resizable {
+            window.styleMask.insert(.resizable)
+        }
+        window.isReleasedWhenClosed = false
+        if !window.setFrameUsingName(id) {
+            if let size = spec.size {
+                window.setContentSize(size)
+            }
+            window.center()
+        }
+        window.setFrameAutosaveName(id)
+        windows[id] = window
+        return window
     }
 
     /// A menu bar app is not active, so anything it shows opens behind others.
@@ -159,16 +191,11 @@ final class WindowPresenter {
 private struct MenuBarLabel: View {
     @ObservedObject var model: AppModel
     @ObservedObject var supervisor: ProxySupervisor
-    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         let summary = supervisor.statusSummary()
         Image(systemName: Self.symbolName(for: summary.tone, state: supervisor.state))
             .accessibilityLabel("redash-wire: \(summary.headline)")
-            .onAppear {
-                let openWindow = openWindow
-                WindowPresenter.shared.register { openWindow(id: $0) }
-            }
     }
 
     /// The menu bar renders these as template images, so colour cannot carry the
