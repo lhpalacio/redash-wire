@@ -138,6 +138,17 @@ struct SettingsView: View {
                     }
                 }
             }
+            Section("Troubleshooting") {
+                HStack {
+                    Button("Copy Diagnostics") { Clipboard.copy(model.diagnostics()) }
+                    Button("Show Log File in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([LogFile.url])
+                    }
+                }
+                Text("Diagnostics hold versions, the status, the profile without its credentials, and the last 200 log lines.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
             Section("About") {
                 LabeledContent("App", value: UpdateChecker.currentVersion)
                 LabeledContent("redash-wire binary", value: model.binaryVersion ?? "not found")

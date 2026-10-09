@@ -411,6 +411,29 @@ final class AppModel: ObservableObject {
         objectWillChange.send()
     }
 
+    /// For a bug report: versions, what the menu says, the profile without its
+    /// credentials, and the end of the log.
+    func diagnostics() -> String {
+        let summary = supervisor.statusSummary()
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        var lines = [
+            "redash-wire diagnostics, \(ISO8601DateFormatter().string(from: Date()))",
+            "App \(UpdateChecker.currentVersion) (\(build)), binary \(binaryVersion ?? "not found")",
+            "macOS \(ProcessInfo.processInfo.operatingSystemVersionString)",
+            "Status: \(([summary.headline] + summary.details).joined(separator: " / "))",
+        ]
+        if let profile = connectionProfile {
+            lines.append("Profile \(profile.name): \(profile.redashURL), PostgreSQL \(profile.postgresListenAddr.isEmpty ? "off" : profile.postgresListenAddr), MySQL \(profile.mysqlListenAddr.isEmpty ? "off" : profile.mysqlListenAddr), read-only \(isReadOnly(profile)), API key \(profile.apiKeySet ? "set" : "missing")")
+        }
+        if let configError {
+            lines.append("Config error: \(configError.message)")
+        }
+        lines.append("")
+        lines.append("Last log lines:")
+        lines += supervisor.log.events.suffix(200).map(\.plainLine)
+        return lines.joined(separator: "\n")
+    }
+
     func revealConfigInFinder() {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: cli.configPath)])
     }

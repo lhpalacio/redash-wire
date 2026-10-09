@@ -241,6 +241,8 @@ final class ProxySupervisor: ObservableObject {
         let generation = self.generation
         publish()
 
+        LogFile.shared.mark("starting profile \(profile.name)")
+
         let process = Process()
         process.executableURL = cli.binaryURL
         process.arguments = cli.serveArguments(profile: profile.name, readOnly: readOnly, verbose: verboseLogging)
@@ -294,6 +296,7 @@ final class ProxySupervisor: ObservableObject {
             let line = lineBuffer[lineBuffer.startIndex..<newline]
             lineBuffer.removeSubrange(lineBuffer.startIndex...newline)
             guard !line.isEmpty else { continue }
+            LogFile.shared.append(Data(line))
             // A Go panic is not JSON, and dropping it left a crash with no
             // trace anywhere.
             let event = LogEvent.parse(line: Data(line))

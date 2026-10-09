@@ -180,7 +180,11 @@ you can:
 - Get a notification when Redash has been offline for 30 seconds (and when it
   is back), or when the proxy gives up, is refused, or fails. Settings turns
   them off.
-- Follow the proxy's log stream, filtered by level and text.
+- Follow the proxy's log stream, filtered by level and text, or pause it to
+  read back. Everything is also written to
+  `~/Library/Logs/RedashWire/redash-wire.log`, and Copy Diagnostics puts
+  versions, the status and the last 200 lines on the clipboard for a bug
+  report.
 - Open Settings (⌘,) to turn on launch at login and the daily update check,
   see every profile with its listeners, lock and any config error, open
   `config.yaml` to edit it, and turn on verbose logging.
